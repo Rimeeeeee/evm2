@@ -2290,8 +2290,11 @@ const PINNED_ATTR: &str = "evm2.pinned";
 /// Pinned functions restore the caller's values before returning. Builtins that exit early
 /// through `evm2_jit_exit` skip that, but return through `evm2_jit_entry`, which saves and
 /// restores every callee-saved register itself.
-const PINNED_REGS: &[&CStr] = if cfg!(target_arch = "x86_64") { &[c"r12", c"r13"] } else { &[] };
+///
+/// `r14` and `r15` encode as a base register without the SIB byte that `r12` needs or the zero
+/// displacement that `r13` needs.
+const PINNED_REGS: &[&CStr] = if cfg!(target_arch = "x86_64") { &[c"r14", c"r15"] } else { &[] };
 
 /// Target features that reserve [`PINNED_REGS`].
 const RESERVED_REGS_FEATURES: &CStr =
-    if cfg!(target_arch = "x86_64") { c"+reserve-r12,+reserve-r13" } else { c"" };
+    if cfg!(target_arch = "x86_64") { c"+reserve-r14,+reserve-r15" } else { c"" };
