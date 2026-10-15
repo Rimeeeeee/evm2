@@ -14,9 +14,14 @@
 #include <llvm/ExecutionEngine/Orc/TargetProcess/JITLoaderPerf.h>
 #include <llvm/IR/Attributes.h>
 #include <llvm/IR/GlobalValue.h>
+#include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/Instructions.h>
+#include <llvm/IR/Intrinsics.h>
+#include <llvm/IR/Module.h>
 #include <llvm/Target/TargetMachine.h>
 
 #include <atomic>
+#include <functional>
 #include <fstream>
 #include <unistd.h>
 
@@ -361,4 +366,86 @@ evm2_jit_llvm_target_machine_set_opt_level(LLVMTargetMachineRef TM,
 
 extern "C" void evm2_jit_llvm_set_dso_local(LLVMValueRef Val, bool Local) {
   unwrap<GlobalValue>(Val)->setDSOLocal(Local);
+}
+
+/// Keeps argument `ArgNo` of `Fn` in the reserved register `Reg` for the whole function.
+///
+/// The argument is written to `Reg` on entry, and every use of it, or of a constant-offset
+/// address derived from it, reads `Reg` instead. The caller's value of `Reg` is restored before
+/// each return. `Reg` must be reserved in the target features and callee-saved.
+extern "C" void evm2_jit_llvm_pin_arg_to_register(LLVMValueRef FnRef, unsigned ArgNo,
+                                                  const char *Reg) {
+  Function &F = *unwrap<Function>(FnRef);
+  Module &M = *F.getParent();
+  LLVMContext &Ctx = F.getContext();
+  Type *I64 = Type::getInt64Ty(Ctx);
+  Argument *Arg = F.getArg(ArgNo);
+  Value *RegMD = MetadataAsValue::get(Ctx, MDNode::get(Ctx, {MDString::get(Ctx, Reg)}));
+  Function *Read = Intrinsic::getOrInsertDeclaration(&M, Intrinsic::read_register, {I64});
+  Function *Write = Intrinsic::getOrInsertDeclaration(&M, Intrinsic::write_register, {I64});
+
+  std::function<bool(Value *)> IsDerived = [&](Value *V) {
+    if (V == Arg)
+      return true;
+    if (auto *GEP = dyn_cast<GetElementPtrInst>(V))
+      return GEP->hasAllConstantIndices() && IsDerived(GEP->getPointerOperand());
+    return false;
+  };
+  // Rematerialize each value once per block, at the top of the block.
+  DenseMap<std::pair<Value *, BasicBlock *>, Value *> Cache;
+  DenseMap<BasicBlock *, Instruction *> InsertPts;
+  std::function<Value *(Value *, BasicBlock *)> Remat = [&](Value *V, BasicBlock *BB) -> Value * {
+    if (Value *Cached = Cache.lookup({V, BB}))
+      return Cached;
+    // Insert before the block's original first instruction so rematerialized values stay in
+    // dependency order.
+    Instruction *Pt = InsertPts.try_emplace(BB, &*BB->getFirstInsertionPt()).first->second;
+    Value *Result;
+    if (V == Arg) {
+      IRBuilder<> B(Pt);
+      Result = B.CreateIntToPtr(B.CreateCall(Read, {RegMD}), Arg->getType());
+    } else {
+      auto *I = cast<Instruction>(V);
+      Value *Base = Remat(I->getOperand(0), BB);
+      Instruction *C = I->clone();
+      C->setName(I->getName());
+      C->insertBefore(Pt->getIterator());
+      C->setOperand(0, Base);
+      Result = C;
+    }
+    Cache[{V, BB}] = Result;
+    return Result;
+  };
+
+  SmallVector<Instruction *, 16> Dead;
+  std::function<void(Value *)> Visit = [&](Value *V) {
+    SmallVector<Use *, 16> Uses;
+    for (Use &U : V->uses())
+      Uses.push_back(&U);
+    for (Use *U : Uses) {
+      auto *User = cast<Instruction>(U->getUser());
+      if (User != V && IsDerived(User)) {
+        Visit(User);
+        Dead.push_back(User);
+        continue;
+      }
+      BasicBlock *BB = User->getParent();
+      if (auto *Phi = dyn_cast<PHINode>(User))
+        BB = Phi->getIncomingBlock(*U);
+      U->set(Remat(V, BB));
+    }
+  };
+  Visit(Arg);
+  for (Instruction *I : reverse(Dead))
+    if (I->use_empty())
+      I->eraseFromParent();
+
+  IRBuilder<> B(&*F.getEntryBlock().getFirstInsertionPt());
+  Value *Saved = B.CreateCall(Read, {RegMD}, "saved_reg");
+  B.CreateCall(Write, {RegMD, B.CreatePtrToInt(Arg, I64)});
+  for (BasicBlock &BB : F)
+    if (auto *Ret = dyn_cast<ReturnInst>(BB.getTerminator())) {
+      B.SetInsertPoint(Ret);
+      B.CreateCall(Write, {RegMD, Saved});
+    }
 }

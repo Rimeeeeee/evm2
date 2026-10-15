@@ -14,7 +14,10 @@ use inkwell::{
     },
     values::AsValueRef,
 };
-use std::{ffi::c_char, sync::atomic::AtomicUsize};
+use std::{
+    ffi::{CStr, c_char},
+    sync::atomic::AtomicUsize,
+};
 
 #[link(name = "evm2_jit_llvm_cpp", kind = "static")]
 unsafe extern "C" {
@@ -63,6 +66,8 @@ unsafe extern "C" {
     );
 
     fn evm2_jit_llvm_set_dso_local(val: LLVMValueRef, local: bool);
+
+    fn evm2_jit_llvm_pin_arg_to_register(f: LLVMValueRef, arg: u32, reg: *const c_char);
 }
 
 pub(crate) fn set_dso_local(f: inkwell::values::FunctionValue<'_>) {
@@ -74,4 +79,9 @@ pub(crate) fn create_initializes_attr(cx: &Context, lower: i64, upper: i64) -> A
         let raw = evm2_jit_llvm_create_initializes_attr(cx.raw(), lower, upper);
         Attribute::new(raw)
     }
+}
+
+/// Keeps argument `arg` of `f` in the reserved, callee-saved register `reg`.
+pub(crate) fn pin_arg_to_register(f: inkwell::values::FunctionValue<'_>, arg: u32, reg: &CStr) {
+    unsafe { evm2_jit_llvm_pin_arg_to_register(f.as_value_ref(), arg, reg.as_ptr()) };
 }

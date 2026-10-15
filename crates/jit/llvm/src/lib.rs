@@ -1034,7 +1034,25 @@ impl Backend for EvmLlvmBackend {
             OptimizationLevel::Aggressive => "default<O3>",
         });
         let opts = PassBuilderOptions::create();
-        self.module().run_passes(passes, &self.machine, opts).map_err(error_msg)
+        self.module().run_passes(passes, &self.machine, opts).map_err(error_msg)?;
+
+        if pin_ecx(&self.machine.get_triple()) {
+            for name in self.function_names.values() {
+                if let Some(f) = self.module().get_function(name)
+                    && f.count_basic_blocks() > 0
+                {
+                    // The ORC JIT detects the host features itself, so set them per function.
+                    let features = &TargetInfo::new().features;
+                    let attr = self.cx.create_string_attribute("target-features", features);
+                    f.add_attribute(AttributeLoc::Function, attr);
+                    cpp::pin_arg_to_register(f, 0, c"r12");
+                    if pin_stack() {
+                        cpp::pin_arg_to_register(f, 1, c"r13");
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn write_object<W: std::io::Write>(&mut self, mut w: W) -> Result<()> {
@@ -1164,7 +1182,14 @@ impl TargetInfo {
             let triple = TargetMachine::get_default_triple();
             let target = Target::from_triple(&triple).unwrap();
             let cpu = TargetMachine::get_host_cpu_name().to_string_lossy().into_owned();
-            let features = TargetMachine::get_host_cpu_features().to_string_lossy().into_owned();
+            let mut features =
+                TargetMachine::get_host_cpu_features().to_string_lossy().into_owned();
+            if pin_ecx(&triple) {
+                features.push_str(",+reserve-r12");
+                if pin_stack() {
+                    features.push_str(",+reserve-r13");
+                }
+            }
             Self { target, triple, cpu, features }
         })
     }
@@ -2260,4 +2285,16 @@ fn error_msg(msg: inkwell::support::LLVMString) -> evm2_jit_backend::Error {
 
 fn fmt_ty(ty: BasicTypeEnum<'_>) -> impl std::fmt::Display {
     ty.print_to_string().to_str().unwrap().trim_matches('"').to_string()
+}
+
+/// Whether EVM functions keep `ecx` in the reserved register `r12`.
+fn pin_ecx(triple: &TargetTriple) -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("EVM2_JIT_PIN_ECX").is_ok_and(|v| v != "0"))
+        && triple.as_str().to_bytes().starts_with(b"x86_64")
+}
+
+fn pin_stack() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("EVM2_JIT_PIN_STACK").is_ok_and(|v| v != "0"))
 }
