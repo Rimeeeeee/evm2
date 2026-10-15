@@ -252,7 +252,8 @@ pub unsafe extern "C" fn __revmc_builtin_calldataload_c(
             core::ptr::copy_nonoverlapping(input.as_ptr().add(offset), word.as_mut_ptr(), count)
         };
     }
-    *out = EvmWord::from_be_bytes(word);
+    // Big-endian bytes; the compiled code byte-swaps them.
+    *out = EvmWord::from_ne_bytes(word);
 }
 
 #[unsafe(no_mangle)]

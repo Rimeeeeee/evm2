@@ -321,7 +321,7 @@ builtins! {
 impl Builtin {
     pub const fn call_conv(self) -> CallConv {
         match self {
-            Self::Mresize => CallConv::Cold,
+            Self::Mresize | Self::CallDataLoadC => CallConv::Cold,
             _ => CallConv::Default,
         }
     }
