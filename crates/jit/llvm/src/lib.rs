@@ -2287,8 +2287,9 @@ const PINNED_ATTR: &str = "evm2.pinned";
 
 /// Callee-saved registers reserved for pinned parameters, in parameter order.
 ///
-/// Pinned functions restore the caller's values only on return, so nothing may unwind through
-/// them. Builtins are `extern "C"`, so a panic in one aborts instead.
+/// Pinned functions restore the caller's values before returning. Builtins that exit early
+/// through `evm2_jit_exit` skip that, but return through `evm2_jit_entry`, which saves and
+/// restores every callee-saved register itself.
 const PINNED_REGS: &[&CStr] = if cfg!(target_arch = "x86_64") { &[c"r12", c"r13"] } else { &[] };
 
 /// Target features that reserve [`PINNED_REGS`].
