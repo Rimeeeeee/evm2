@@ -1090,6 +1090,12 @@ impl InstData {
         self.flags.contains(InstFlags::STACK_SECTION_HEAD)
     }
 
+    /// Returns `true` if this stack section head continues the previous section.
+    #[inline]
+    pub(crate) const fn continues_stack_section(&self) -> bool {
+        self.flags.contains(InstFlags::CONTINUES_STACK_SECTION)
+    }
+
     /// Returns `true` if this instruction is dead code.
     pub(crate) const fn is_dead_code(&self) -> bool {
         self.flags.contains(InstFlags::DEAD_CODE)
@@ -1174,6 +1180,11 @@ bitflags::bitflags! {
         const STACK_SECTION_HEAD = 1 << 7;
         /// Don't generate any code.
         const DEAD_CODE = 1 << 8;
+        /// This stack section head is only entered by falling through the preceding `JUMPI`,
+        /// so it keeps the previous section's virtual stack and stack length. Its
+        /// `stack_section` holds only the bounds that the previous sections have not checked;
+        /// the virtual stack already tracks the checked range.
+        const CONTINUES_STACK_SECTION = 1 << 9;
     }
 }
 

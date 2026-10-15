@@ -645,6 +645,45 @@ tests! {
             expected_gas: 3 + (1 + 3 + 3 + 3 + 3 + 3 + 10) * 3 + 2 + 3,
         }),
 
+        // The JUMPI fall-throughs continue the section at `head`: each one reads deeper
+        // below the section start, and the final taken edge stores the values that only
+        // lived in SSA. DUP5 reads the deepest value, exactly at the checked range.
+        jumpi_fallthrough_chain(@raw {
+            bytecode: &asm(&jumpi_fallthrough_chain("CALLDATASIZE ISZERO", "DUP5")),
+            expected_return: InstrStop::Stop,
+            expected_stack: STACK_WHAT_INTERPRETER_SAYS,
+            expected_gas: GAS_WHAT_INTERPRETER_SAYS,
+        }),
+        // DUP6 reads one below the stack.
+        jumpi_fallthrough_underflow(@raw {
+            bytecode: &asm(&jumpi_fallthrough_chain("CALLDATASIZE ISZERO", "DUP6")),
+            expected_return: InstrStop::StackUnderflow,
+        }),
+        // The underflow is on the fall-through, so it must not fail when the jump is taken.
+        jumpi_taken_skips_fallthrough_underflow(@raw {
+            bytecode: &asm(&jumpi_fallthrough_chain("CALLDATASIZE", "DUP6")),
+            expected_return: InstrStop::Stop,
+            expected_stack: STACK_WHAT_INTERPRETER_SAYS,
+            expected_gas: GAS_WHAT_INTERPRETER_SAYS,
+        }),
+        // The second fall-through fills the stack to exactly 1024.
+        jumpi_fallthrough_full_stack(@raw {
+            bytecode: &asm(&jumpi_fallthrough_overflow("CALLDATASIZE ISZERO", 3)),
+            expected_return: InstrStop::Stop,
+            expected_stack: STACK_WHAT_INTERPRETER_SAYS,
+            expected_gas: GAS_WHAT_INTERPRETER_SAYS,
+        }),
+        jumpi_fallthrough_overflow(@raw {
+            bytecode: &asm(&jumpi_fallthrough_overflow("CALLDATASIZE ISZERO", 4)),
+            expected_return: InstrStop::StackOverflow,
+        }),
+        jumpi_taken_skips_fallthrough_overflow(@raw {
+            bytecode: &asm(&jumpi_fallthrough_overflow("CALLDATASIZE", 4)),
+            expected_return: InstrStop::Stop,
+            expected_stack: STACK_WHAT_INTERPRETER_SAYS,
+            expected_gas: GAS_WHAT_INTERPRETER_SAYS,
+        }),
+
         pc(@raw {
             bytecode: &[op::PC, op::PC, op::PUSH1, 69, op::PC, op::PUSH0, op::PC],
             expected_stack: &[0_U256, 1_U256, 69_U256, 4_U256, 0_U256, 6_U256],
@@ -2420,4 +2459,57 @@ fn bytecode_ternop_mixed(
 
 fn asm(s: &str) -> Vec<u8> {
     crate::parse_asm(s).unwrap()
+}
+
+/// Three unknown values enter the section at `head`, followed by a chain of JUMPI
+/// fall-throughs. `cond` decides whether the third JUMPI jumps to `end`; the third
+/// fall-through then runs `deep_dup` with five values on the stack. The last JUMPI keeps
+/// the sum below it only in SSA, as CHAINID writes its output to memory.
+fn jumpi_fallthrough_chain(cond: &str, deep_dup: &str) -> String {
+    format!(
+        "
+        CALLDATASIZE
+        PUSH 1 CALLDATALOAD
+        PUSH 2 CALLDATALOAD
+        PUSH %head
+        JUMP
+    fail:
+        JUMPDEST
+        INVALID
+    head:
+        JUMPDEST
+        CALLDATASIZE ISZERO PUSH %fail JUMPI
+        DUP2 PUSH0 CALLDATALOAD ADD
+        CALLDATASIZE ISZERO PUSH %fail JUMPI
+        DUP4 DUP2 MUL
+        {cond} PUSH %end JUMPI
+        {deep_dup}
+        CALLDATASIZE ISZERO PUSH %fail JUMPI
+        ADD
+        CHAINID PUSH %end JUMPI
+        INVALID
+    end:
+        JUMPDEST
+        STOP
+        "
+    )
+}
+
+/// 1020 values followed by a chain of JUMPI fall-throughs. `cond` decides whether the second
+/// JUMPI jumps to `end`; the second fall-through then pushes `pushes` values onto 1021.
+fn jumpi_fallthrough_overflow(cond: &str, pushes: usize) -> String {
+    format!(
+        "
+        {}
+        CALLDATASIZE ISZERO PUSH %end JUMPI
+        PUSH0 {cond} PUSH %end JUMPI
+        {}
+        STOP
+    end:
+        JUMPDEST
+        STOP
+        ",
+        "PUSH0 ".repeat(1020),
+        "PUSH0 ".repeat(pushes),
+    )
 }
