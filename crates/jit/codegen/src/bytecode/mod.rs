@@ -1174,6 +1174,9 @@ bitflags::bitflags! {
         const STACK_SECTION_HEAD = 1 << 7;
         /// Don't generate any code.
         const DEAD_CODE = 1 << 8;
+        /// Dedup redirected another block here, so it can be entered from more than one place
+        /// without a jump.
+        const REDIRECT_TARGET = 1 << 9;
     }
 }
 

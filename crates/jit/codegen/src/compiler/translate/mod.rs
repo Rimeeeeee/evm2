@@ -24,6 +24,8 @@ const STACK_CAP: usize = 1024;
 /// The size of a stack word in bytes. Stack lengths are kept in bytes so that stack addresses
 /// need no scaling.
 const WORD_SIZE: i64 = 32;
+/// The most gas that sections entered only by fall-through may charge before a signed check.
+const GAS_CHECK_THRESHOLD: u64 = 1000;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct FcxConfig {
@@ -113,6 +115,8 @@ pub(super) struct FunctionCx<'a, B: Backend> {
     /// `section_len_offset + diff`. Stores are skipped when the new offset matches this value.
     stored_len_offset: i32,
     cached_mem_base: Option<B::Value>,
+    /// Gas subtracted without a check since the last check, in translation order.
+    unchecked_gas: u64,
 
     /// The bytecode being translated.
     bytecode: &'a Bytecode<'a>,
@@ -249,6 +253,7 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
             section_len_offset: 0,
             stored_len_offset: 0,
             cached_mem_base: None,
+            unchecked_gas: 0,
             bcx,
 
             bytecode,
@@ -337,10 +342,19 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
             // `InstrStop` codes exist purely for debugging and error messages.
             // `single_error` collapses every failure path to a single placeholder
             // (OOG), letting LLVM DCE the per-site materialization and the phi.
+            let out_of_gas = fx.bcx.iconst(fx.i8_type, InstrStop::OutOfGas as i64);
             let failure_value = if config.single_error {
-                fx.bcx.iconst(fx.i8_type, InstrStop::OutOfGas as i64)
+                out_of_gas
             } else {
-                fx.bcx.phi(fx.i8_type, &fx.incoming_failures)
+                let failure_value = fx.bcx.phi(fx.i8_type, &fx.incoming_failures);
+                // Gas subtracted without a check may have run out before this failure.
+                if config.gas_metering {
+                    let remaining = fx.load_gas_remaining();
+                    let is_negative = fx.bcx.icmp_imm(IntCC::SignedLessThan, remaining, 0);
+                    fx.bcx.select(is_negative, out_of_gas, failure_value)
+                } else {
+                    failure_value
+                }
             };
             fx.bcx.set_current_block_cold();
             // Do not sync the stack here: this is a shared synthetic merge block for
@@ -468,7 +482,10 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
         }
 
         // Pay static gas for the current section.
-        self.gas_cost_imm(data.gas_section.gas_cost as u64);
+        debug_assert!(data.is_stack_section_head() || data.gas_section.is_empty());
+        if data.is_stack_section_head() {
+            self.charge_section_gas(inst);
+        }
 
         // Compute bytes_before for this instruction.
         // At section heads: load from the alloca once and reset the section offset.
@@ -975,9 +992,8 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
                 self.push(msize);
             }
             op::GAS => {
-                let addr = self.gas_remaining_addr();
-                let i64_type = self.bcx.type_int(64);
-                let remaining = self.bcx.load(i64_type, addr, "ecx.gas.remaining");
+                self.build_gas_check();
+                let remaining = self.load_gas_remaining();
                 let remaining = self.bcx.zext(self.word_type, remaining);
                 self.push(remaining);
             }
@@ -1059,7 +1075,7 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
             op::SELFDESTRUCT => {
                 let sp = self.sp_after_inputs();
                 self.sync_diverging_stack_effect();
-                let _ = self.call_builtin(Builtin::SelfDestruct, &[self.ecx, sp]);
+                self.call_fallible_builtin(Builtin::SelfDestruct, &[self.ecx, sp]);
                 self.bcx.unreachable();
                 goto_return!(no_branch);
             }
@@ -1269,7 +1285,7 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
         let sp = self.sp_after_inputs();
         let ir_const = self.bcx.iconst(self.i8_type, ir as i64);
         self.sync_diverging_stack_effect();
-        let _ = self.call_builtin(Builtin::DoReturn, &[self.ecx, sp, ir_const]);
+        self.call_fallible_builtin(Builtin::DoReturn, &[self.ecx, sp, ir_const]);
         self.bcx.unreachable();
     }
 
@@ -1346,6 +1362,12 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
     fn gas_remaining_addr(&mut self) -> B::Value {
         const OFFSET: usize = mem::offset_of!(EvmContext<'_, '_, '_>, gas);
         self.get_field(self.ecx, OFFSET, "ecx.gas.remaining.addr")
+    }
+
+    fn load_gas_remaining(&mut self) -> B::Value {
+        let addr = self.gas_remaining_addr();
+        let i64_type = self.bcx.type_int(64);
+        self.bcx.load(i64_type, addr, "ecx.gas.remaining")
     }
 
     /// Saves the local `stack_bytes` to `stack_len_arg` as a number of words.
@@ -1535,29 +1557,89 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
         self.vstack.mark_materialized_range(start..end);
     }
 
-    /// Builds a gas cost deduction for an immediate value.
-    fn gas_cost_imm(&mut self, cost: u64) {
-        if !self.config.gas_metering || cost == 0 {
-            return;
-        }
-        let value = self.bcx.iconst(self.isize_type, cost as i64);
-        self.gas_cost(value);
-    }
-
-    /// Builds a gas cost deduction for a value.
-    fn gas_cost(&mut self, cost: B::Value) {
+    /// Charges the static gas of the section headed by `head`.
+    ///
+    /// Only a section entered through a `JUMPDEST` can start unbounded work, so sections entered
+    /// only by falling through subtract their gas without a branch until the gas charged since
+    /// the last check reaches [`GAS_CHECK_THRESHOLD`]. The check is signed, so a skipped deficit
+    /// stays visible as negative remaining gas. Sections that return or call builtins that charge
+    /// gas check at their head; [`build_gas_check`](Self::build_gas_check) covers the rest.
+    fn charge_section_gas(&mut self, head: Inst) {
         if !self.config.gas_metering {
             return;
         }
 
-        // Modified from `Gas::record_cost`.
-        // This can overflow the gas counters, which has to be adjusted for after the call.
-        let addr = self.gas_remaining_addr();
-        let i64_type = self.bcx.type_int(64);
-        let gas_remaining = self.bcx.load(i64_type, addr, "ecx.gas.remaining");
-        let (res, overflow) = self.bcx.usub_overflow(gas_remaining, cost);
-        self.bcx.store(res, addr);
-        self.build_check(overflow, InstrStop::OutOfGas);
+        if !self.is_fall_through_only(head) {
+            // Other paths can arrive with gas left unchecked, so force a check.
+            self.unchecked_gas = GAS_CHECK_THRESHOLD;
+        }
+        let cost = self.bytecode.inst(head).gas_section.gas_cost as u64;
+        if cost != 0 {
+            let remaining = self.load_gas_remaining();
+            let remaining = self.bcx.isub_imm(remaining, cost as i64);
+            let addr = self.gas_remaining_addr();
+            self.bcx.store(remaining, addr);
+            self.unchecked_gas += cost;
+        }
+        if self.unchecked_gas >= GAS_CHECK_THRESHOLD
+            || (self.unchecked_gas != 0 && self.section_needs_gas_check(head))
+        {
+            self.build_gas_check();
+            self.unchecked_gas = 0;
+        }
+    }
+
+    /// Returns `true` if `inst` can only be entered by falling through from the previous
+    /// instruction.
+    fn is_fall_through_only(&self, inst: Inst) -> bool {
+        let data = self.bytecode.inst(inst);
+        if data.is_reachable_jumpdest(self.bytecode.has_dynamic_jumps())
+            || data.flags.contains(InstFlags::REDIRECT_TARGET)
+        {
+            return false;
+        }
+        if inst.index() == 0 {
+            return true;
+        }
+        let prev = self.bytecode.inst(inst - 1);
+        !prev.is_dead_code() && prev.can_fall_through()
+    }
+
+    /// Returns `true` if the section headed by `head` reads the remaining gas, charges it in a
+    /// builtin, or ends execution.
+    ///
+    /// Memory resizes are left out: they are conditional and check on their own cold path.
+    fn section_needs_gas_check(&self, head: Inst) -> bool {
+        std::iter::successors(Some(head), |&inst| self.lexical_next_inst(inst))
+            .map(|inst| (inst, self.bytecode.inst(inst)))
+            .filter(|(_, data)| !data.is_dead_code())
+            .take_while(|&(inst, data)| inst == head || !data.is_stack_section_head())
+            .any(|(_, data)| {
+                data.is_diverging()
+                    || data.requires_gasleft(self.bytecode.spec_id)
+                    || matches!(
+                        data.opcode,
+                        op::EXP
+                            | op::KECCAK256
+                            | op::CALLDATACOPY
+                            | op::CODECOPY
+                            | op::RETURNDATACOPY
+                            | op::MCOPY
+                            | op::LOG0..=op::LOG4
+                    )
+            })
+    }
+
+    /// Fails with `OutOfGas` if gas subtracted without a check left the remaining gas negative.
+    ///
+    /// Leaves `unchecked_gas` alone, so it is safe to call on a conditional path.
+    fn build_gas_check(&mut self) {
+        if self.unchecked_gas == 0 {
+            return;
+        }
+        let remaining = self.load_gas_remaining();
+        let out_of_gas = self.bcx.icmp_imm(IntCC::SignedLessThan, remaining, 0);
+        self.build_check(out_of_gas, InstrStop::OutOfGas);
     }
 
     /// Ensures the memory is large enough for `offset + len` bytes, calling the `mresize`
@@ -1769,6 +1851,7 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
 
     /// Builds a branch to the return block.
     fn build_return(&mut self, ret: B::Value) {
+        self.build_gas_check();
         if self.config.inspect_stack {
             self.materialize_live_stack();
         }
@@ -1806,6 +1889,7 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
     ///
     /// The builtin longjmps on error, so no return value check is needed.
     fn call_fallible_builtin(&mut self, builtin: Builtin, args: &[B::Value]) {
+        self.build_gas_check();
         let _ = self.call_builtin(builtin, args);
     }
 
