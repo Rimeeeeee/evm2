@@ -282,7 +282,6 @@ builtins! {
     Keccak256CC    = __revmc_builtin_keccak256_cc(@[ecx] ptr, @[sp] ptr, usize, usize) None,
     Balance        = __revmc_builtin_balance(@[ecx] ptr, @[sp] ptr) None,
     Origin         = __revmc_builtin_origin(@[ecx_ro] ptr, @[sp] ptr) None,
-    CallDataLoad   = __revmc_builtin_calldataload(@[ecx_ro] ptr, @[sp] ptr) None,
     CallDataLoadC  = __revmc_builtin_calldataload_c(@[ecx_ro] ptr, @[sp] ptr, usize) None,
     CallDataCopy   = __revmc_builtin_calldatacopy(@[ecx] ptr, @[sp] ptr) None,
     CodeCopy       = __revmc_builtin_codecopy(@[ecx] ptr, @[sp] ptr) None,

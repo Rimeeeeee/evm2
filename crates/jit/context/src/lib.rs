@@ -46,6 +46,8 @@ pub struct EvmContext<'ctx, 'frame, 'host> {
 
     /// The size of return data from the last call-like operation.
     pub return_data_len: usize,
+    /// The call input data pointer, cached for CALLDATALOAD.
+    pub calldata: *const u8,
     /// The size of the call input data, cached for CALLDATASIZE.
     pub calldatasize: usize,
 
@@ -93,6 +95,7 @@ impl<'ctx, 'frame, 'host> EvmContext<'ctx, 'frame, 'host> {
         let interpreter_ptr = unsafe { NonNull::new_unchecked(interpreter_ptr) };
         let message = interpreter.message();
         let gas = interpreter.gas();
+        let calldata = message.input.as_ptr();
         let calldatasize = message.input.len();
         let return_data_len = interpreter.return_data().len();
         let (stack_ptr, stack_len) = unsafe { interpreter.stack_mut().into_raw_parts() };
@@ -101,6 +104,7 @@ impl<'ctx, 'frame, 'host> EvmContext<'ctx, 'frame, 'host> {
             interpreter: interpreter_ptr,
             gas,
             return_data_len,
+            calldata,
             calldatasize,
             exit_result: InstrStop::Stop,
             exit_sp: ptr::null_mut(),

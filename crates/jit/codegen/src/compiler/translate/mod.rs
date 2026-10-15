@@ -749,10 +749,7 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
                 let message = self.load_message_ptr();
                 field!(@push self.word_type, message, Message<BaseEvmTypes>; value);
             }
-            op::CALLDATALOAD => {
-                let sp = self.sp_after_inputs();
-                let _ = self.call_builtin(Builtin::CallDataLoad, &[self.ecx, sp]);
-            }
+            op::CALLDATALOAD => self.build_calldataload(),
             op::CALLDATASIZE => {
                 let ecx = self.ecx;
                 field!(@push self.isize_type, ecx, EvmContext<'_, '_, '_>; calldatasize);
@@ -1601,6 +1598,61 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
             this.call_fallible_builtin(Builtin::Mresize, &[this.ecx, min_size]);
         });
         self.build_memory_addr(offset)
+    }
+
+    /// Loads a calldata word inline when `offset + 32 <= calldatasize`, calling the builtin on
+    /// the cold path otherwise.
+    fn build_calldataload(&mut self) {
+        // Calldata is shorter than `isize::MAX` bytes, so larger offsets always load zero, and
+        // `offset + 32` cannot overflow for the rest. A constant offset folds the bounds check to a
+        // comparison of the size against an immediate.
+        if let [Some(offset)] = self.const_operands()
+            && offset >= U256::from(isize::MAX)
+        {
+            return self.fold_const(0);
+        }
+        let offset = self.pop();
+        let offset = self.u256_to_u64_saturating(offset, 63);
+
+        let ecx = self.ecx;
+        let calldatasize_addr = self.get_field(
+            ecx,
+            mem::offset_of!(EvmContext<'_, '_, '_>, calldatasize),
+            "ecx.calldatasize.addr",
+        );
+        let calldatasize = self.bcx.load(self.isize_type, calldatasize_addr, "ecx.calldatasize");
+        let end = self.bcx.iadd_imm(offset, 32);
+        let in_bounds = self.bcx.icmp(IntCC::UnsignedLessThanOrEqual, end, calldatasize);
+
+        let current_block = self.current_block();
+        let fast_block = self.create_block_after(current_block, "fast");
+        let slow_block = self.create_block_after(fast_block, "slow");
+        let done_block = self.create_block_after(slow_block, "contd");
+        self.bcx.brif_cold(in_bounds, fast_block, slow_block, false);
+
+        self.bcx.switch_to_block(fast_block);
+        let calldata_addr = self.get_field(
+            ecx,
+            mem::offset_of!(EvmContext<'_, '_, '_>, calldata),
+            "ecx.calldata.addr",
+        );
+        let ptr_type = self.bcx.type_ptr();
+        let calldata = self.bcx.load(ptr_type, calldata_addr, "ecx.calldata");
+        let addr = self.bcx.gep(self.i8_type, calldata, &[offset], "calldataload.addr");
+        let value = self.bcx.load_aligned(self.word_type, addr, 1, "calldataload.value");
+        let fast_value = if self.little_endian() { self.bcx.bswap(value) } else { value };
+        self.bcx.br(done_block);
+
+        self.bcx.switch_to_block(slow_block);
+        let sp = self.sp_from_top(1);
+        let _ = self.call_builtin(Builtin::CallDataLoadC, &[ecx, sp, offset]);
+        let slow_value = self.load_word(sp, "builtin.out");
+        self.bcx.br(done_block);
+
+        self.bcx.switch_to_block(done_block);
+        let value =
+            self.bcx.phi(self.word_type, &[(fast_value, fast_block), (slow_value, slow_block)]);
+        self.push(value);
     }
 
     fn can_skip_ensure_memory(&self, inst: Inst) -> bool {

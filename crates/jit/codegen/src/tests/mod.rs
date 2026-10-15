@@ -955,6 +955,46 @@ tests! {
             expected_stack: &[0xaa00000000000000000000000000000000000000000000000000000000000000_U256],
             expected_gas: 3 + 3,
         }),
+        calldataload_last_word(op::CALLDATALOAD, 32_U256 => U256::from_be_slice(&DEF_CD[32..])),
+        calldataload_below_last_word(op::CALLDATALOAD, 31_U256 => U256::from_be_slice(&DEF_CD[31..63])),
+        calldataload_past_last_word(op::CALLDATALOAD, 33_U256 => 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa00_U256),
+        calldataload_past_end(op::CALLDATALOAD, 64_U256 => 0_U256),
+        calldataload_above_i64(op::CALLDATALOAD, 0x8000000000000000_U256 => 0_U256),
+        calldataload_above_u64(op::CALLDATALOAD, 0x10000000000000000_U256 => 0_U256),
+        calldataload_max(op::CALLDATALOAD, U256::MAX => 0_U256),
+        calldataload_seq_last_word(@raw {
+            bytecode: &[op::PUSH1, 32, op::CALLDATALOAD],
+            modify_message: Some(|m| m.input = Bytes::from_static(&SEQ_CD)),
+            expected_stack: &[U256::from_be_slice(&SEQ_CD[32..])],
+            expected_gas: 3 + 3,
+        }),
+        calldataload_seq_below_last_word_dyn(@raw {
+            bytecode: &bytecode_unop_opaque(op::CALLDATALOAD, 31_U256),
+            modify_message: Some(|m| m.input = Bytes::from_static(&SEQ_CD)),
+            expected_stack: &[U256::from_be_slice(&SEQ_CD[31..63])],
+            expected_memory: MEMORY_WHAT_INTERPRETER_SAYS,
+            expected_gas: GAS_WHAT_INTERPRETER_SAYS,
+        }),
+        calldataload_seq_past_last_word_dyn(@raw {
+            bytecode: &bytecode_unop_opaque(op::CALLDATALOAD, 33_U256),
+            modify_message: Some(|m| m.input = Bytes::from_static(&SEQ_CD)),
+            expected_stack: &[U256::from_be_slice(&SEQ_CD[33..]) << 8],
+            expected_memory: MEMORY_WHAT_INTERPRETER_SAYS,
+            expected_gas: GAS_WHAT_INTERPRETER_SAYS,
+        }),
+        calldataload_empty(@raw {
+            bytecode: &[op::PUSH0, op::CALLDATALOAD],
+            modify_message: Some(|m| m.input = Bytes::new()),
+            expected_stack: &[0_U256],
+            expected_gas: 2 + 3,
+        }),
+        calldataload_empty_dyn(@raw {
+            bytecode: &bytecode_unop_opaque(op::CALLDATALOAD, 0_U256),
+            modify_message: Some(|m| m.input = Bytes::new()),
+            expected_stack: &[0_U256],
+            expected_memory: MEMORY_WHAT_INTERPRETER_SAYS,
+            expected_gas: GAS_WHAT_INTERPRETER_SAYS,
+        }),
         calldatasize(@raw {
             bytecode: &[op::CALLDATASIZE, op::CALLDATASIZE],
             expected_stack: &[U256::from(DEF_CD.len()), U256::from(DEF_CD.len())],
@@ -2349,6 +2389,17 @@ fn bytecode_ternop(op: u8, a: U256, b: U256, c: U256) -> [u8; 100] {
     code[i] = op;
     code
 }
+
+/// Calldata whose bytes are their own indices, so misordered loads show up.
+static SEQ_CD: [u8; 64] = {
+    let mut cd = [0; 64];
+    let mut i = 0;
+    while i < cd.len() {
+        cd[i] = i as u8;
+        i += 1;
+    }
+    cd
+};
 
 /// Build opaque unop bytecode: MSTORE(a, 0), MLOAD(0), `<op>`.
 fn bytecode_unop_opaque(opcode: u8, a: U256) -> Vec<u8> {

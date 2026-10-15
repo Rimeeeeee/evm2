@@ -232,23 +232,12 @@ pub unsafe extern "C" fn __revmc_builtin_origin(ecx: &EvmContext, slot: &mut Evm
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __revmc_builtin_calldataload(
-    ecx: &EvmContext,
-    offset_ptr: &mut EvmWord,
-) {
-    do_calldataload(ecx, offset_ptr, word_to_usize_saturated(offset_ptr.to_u256()));
-}
-
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __revmc_builtin_calldataload_c(
     ecx: &EvmContext,
-    offset_ptr: &mut EvmWord,
+    out: &mut EvmWord,
     offset: u64,
 ) {
-    do_calldataload(ecx, offset_ptr, offset as usize);
-}
-
-fn do_calldataload(ecx: &EvmContext, out: &mut EvmWord, offset: usize) {
+    let offset = offset as usize;
     let mut word = B256::ZERO;
     let input = ecx.input();
     let input_len = input.len();

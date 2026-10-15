@@ -30,7 +30,7 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
             op::SIGNEXTEND => self.peephole_signextend(),
             op::BYTE => self.peephole_byte(),
 
-            op::CALLDATALOAD | op::SLOAD => self.peephole_load(data.opcode),
+            op::SLOAD => self.peephole_sload(),
 
             op::KECCAK256 => self.peephole_keccak256(),
             op::RETURN | op::REVERT => self.peephole_return(data.opcode),
@@ -276,23 +276,13 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
         true
     }
 
-    fn peephole_load(&mut self, op: u8) -> bool {
+    fn peephole_sload(&mut self) -> bool {
         if let [Some(offset)] = self.const_operands()
             && let Ok(offset) = u64::try_from(offset)
         {
-            let builtin = match op {
-                op::SLOAD => Builtin::SloadC,
-                op::CALLDATALOAD => Builtin::CallDataLoadC,
-                _ => unreachable!(),
-            };
             let sp = self.sp_from_top(1);
             let offset = self.bcx.iconst(self.isize_type, offset as i64);
-            let args = &[self.ecx, sp, offset];
-            if op == op::CALLDATALOAD {
-                let _ = self.call_builtin(builtin, args);
-            } else {
-                self.call_fallible_builtin(builtin, args);
-            }
+            self.call_fallible_builtin(Builtin::SloadC, &[self.ecx, sp, offset]);
             // Builtin wrote output to sp; reload into virtual stack.
             let off = self.section_len_offset - 1;
             let value = self.load_word(sp, "builtin.out");
