@@ -34,6 +34,7 @@ unsafe extern "C" {
 
     pub(crate) fn evm2_jit_llvm_lljit_builder_set_concurrent_compiler(
         builder: LLVMOrcLLJITBuilderRef,
+        features: *const c_char,
     );
 
     pub(crate) fn evm2_jit_llvm_execution_session_remove_jit_dylib(
@@ -67,7 +68,12 @@ unsafe extern "C" {
 
     fn evm2_jit_llvm_set_dso_local(val: LLVMValueRef, local: bool);
 
-    fn evm2_jit_llvm_pin_arg_to_register(f: LLVMValueRef, arg: u32, reg: *const c_char);
+    fn evm2_jit_llvm_pin_args_to_registers(
+        f: LLVMValueRef,
+        args: *const u32,
+        regs: *const *const c_char,
+        n: usize,
+    );
 }
 
 pub(crate) fn set_dso_local(f: inkwell::values::FunctionValue<'_>) {
@@ -81,7 +87,20 @@ pub(crate) fn create_initializes_attr(cx: &Context, lower: i64, upper: i64) -> A
     }
 }
 
-/// Keeps argument `arg` of `f` in the reserved, callee-saved register `reg`.
-pub(crate) fn pin_arg_to_register(f: inkwell::values::FunctionValue<'_>, arg: u32, reg: &CStr) {
-    unsafe { evm2_jit_llvm_pin_arg_to_register(f.as_value_ref(), arg, reg.as_ptr()) };
+/// Keeps arguments `args[i]` of `f` in the reserved, callee-saved registers `regs[i]`.
+pub(crate) fn pin_args_to_registers(
+    f: inkwell::values::FunctionValue<'_>,
+    args: &[u32],
+    regs: &[&CStr],
+) {
+    assert_eq!(args.len(), regs.len());
+    let regs = regs.iter().map(|reg| reg.as_ptr()).collect::<Vec<_>>();
+    unsafe {
+        evm2_jit_llvm_pin_args_to_registers(
+            f.as_value_ref(),
+            args.as_ptr(),
+            regs.as_ptr(),
+            args.len(),
+        )
+    };
 }

@@ -240,8 +240,10 @@ impl GlobalOrcJit {
     ) -> Result<&'static Self> {
         let result = Self::global().get_or_init(|| {
             init().map_err(|e| e.to_string())?;
-            let jit =
-                orc::LLJIT::builder().concurrent_compiler().build().map_err(|e| e.to_string())?;
+            let jit = orc::LLJIT::builder()
+                .concurrent_compiler(RESERVED_REGS_FEATURES)
+                .build()
+                .map_err(|e| e.to_string())?;
             jit.get_execution_session().set_default_error_reporter();
             jit.get_obj_transform_layer().set_transform(obj_capture_transform);
 
@@ -1036,21 +1038,15 @@ impl Backend for EvmLlvmBackend {
         let opts = PassBuilderOptions::create();
         self.module().run_passes(passes, &self.machine, opts).map_err(error_msg)?;
 
-        if pin_ecx(&self.machine.get_triple()) {
-            for name in self.function_names.values() {
-                if let Some(f) = self.module().get_function(name)
-                    && f.count_basic_blocks() > 0
-                {
-                    // The ORC JIT detects the host features itself, so set them per function.
-                    let features = &TargetInfo::new().features;
-                    let attr = self.cx.create_string_attribute("target-features", features);
-                    f.add_attribute(AttributeLoc::Function, attr);
-                    cpp::pin_arg_to_register(f, 0, c"r12");
-                    if pin_stack() {
-                        cpp::pin_arg_to_register(f, 1, c"r13");
-                    }
-                }
+        for f in self.module().get_functions().filter(|_| !PINNED_REGS.is_empty()) {
+            let pinned = (0..f.count_params())
+                .filter(|&i| f.get_string_attribute(AttributeLoc::Param(i), PINNED_ATTR).is_some())
+                .collect::<Vec<_>>();
+            if pinned.is_empty() {
+                continue;
             }
+            assert!(pinned.len() <= PINNED_REGS.len(), "too many pinned parameters");
+            cpp::pin_args_to_registers(f, &pinned, &PINNED_REGS[..pinned.len()]);
         }
         Ok(())
     }
@@ -1184,11 +1180,9 @@ impl TargetInfo {
             let cpu = TargetMachine::get_host_cpu_name().to_string_lossy().into_owned();
             let mut features =
                 TargetMachine::get_host_cpu_features().to_string_lossy().into_owned();
-            if pin_ecx(&triple) {
-                features.push_str(",+reserve-r12");
-                if pin_stack() {
-                    features.push_str(",+reserve-r13");
-                }
+            if !PINNED_REGS.is_empty() {
+                features.push(',');
+                features.push_str(RESERVED_REGS_FEATURES.to_str().unwrap());
             }
             Self { target, triple, cpu, features }
         })
@@ -2213,6 +2207,7 @@ fn convert_attribute(bcx: &EvmLlvmBuilder<'_>, attr: evm2_jit_backend::Attribute
         OurAttr::ArgMemOnly => ("memory", AttrValue::Enum(3)),
         // `u64::MAX` marks all reachable memory as dead; `0` would mark zero bytes.
         OurAttr::DeadOnReturn => ("dead_on_return", AttrValue::Enum(u64::MAX)),
+        OurAttr::Pinned => (PINNED_ATTR, AttrValue::String("")),
 
         OurAttr::Initializes(size) => {
             return cpp::create_initializes_attr(bcx.cx, 0, size as i64);
@@ -2287,14 +2282,15 @@ fn fmt_ty(ty: BasicTypeEnum<'_>) -> impl std::fmt::Display {
     ty.print_to_string().to_str().unwrap().trim_matches('"').to_string()
 }
 
-/// Whether EVM functions keep `ecx` in the reserved register `r12`.
-fn pin_ecx(triple: &TargetTriple) -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("EVM2_JIT_PIN_ECX").is_ok_and(|v| v != "0"))
-        && triple.as_str().to_bytes().starts_with(b"x86_64")
-}
+/// String attribute that marks a parameter as pinned to a register.
+const PINNED_ATTR: &str = "evm2.pinned";
 
-fn pin_stack() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("EVM2_JIT_PIN_STACK").is_ok_and(|v| v != "0"))
-}
+/// Callee-saved registers reserved for pinned parameters, in parameter order.
+///
+/// Pinned functions restore the caller's values only on return, so nothing may unwind through
+/// them. Builtins are `extern "C"`, so a panic in one aborts instead.
+const PINNED_REGS: &[&CStr] = if cfg!(target_arch = "x86_64") { &[c"r12", c"r13"] } else { &[] };
+
+/// Target features that reserve [`PINNED_REGS`].
+const RESERVED_REGS_FEATURES: &CStr =
+    if cfg!(target_arch = "x86_64") { c"+reserve-r12,+reserve-r13" } else { c"" };

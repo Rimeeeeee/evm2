@@ -788,6 +788,16 @@ impl<B: Backend> EvmCompiler<B> {
             }
         }
 
+        // Keep the context and stack pointers in registers across the whole function instead of
+        // letting register allocation spill them.
+        for param in 0..=1 {
+            bcx.add_function_attribute(
+                None,
+                Attribute::Pinned,
+                FunctionAttributeLocation::Param(param),
+            );
+        }
+
         // The stack argument's contents are dead after return when the stack is not observed,
         // so the caller can elide any stores to the buffer.
         if !bytecode.stack_observed() {

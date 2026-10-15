@@ -155,6 +155,9 @@ pub enum Attribute {
     /// `dead_on_return` — the contents of the pointed-to memory are dead after the function
     /// returns, allowing the caller to elide stores to the memory.
     DeadOnReturn,
+    /// Keep the parameter in a reserved callee-saved register for the whole function, where the
+    /// target has registers to spare.
+    Pinned,
     // TODO: Range?
 }
 

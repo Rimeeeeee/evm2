@@ -17,11 +17,9 @@
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Intrinsics.h>
-#include <llvm/IR/Module.h>
 #include <llvm/Target/TargetMachine.h>
 
 #include <atomic>
-#include <functional>
 #include <fstream>
 #include <unistd.h>
 
@@ -63,13 +61,16 @@ evm2_jit_llvm_jit_dylib_add_to_link_order(LLVMOrcJITDylibRef JD,
 /// setSupportConcurrentCompilation(true) would also switch the dispatcher to
 /// DynamicThreadPoolTaskDispatcher, spawning background threads. We only want
 /// the thread-safe compiler, not the thread pool.
+///
+/// `Features` is a comma-separated list of target features to add to the host's.
 extern "C" void evm2_jit_llvm_lljit_builder_set_concurrent_compiler(
-    LLVMOrcLLJITBuilderRef Builder) {
+    LLVMOrcLLJITBuilderRef Builder, const char *Features) {
   auto *B = reinterpret_cast<orc::LLJITBuilder *>(Builder);
   B->setCompileFunctionCreator(
-      [](orc::JITTargetMachineBuilder JTMB)
+      [Features = std::string(Features)](orc::JITTargetMachineBuilder JTMB)
           -> Expected<std::unique_ptr<orc::IRCompileLayer::IRCompiler>> {
         JTMB.setCodeGenOptLevel(CodeGenOptLevel::Aggressive);
+        JTMB.addFeatures(SubtargetFeatures(Features).getFeatures());
         return std::make_unique<orc::ConcurrentIRCompiler>(std::move(JTMB));
       });
 }
@@ -368,84 +369,78 @@ extern "C" void evm2_jit_llvm_set_dso_local(LLVMValueRef Val, bool Local) {
   unwrap<GlobalValue>(Val)->setDSOLocal(Local);
 }
 
-/// Keeps argument `ArgNo` of `Fn` in the reserved register `Reg` for the whole function.
+/// Keeps arguments `Args[i]` of `Fn` in the reserved registers `Regs[i]` for the whole function.
 ///
-/// The argument is written to `Reg` on entry, and every use of it, or of a constant-offset
-/// address derived from it, reads `Reg` instead. The caller's value of `Reg` is restored before
-/// each return. `Reg` must be reserved in the target features and callee-saved.
-extern "C" void evm2_jit_llvm_pin_arg_to_register(LLVMValueRef FnRef, unsigned ArgNo,
-                                                  const char *Reg) {
+/// Each argument is written to its register on entry, and every use of it, or of a
+/// constant-offset address derived from it, reads the register instead, once per block. The
+/// caller's values of the registers are restored before each return. The registers must be
+/// reserved in the target features and callee-saved.
+extern "C" void evm2_jit_llvm_pin_args_to_registers(LLVMValueRef FnRef, const unsigned *Args,
+                                                    const char *const *Regs, size_t N) {
   Function &F = *unwrap<Function>(FnRef);
-  Module &M = *F.getParent();
   LLVMContext &Ctx = F.getContext();
+  const DataLayout &DL = F.getDataLayout();
   Type *I64 = Type::getInt64Ty(Ctx);
-  Argument *Arg = F.getArg(ArgNo);
-  Value *RegMD = MetadataAsValue::get(Ctx, MDNode::get(Ctx, {MDString::get(Ctx, Reg)}));
-  Function *Read = Intrinsic::getOrInsertDeclaration(&M, Intrinsic::read_register, {I64});
-  Function *Write = Intrinsic::getOrInsertDeclaration(&M, Intrinsic::write_register, {I64});
+  IRBuilder<> B(Ctx);
 
-  std::function<bool(Value *)> IsDerived = [&](Value *V) {
-    if (V == Arg)
-      return true;
-    if (auto *GEP = dyn_cast<GetElementPtrInst>(V))
-      return GEP->hasAllConstantIndices() && IsDerived(GEP->getPointerOperand());
-    return false;
-  };
-  // Rematerialize each value once per block, at the top of the block.
-  DenseMap<std::pair<Value *, BasicBlock *>, Value *> Cache;
+  // Rematerialized values go before each block's original first instruction, so they stay in
+  // dependency order.
   DenseMap<BasicBlock *, Instruction *> InsertPts;
-  std::function<Value *(Value *, BasicBlock *)> Remat = [&](Value *V, BasicBlock *BB) -> Value * {
-    if (Value *Cached = Cache.lookup({V, BB}))
-      return Cached;
-    // Insert before the block's original first instruction so rematerialized values stay in
-    // dependency order.
-    Instruction *Pt = InsertPts.try_emplace(BB, &*BB->getFirstInsertionPt()).first->second;
-    Value *Result;
-    if (V == Arg) {
-      IRBuilder<> B(Pt);
-      Result = B.CreateIntToPtr(B.CreateCall(Read, {RegMD}), Arg->getType());
-    } else {
-      auto *I = cast<Instruction>(V);
-      Value *Base = Remat(I->getOperand(0), BB);
-      Instruction *C = I->clone();
-      C->setName(I->getName());
-      C->insertBefore(Pt->getIterator());
-      C->setOperand(0, Base);
-      Result = C;
-    }
-    Cache[{V, BB}] = Result;
-    return Result;
+  auto InsertPt = [&](BasicBlock *BB) {
+    return InsertPts.try_emplace(BB, &*BB->getFirstInsertionPt()).first->second;
   };
 
   SmallVector<Instruction *, 16> Dead;
-  std::function<void(Value *)> Visit = [&](Value *V) {
-    SmallVector<Use *, 16> Uses;
-    for (Use &U : V->uses())
-      Uses.push_back(&U);
-    for (Use *U : Uses) {
-      auto *User = cast<Instruction>(U->getUser());
-      if (User != V && IsDerived(User)) {
-        Visit(User);
-        Dead.push_back(User);
-        continue;
-      }
-      BasicBlock *BB = User->getParent();
-      if (auto *Phi = dyn_cast<PHINode>(User))
-        BB = Phi->getIncomingBlock(*U);
-      U->set(Remat(V, BB));
-    }
-  };
-  Visit(Arg);
-  for (Instruction *I : reverse(Dead))
-    if (I->use_empty())
-      I->eraseFromParent();
+  SmallVector<std::pair<Value *, Value *>, 2> Saved;
+  for (size_t I = 0; I < N; ++I) {
+    Argument *Arg = F.getArg(Args[I]);
+    Value *Reg = MetadataAsValue::get(Ctx, MDNode::get(Ctx, {MDString::get(Ctx, Regs[I])}));
 
-  IRBuilder<> B(&*F.getEntryBlock().getFirstInsertionPt());
-  Value *Saved = B.CreateCall(Read, {RegMD}, "saved_reg");
-  B.CreateCall(Write, {RegMD, B.CreatePtrToInt(Arg, I64)});
+    DenseMap<std::pair<int64_t, BasicBlock *>, Value *> Cache;
+    auto Remat = [&](int64_t Offset, BasicBlock *BB, const Twine &Name) {
+      auto [It, Inserted] = Cache.try_emplace({Offset, BB});
+      if (Inserted) {
+        B.SetInsertPoint(InsertPt(BB));
+        Value *Read = B.CreateIntrinsic(Intrinsic::read_register, {I64}, {Reg});
+        Value *Ptr = B.CreateIntToPtr(Read, Arg->getType());
+        It->second = Offset ? B.CreateInBoundsPtrAdd(Ptr, B.getInt64(Offset), Name) : Ptr;
+      }
+      return It->second;
+    };
+
+    auto Visit = [&](auto &Self, Value *V, int64_t Offset) -> void {
+      for (Use &U : make_early_inc_range(V->uses())) {
+        auto *User = cast<Instruction>(U.getUser());
+        APInt GEPOffset(64, 0);
+        if (auto *GEP = dyn_cast<GetElementPtrInst>(User);
+            GEP && GEP->accumulateConstantOffset(DL, GEPOffset)) {
+          Self(Self, GEP, Offset + GEPOffset.getSExtValue());
+          Dead.push_back(GEP);
+          continue;
+        }
+        BasicBlock *BB = User->getParent();
+        if (auto *Phi = dyn_cast<PHINode>(User))
+          BB = Phi->getIncomingBlock(U);
+        U.set(Remat(Offset, BB, V->getName()));
+      }
+    };
+    Visit(Visit, Arg, 0);
+
+    B.SetInsertPoint(&*F.getEntryBlock().getFirstInsertionPt());
+    Value *Old = B.CreateIntrinsic(Intrinsic::read_register, {I64}, {Reg});
+    B.CreateIntrinsic(Intrinsic::write_register, {I64}, {Reg, B.CreatePtrToInt(Arg, I64)});
+    Saved.push_back({Reg, Old});
+  }
+
+  // Erase only now, since a dead GEP may be a block's insertion point. Users come before the
+  // GEPs they use.
+  for (Instruction *I : Dead)
+    I->eraseFromParent();
+
   for (BasicBlock &BB : F)
     if (auto *Ret = dyn_cast<ReturnInst>(BB.getTerminator())) {
       B.SetInsertPoint(Ret);
-      B.CreateCall(Write, {RegMD, Saved});
+      for (auto [Reg, Old] : Saved)
+        B.CreateIntrinsic(Intrinsic::write_register, {I64}, {Reg, Old});
     }
 }
