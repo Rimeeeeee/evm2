@@ -3,10 +3,13 @@
 use super::{AccountBal, BalError, BlockAccessIndex};
 use crate::{
     bytecode::BytecodeDecodeError,
-    evm::state::{AccountInfo, PendingState},
+    evm::state::{Account, AccountInfo, PendingState},
 };
 use alloc::vec::Vec;
-use alloy_eip7928::{AccountChanges as AlloyAccountChanges, BlockAccessList as AlloyBal};
+use alloy_eip7928::{
+    AccountChanges as AlloyAccountChanges, BlockAccessList as AlloyBal,
+    CodeChange as AlloyCodeChange, SlotChanges as AlloySlotChanges,
+};
 use alloy_primitives::{Address, U256, map::AddressMap};
 
 /// BAL structure.
@@ -28,6 +31,50 @@ impl Bal {
         Self { accounts: AddressMap::default() }
     }
 
+    /// Returns a canonical EIP-7928 [`AlloyBal`] without consuming this BAL.
+    ///
+    /// Builds the output directly from borrowed entries, cloning the change lists and sharing
+    /// the original bytecode bytes without cloning the intermediate maps or decoded bytecode.
+    /// Accounts are sorted by address, storage reads and writes by slot, and changes by block
+    /// access index. The source BAL is left unchanged.
+    pub fn to_alloy_bal(&self) -> AlloyBal {
+        let mut alloy_bal = AlloyBal::from_iter(self.accounts.iter().map(|(&address, account)| {
+            let mut storage_reads = Vec::new();
+            let mut storage_changes = Vec::new();
+            for (&slot, changes) in &account.storage.storage {
+                if changes.is_empty() {
+                    storage_reads.push(slot);
+                } else {
+                    storage_changes.push(AlloySlotChanges::new(slot, changes.changes.clone()));
+                }
+            }
+
+            let mut changes = AlloyAccountChanges {
+                address,
+                storage_changes,
+                storage_reads,
+                balance_changes: account.account_info.balance.changes.clone(),
+                nonce_changes: account.account_info.nonce.changes.clone(),
+                code_changes: account
+                    .account_info
+                    .code
+                    .changes
+                    .iter()
+                    .map(|change| {
+                        AlloyCodeChange::new(
+                            change.block_access_index,
+                            change.code.1.original_bytes(),
+                        )
+                    })
+                    .collect(),
+            };
+            changes.sort();
+            changes
+        }));
+        alloy_bal.sort_unstable_by_key(|account| account.address);
+        alloy_bal
+    }
+
     /// Extend BAL with a transaction's detached [`PendingState`] at `bal_index`.
     ///
     /// This is the fold [`Evm`](crate::Evm) applies on transaction commit when its BAL builder is
@@ -35,26 +82,14 @@ impl Bal {
     /// ones as writes at `bal_index`. Apply pending states in transaction order, since writes
     /// must be appended with ascending indices.
     pub fn commit(&mut self, bal_index: BlockAccessIndex, pending: PendingState) {
-        for (address, entry) in &pending.accounts {
-            self.update_account(
-                bal_index,
-                *address,
-                entry.original.as_ref(),
-                entry.present.as_ref(),
-            );
-        }
-        for (address, overlay) in &pending.storage {
-            self.accounts
-                .entry(*address)
-                .or_default()
-                .storage
-                .update_pending(bal_index, &overlay.slots);
+        for (&address, account) in &pending.accounts {
+            self.update_account(bal_index, address, account);
         }
     }
 
     /// Extend BAL with one pending account overlay entry: its transaction-boundary original info
-    /// against its present info. An absent side is the non-existent (default) account, so an
-    /// account removed by the transaction records zeroed writes.
+    /// against its present info, and its loaded storage slots. An absent side is the non-existent
+    /// (default) account, so an account removed by the transaction records zeroed writes.
     ///
     /// A selfdestructed account needs no special-casing: transaction finalization already resolved
     /// its present info to the EIP-8246 balance-only remnant or to a removed account, and its
@@ -64,16 +99,16 @@ impl Bal {
         &mut self,
         bal_index: BlockAccessIndex,
         address: Address,
-        original: Option<&AccountInfo>,
-        present: Option<&AccountInfo>,
+        account: &Account,
     ) {
         let bal_account = self.accounts.entry(address).or_default();
         let absent = AccountInfo::default();
         bal_account.account_info.update(
             bal_index,
-            original.unwrap_or(&absent),
-            present.unwrap_or(&absent),
+            account.original.as_ref().unwrap_or(&absent),
+            account.present.as_ref().unwrap_or(&absent),
         );
+        bal_account.storage.update_pending(bal_index, &account.storage.slots);
     }
 
     /// Populate storage slot from BAL by account address.
@@ -96,6 +131,14 @@ impl Bal {
             *value = bal_value;
         };
         Ok(())
+    }
+}
+
+impl From<&Bal> for AlloyBal {
+    /// Converts a borrowed BAL using [`Bal::to_alloy_bal`].
+    #[inline]
+    fn from(bal: &Bal) -> Self {
+        bal.to_alloy_bal()
     }
 }
 
@@ -288,7 +331,7 @@ mod tests {
     }
 
     #[test]
-    fn into_alloy_bal_canonicalizes_eip_7928_ordering() {
+    fn alloy_bal_conversions_canonicalize_eip_7928_ordering() {
         let low_address = Address::with_last_byte(1);
         let high_address = Address::with_last_byte(2);
 
@@ -339,10 +382,15 @@ mod tests {
             },
         };
 
-        let alloy_bal = AlloyBal::from(Bal::from_iter([
+        let bal = Bal::from_iter([
             (high_address, AccountBal::default()),
             (low_address, unordered_account),
-        ]));
+        ]);
+        let original = bal.clone();
+        let alloy_bal = bal.to_alloy_bal();
+        assert_eq!(alloy_bal, AlloyBal::from(&bal));
+        assert_eq!(bal, original);
+        assert_eq!(alloy_bal, AlloyBal::from(bal));
 
         assert_eq!(
             alloy_bal.iter().map(|account| account.address).collect::<Vec<_>>(),
@@ -391,6 +439,15 @@ mod tests {
             account.code_changes.iter().map(|change| change.block_access_index).collect::<Vec<_>>(),
             vec![idx(3), idx(7)]
         );
+        assert_eq!(account.code_changes[0].new_code().as_ref(), &[3]);
+        assert_eq!(account.code_changes[1].new_code().as_ref(), &[7]);
+    }
+
+    #[test]
+    fn borrowed_empty_bal_converts_to_empty_alloy_bal() {
+        let bal = Bal::new();
+        assert!(bal.to_alloy_bal().is_empty());
+        assert!(AlloyBal::from(&bal).is_empty());
     }
 
     fn slot(original: U256, current: U256) -> StorageSlot {
@@ -411,9 +468,9 @@ mod tests {
         let mut overlay = StorageOverlay::default();
         overlay.slots.insert(U256::from(5), slot(U256::ZERO, U256::from(42)));
         overlay.slots.insert(U256::from(6), slot(U256::from(7), U256::from(7)));
+        let account = Account { storage: overlay, ..account };
         let pending = PendingState {
             accounts: AddressMap::from_iter([(address, account)]),
-            storage: AddressMap::from_iter([(address, overlay)]),
             selfdestructs: Default::default(),
         };
 
@@ -452,9 +509,9 @@ mod tests {
         };
         let mut overlay = StorageOverlay { wiped: true, ..Default::default() };
         overlay.slots.insert(U256::from(5), slot(U256::from(42), U256::from(42)));
+        let account = Account { storage: overlay, ..account };
         let pending = PendingState {
             accounts: AddressMap::from_iter([(address, account)]),
-            storage: AddressMap::from_iter([(address, overlay)]),
             selfdestructs: AddressSet::from_iter([address]),
         };
 

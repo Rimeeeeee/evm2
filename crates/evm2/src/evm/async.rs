@@ -5,9 +5,8 @@
 //! suspended and the outer async task returns `Poll::Pending`.
 
 use crate::{
-    AnyError, ErrorCode,
+    DatabaseError,
     bytecode::Bytecode,
-    error::error_unavailable,
     evm::{AccountInfo, DbResult, DynDatabase, NonStaticAny},
     interpreter::Word,
 };
@@ -21,7 +20,14 @@ type Yield = ();
 type Complete<R> = AsyncResult<R>;
 type EvmFiber<R> = Coroutine<Resume, Yield, Complete<R>, DefaultStack>;
 
-const DEFAULT_STACK_SIZE: usize = 1024 * 1024;
+/// Fiber stack size, large enough for nested calls to reach the 1024 call depth limit.
+///
+/// Calls recurse on the native stack. Before EIP-150 a call can forward almost all of its gas, so a
+/// self-calling contract reaches the depth limit with about 5.3M gas. Running such a transaction
+/// with 1025 frames needs at least about 1.0 MiB of stack in release builds, 1.6 MiB with an
+/// inspector, and 5.6 MiB with an inspector at opt-level 0 (about 5.5 KiB per frame). The stack is
+/// reserved with `mmap` and committed lazily, so unused headroom only costs address space.
+const DEFAULT_STACK_SIZE: usize = 16 * 1024 * 1024;
 
 /// Reusable async EVM fiber stack storage.
 #[derive(Default)]
@@ -407,6 +413,11 @@ pub trait AsyncDatabase: NonStaticAny {
     /// Database error type.
     type Error: Error + Send + Sync + 'static;
 
+    /// Whether a concrete database error indicates an internal failure rather than invalid input.
+    fn is_fatal(_error: &Self::Error) -> bool {
+        true
+    }
+
     /// Loads account information.
     fn get_account(
         &mut self,
@@ -436,14 +447,13 @@ pub trait AsyncDatabase: NonStaticAny {
 /// Adapter that exposes an [`AsyncDatabase`] through the synchronous [`DynDatabase`] interface.
 pub struct AsyncDb<D: AsyncDatabase> {
     db: D,
-    error: Option<AnyError>,
 }
 
 impl<D: AsyncDatabase> AsyncDb<D> {
     /// Creates a new async database adapter.
     #[inline]
     pub const fn new(db: D) -> Self {
-        Self { db, error: None }
+        Self { db }
     }
 
     /// Returns the wrapped database.
@@ -464,23 +474,14 @@ impl<D: AsyncDatabase> AsyncDb<D> {
         self.db
     }
 
-    /// Takes the stored database or async execution error.
-    #[inline]
-    pub const fn take_error(&mut self) -> Option<AnyError> {
-        self.error.take()
-    }
-
-    #[inline]
-    fn store_error(&mut self, error: impl Error + Send + Sync + 'static) -> ErrorCode {
-        self.error = Some(AnyError::new(error));
-        ErrorCode::STORED_ERROR
-    }
-
     #[inline]
     fn database_result<T>(&mut self, result: AsyncResult<T, D::Error>) -> DbResult<T> {
         result.map_err(|error| match error {
-            AsyncError::Inner(error) => self.store_error(error),
-            error => self.store_error(error),
+            AsyncError::Inner(error) => {
+                let fatal = D::is_fatal(&error);
+                DatabaseError::new(error, fatal)
+            }
+            error => DatabaseError::new(error, true),
         })
     }
 }
@@ -521,16 +522,6 @@ impl<D: AsyncDatabase> DynDatabase for AsyncDb<D> {
         };
         self.database_result(result)
     }
-
-    #[inline]
-    fn error(&mut self, code: ErrorCode) -> AnyError {
-        if code == ErrorCode::STORED_ERROR
-            && let Some(error) = self.error.clone()
-        {
-            return error;
-        }
-        error_unavailable(code)
-    }
 }
 
 impl<D: AsyncDatabase + fmt::Debug> fmt::Debug for AsyncDb<D> {
@@ -547,13 +538,14 @@ mod tests {
         BaseEvmTypes, Evm, PrecompileError, Precompiles, SpecId, TxResult, TxResultExt,
         bytecode::Bytecode,
         env::BlockEnvExt,
-        evm::{Database, Db, DynDatabase, InMemoryDB, PrecompileProvider, SystemTx},
+        evm::{AccountInfo, Database, Db, DynDatabase, InMemoryDB, PrecompileProvider, SystemTx},
         interpreter::{GasTracker, Message, Word, op},
         precompile::PrecompileOutput,
-        registry::{HandlerError, HandlerResult, TxRegistry, TxRequest},
+        precompiles::PrecompileId,
+        registry::{HandlerError, HandlerResult, TxRegistry, TxRequest, handler},
     };
     use alloy_consensus::{TxLegacy, transaction::Recovered};
-    use alloy_primitives::{Address, B256, Bytes, TxKind};
+    use alloy_primitives::{Address, B256, Bytes, TxKind, hex};
     use core::{
         assert_matches, convert::Infallible, fmt, future::Future, pin::Pin, ptr::NonNull,
         task::Poll,
@@ -653,15 +645,16 @@ mod tests {
     }
 
     #[test]
-    fn async_database_stores_database_error() {
+    fn async_database_returns_owned_database_error() {
         let mut db = AsyncDb::new(FailingDb);
         let address = Address::ZERO;
         let key = Word::from(7);
         let code = on_fiber(|| DynDatabase::get_storage(&mut db, &address, &key).unwrap_err());
         let code = poll_ready(code).unwrap();
 
-        assert_eq!(db.error(code).to_string(), "storage read failed");
-        assert_eq!(db.error(code).to_string(), "storage read failed");
+        assert_eq!(code.to_string(), "storage read failed");
+        assert!(code.is_fatal());
+        assert!(code.downcast_ref::<TestError>().is_some());
     }
 
     #[test]
@@ -679,7 +672,7 @@ mod tests {
         let registry = TxRegistry::new().with_handler(
             TEST_TX_TYPE,
             crate::ethereum::TxEnvelope::as_legacy,
-            handle_test_tx,
+            handler(|_| Ok(()), |req, ()| handle_test_tx(req)),
         );
         let mut evm = Evm::<BaseEvmTypes>::new(
             SpecId::OSAKA,
@@ -700,7 +693,7 @@ mod tests {
         let registry = TxRegistry::new().with_handler(
             TEST_TX_TYPE,
             crate::ethereum::TxEnvelope::as_legacy,
-            handle_test_tx,
+            handler(|_| Ok(()), |req, ()| handle_test_tx(req)),
         );
         let mut evm = Evm::<BaseEvmTypes>::new(
             SpecId::OSAKA,
@@ -722,7 +715,7 @@ mod tests {
         let registry = TxRegistry::new().with_handler(
             TEST_TX_TYPE,
             crate::ethereum::TxEnvelope::as_legacy,
-            handle_test_tx,
+            handler(|_| Ok(()), |req, ()| handle_test_tx(req)),
         );
         let mut evm = Evm::<BaseEvmTypes>::new(
             SpecId::OSAKA,
@@ -762,7 +755,7 @@ mod tests {
         let registry = TxRegistry::new().with_handler(
             TEST_TX_TYPE,
             crate::ethereum::TxEnvelope::as_legacy,
-            handle_test_tx,
+            handler(|_| Ok(()), |req, ()| handle_test_tx(req)),
         );
         let mut evm = Evm::<BaseEvmTypes>::new(
             SpecId::OSAKA,
@@ -802,7 +795,7 @@ mod tests {
         let registry = TxRegistry::new().with_handler(
             TEST_TX_TYPE,
             crate::ethereum::TxEnvelope::as_legacy,
-            handle_test_tx,
+            handler(|_| Ok(()), |req, ()| handle_test_tx(req)),
         );
         let database = Db::new(NonSendDb { marker: Rc::clone(&marker) });
         let precompiles = NonSendPrecompiles { marker: Rc::clone(&marker) };
@@ -869,14 +862,8 @@ mod tests {
         let key = Word::from(7);
         let code = DynDatabase::get_storage(&mut db, &address, &key).unwrap_err();
 
-        assert_eq!(
-            db.error(code).to_string(),
-            "async host operation requires EVM async fiber execution"
-        );
-        assert_eq!(
-            db.error(code).to_string(),
-            "async host operation requires EVM async fiber execution"
-        );
+        assert_eq!(code.to_string(), "async host operation requires EVM async fiber execution");
+        assert!(code.is_fatal());
     }
 
     #[test]
@@ -939,7 +926,7 @@ mod tests {
     }
 
     #[test]
-    fn system_call_async_clears_stale_error_code() {
+    fn system_call_async_succeeds_after_database_error() {
         let contract = Address::from([0x42; 20]);
         let mut evm = Evm::<BaseEvmTypes>::new(
             SpecId::OSAKA,
@@ -956,15 +943,13 @@ mod tests {
             Address::ZERO,
         );
 
-        assert_matches!(evm.transact(&tx), Err(HandlerError::Fatal(_)));
-        assert!(evm.error_code().is_some());
+        assert_matches!(evm.transact(&tx), Err(HandlerError::Database(_)));
 
         let result = poll_ready(evm.system_call_async(SystemTx::new(contract, Bytes::new())))
             .unwrap()
             .discard();
 
         assert!(result.status);
-        assert_eq!(result.error_code, None);
     }
 
     #[test]
@@ -1014,6 +999,49 @@ mod tests {
             assert_matches!(future.as_mut().poll(&mut cx), Poll::Pending);
         }
         assert!(saw_cancel);
+    }
+
+    #[test]
+    fn transact_async_reaches_call_depth_limit() {
+        let caller = Address::from([0xaa; 20]);
+        let target = Address::from([0x11; 20]);
+        // SLOAD 0, add 1, SSTORE 0, then CALL self with all but 1024 gas remaining.
+        let code = Bytecode::new_legacy(Bytes::from_static(&hex!(
+            "60005460010160005560006000600060006000306104005a03f100"
+        )));
+        let mut database = InMemoryDB::default();
+        database.insert_account_info(
+            &caller,
+            AccountInfo::default().with_balance(Word::from(10).pow(Word::from(18))),
+        );
+        database.insert_account_info(
+            &target,
+            AccountInfo { nonce: 1, ..AccountInfo::default().with_code(code) },
+        );
+        let mut evm = Evm::<BaseEvmTypes>::new(
+            SpecId::FRONTIER,
+            BlockEnvExt::default(),
+            crate::ethereum::ethereum_tx_registry(SpecId::FRONTIER),
+            database,
+            Precompiles::base(SpecId::FRONTIER),
+        );
+        let tx = Recovered::new_unchecked(
+            crate::ethereum::TxEnvelope::Legacy(TxLegacy {
+                to: TxKind::Call(target),
+                gas_limit: 7_000_000,
+                ..TxLegacy::default()
+            }),
+            caller,
+        );
+
+        let result = poll_ready(evm.transact_async(&tx)).unwrap().commit();
+
+        assert!(result.status);
+        assert_eq!(result.tx_gas_used(), 5_291_175);
+        assert_eq!(
+            evm.state_mut().storage_slot_untracked(&target, &Word::ZERO).unwrap(),
+            Word::from(1025)
+        );
     }
 
     const TEST_TX_TYPE: u8 = 0x00;
@@ -1114,9 +1142,23 @@ mod tests {
     }
 
     impl PrecompileProvider<BaseEvmTypes> for NonSendPrecompiles {
+        fn precompile_ids(&self) -> Vec<(Address, PrecompileId)> {
+            Vec::new()
+        }
+
         fn contains(&self, _address: &Address) -> bool {
             let _ = Rc::strong_count(&self.marker);
             false
+        }
+
+        fn move_precompiles(
+            &mut self,
+            moves: &[(Address, Address)],
+        ) -> Result<(), crate::precompiles::MovePrecompileError> {
+            <crate::evm::precompile::NoPrecompiles as PrecompileProvider<BaseEvmTypes>>::move_precompiles(
+                &mut Default::default(),
+                moves,
+            )
         }
 
         fn execute(

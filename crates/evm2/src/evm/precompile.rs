@@ -4,7 +4,7 @@ use super::{Evm, NonStaticAny};
 use crate::{
     EvmTypesHost, PrecompileError,
     interpreter::{GasTracker, Message},
-    precompiles::PrecompileId,
+    precompiles::{MovePrecompileError, PrecompileId},
 };
 use alloc::{boxed::Box, vec::Vec};
 use alloy_primitives::{Address, Bytes};
@@ -45,13 +45,26 @@ pub trait PrecompileProvider<T: EvmTypesHost>: NonStaticAny {
         Vec::new()
     }
 
-    /// Returns precompile addresses and identifiers.
-    fn precompile_ids(&self) -> Vec<(Address, PrecompileId)> {
-        Vec::new()
+    /// Calls `f` with each precompile address.
+    ///
+    /// Defaults to iterating [`Self::addresses`]; providers should override it to avoid the
+    /// allocation, since it runs once per transaction.
+    fn for_each_address(&self, f: &mut dyn FnMut(Address)) {
+        self.addresses().into_iter().for_each(f);
     }
+
+    /// Returns precompile addresses and identifiers.
+    fn precompile_ids(&self) -> Vec<(Address, PrecompileId)>;
 
     /// Returns whether `address` has a registered precompile.
     fn contains(&self, address: &Address) -> bool;
+
+    /// Relocates installed precompiles, validating all sources before changing the provider.
+    ///
+    /// Entries whose source and destination match are ignored. Wrappers must preserve the
+    /// underlying provider and invalidate any address-dependent caches after a successful move.
+    fn move_precompiles(&mut self, moves: &[(Address, Address)])
+    -> Result<(), MovePrecompileError>;
 
     /// Executes the precompile at `address`, if one is registered.
     fn execute(
@@ -97,8 +110,23 @@ impl<T: EvmTypesHost> PrecompileProvider<T> for NoPrecompiles {
     }
 
     #[inline]
+    fn precompile_ids(&self) -> Vec<(Address, PrecompileId)> {
+        Vec::new()
+    }
+
+    #[inline]
     fn contains(&self, _address: &Address) -> bool {
         false
+    }
+
+    fn move_precompiles(
+        &mut self,
+        moves: &[(Address, Address)],
+    ) -> Result<(), MovePrecompileError> {
+        match moves.iter().find(|(source, dest)| source != dest) {
+            Some((source, _)) => Err(MovePrecompileError::NotAPrecompile(*source)),
+            None => Ok(()),
+        }
     }
 
     #[inline]

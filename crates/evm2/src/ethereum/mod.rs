@@ -15,16 +15,19 @@ pub mod legacy;
 pub use lazy_eip7702::{LazyAuthorization, LazyTxEip7702};
 
 use crate::{
-    Evm, EvmFeatures, EvmTypes, SpecId, TxResult, TxResultExt, Version,
+    Evm, EvmFeatures, EvmTypes, HostError, SpecId, TxResult, TxResultExt, Version,
     bytecode::Bytecode,
     env::TxEnv,
-    evm::{AccountInfo, error_handler, handler::GasSettlement},
+    evm::{
+        AccountInfo,
+        handler::{DefaultTxHandlerHooks, GasSettlement},
+    },
     interpreter::{
         GasTracker, Host, InstrStop, Message, MessageExt, MessageKind, MessageResult,
-        MessageResultExt, Word,
+        MessageResultExt,
         gas::{EIP2780_TX_BASE_COST, EIP8038_COLD_ACCOUNT_ACCESS, WARM_STORAGE_READ_COST},
     },
-    registry::{HandlerError, HandlerResult, TxRegistry},
+    registry::{HandlerError, HandlerResult, TxRegistry, handler},
     utils::num_words,
     version::GasId,
 };
@@ -52,6 +55,17 @@ pub enum TxEnvelope {
 
 /// Recovered Ethereum transaction envelope.
 pub type RecoveredTxEnvelope = Recovered<TxEnvelope>;
+
+/// Transaction state produced by validation and pre-execution processing for the standard
+/// Ethereum handlers.
+#[derive(Clone, Copy, Debug)]
+pub struct PreparedTx {
+    pub(super) caller: Address,
+    pub(super) gas_price: U256,
+    pub(super) intrinsic: u64,
+    pub(super) initial_state_gas: u64,
+    pub(super) floor_gas: u64,
+}
 
 impl From<EthereumTxEnvelope<TxEip4844>> for TxEnvelope {
     fn from(tx: EthereumTxEnvelope<TxEip4844>) -> Self {
@@ -213,20 +227,54 @@ impl Transaction for TxEnvelope {
 pub fn ethereum_tx_registry<T: EvmTypes<Tx = TxEnvelope>>(
     spec_id: SpecId,
 ) -> TxRegistry<T, TxResult<T>> {
-    let mut registry =
-        TxRegistry::new().with_handler(0, TxEnvelope::as_legacy, legacy::handle::<T>);
+    let mut registry = TxRegistry::new().with_handler(
+        0,
+        TxEnvelope::as_legacy,
+        handler(
+            legacy::prepare_with_hooks::<T, DefaultTxHandlerHooks>,
+            legacy::execute_prepared::<T, DefaultTxHandlerHooks>,
+        ),
+    );
 
     if spec_id.enables(SpecId::BERLIN) {
-        registry.register(1, TxEnvelope::as_eip2930, eip2930::handle::<T>);
+        registry.register(
+            1,
+            TxEnvelope::as_eip2930,
+            handler(
+                eip2930::prepare_with_hooks::<T, DefaultTxHandlerHooks>,
+                eip2930::execute_prepared::<T, DefaultTxHandlerHooks>,
+            ),
+        );
     }
     if spec_id.enables(SpecId::LONDON) {
-        registry.register(2, TxEnvelope::as_eip1559, eip1559::handle::<T>);
+        registry.register(
+            2,
+            TxEnvelope::as_eip1559,
+            handler(
+                eip1559::prepare_with_hooks::<T, DefaultTxHandlerHooks>,
+                eip1559::execute_prepared::<T, DefaultTxHandlerHooks>,
+            ),
+        );
     }
     if spec_id.enables(SpecId::CANCUN) {
-        registry.register(3, TxEnvelope::as_eip4844, eip4844::handle::<T>);
+        registry.register(
+            3,
+            TxEnvelope::as_eip4844,
+            handler(
+                eip4844::prepare_with_hooks::<T, DefaultTxHandlerHooks>,
+                eip4844::execute_prepared::<T, DefaultTxHandlerHooks>,
+            ),
+        );
     }
     if spec_id.enables(SpecId::PRAGUE) {
-        registry.register(4, TxEnvelope::as_eip7702, eip7702::handle::<T>);
+        registry.register(
+            4,
+            TxEnvelope::as_eip7702,
+            handler(
+                eip7702::prepare_with_hooks::<T, DefaultTxHandlerHooks>,
+                eip7702::execute_prepared::<T, DefaultTxHandlerHooks>,
+            ),
+        );
     }
 
     registry
@@ -283,27 +331,28 @@ pub fn validate_block_gas_limit(
     Ok(())
 }
 
-/// Validates the transaction gas limit against the active transaction cap.
+/// Validates the transaction gas limit against the active transaction gas limit cap.
+///
+/// See [`Version::tx_gas_caps`].
 pub const fn validate_tx_gas_limit_cap(version: &Version, tx_gas_limit: u64) -> HandlerResult<()> {
-    // EIP-7825 caps each transaction gas limit to 2^24 in Osaka. Amsterdam/EIP-8037
-    // replaces this with a execution-gas cap while allowing extra transaction gas to serve as
-    // the state-gas reservoir.
-    let cap = version.tx_gas_limit_cap;
-    if !version.feature(EvmFeatures::EIP8037) && tx_gas_limit > cap {
+    let (cap, _) = version.tx_gas_caps();
+    if tx_gas_limit > cap {
         return Err(HandlerError::TxGasLimitGreaterThanCap { gas_limit: tx_gas_limit, cap });
     }
     Ok(())
 }
 
-/// Validates the execution-gas portion against the active transaction cap.
+/// Validates the execution-gas portion against the active execution gas cap.
+///
+/// See [`Version::tx_gas_caps`].
 pub const fn validate_execution_gas_limit_cap(
     version: &Version,
     tx_gas_limit: u64,
     intrinsic: u64,
     floor_gas: u64,
 ) -> HandlerResult<()> {
-    let cap = version.tx_gas_limit_cap;
-    if version.feature(EvmFeatures::EIP8037) && tx_gas_limit > cap {
+    let (_, cap) = version.tx_gas_caps();
+    if tx_gas_limit > cap {
         let required_execution_gas = if intrinsic > floor_gas { intrinsic } else { floor_gas };
         if required_execution_gas > cap {
             return Err(HandlerError::TxGasLimitGreaterThanCap {
@@ -389,9 +438,9 @@ pub fn validate_sender<'a, T: EvmTypes>(
     let has_balance_top_up = host.feature(EvmFeatures::BALANCE_TOP_UP);
     let has_eip3607 = host.feature(EvmFeatures::EIP3607);
 
-    let mut sender = host.state.account(&caller, false).map_err(error_handler!(host))?;
+    let mut sender = host.state.account(&caller)?;
     if has_eip3607 && sender.code_hash() != KECCAK256_EMPTY {
-        let code = sender.load_code().map_err(error_handler!(host))?;
+        let code = sender.load_code()?;
         if !code.is_empty() && !code.is_eip7702() {
             return Err(HandlerError::RejectCallerWithCode);
         }
@@ -439,10 +488,9 @@ pub fn charge_upfront<'a, T: EvmTypes>(
     if !host.feature(EvmFeatures::FEE_CHARGE) {
         return Ok(());
     }
-    host.state
-        .account(&caller, false)
-        .map_err(error_handler!(host))?
-        .add_balance(Word::ZERO.wrapping_sub(max_gas_cost));
+    let mut account = host.state.account(&caller)?;
+    let balance = account.balance().saturating_sub(max_gas_cost);
+    account.set_balance(balance);
     Ok(())
 }
 
@@ -523,10 +571,10 @@ pub fn prepare_initial_frame<'a, T: EvmTypes>(
     let message = match to {
         TxKind::Call(to) => {
             let (recipient_is_empty, mut code) = {
-                let mut account = host.state.account(&to, false).map_err(error_handler!(host))?;
+                let mut account = host.state.account(&to)?;
                 // A nonexistent recipient reads as an empty account (EIP-161).
                 let recipient_is_empty = account.get().is_none_or(AccountInfo::is_empty);
-                (recipient_is_empty, account.load_code().map_err(error_handler!(host))?)
+                (recipient_is_empty, account.load_code()?)
             };
             let mut code_address = to;
             let mut disable_precompiles = false;
@@ -553,22 +601,20 @@ pub fn prepare_initial_frame<'a, T: EvmTypes>(
                         return Ok(None);
                     }
                     let skip_cold_load = tx_gas.remaining() < cold_additional;
-                    let Ok(load) =
-                        Host::load_account(host, &delegated_address, true, skip_cold_load)
-                    else {
-                        return Ok(None);
-                    };
+                    let load =
+                        match Host::load_account(host, &delegated_address, true, skip_cold_load) {
+                            Ok(load) => load,
+                            Err(HostError::Halt(_)) => return Ok(None),
+                            Err(HostError::Execution(error)) => return Err(error.into()),
+                        };
                     if load.is_cold && tx_gas.spend(cold_additional).is_err() {
                         return Ok(None);
                     }
                     code = load.code;
                 } else {
-                    let mut account = host
-                        .state
-                        .account(&delegated_address, false)
-                        .map_err(error_handler!(host))?;
+                    let mut account = host.state.account(&delegated_address)?;
                     account.warm();
-                    code = account.load_code().map_err(error_handler!(host))?;
+                    code = account.load_code()?;
                 }
                 code_address = delegated_address;
                 disable_precompiles = true;
@@ -579,6 +625,7 @@ pub fn prepare_initial_frame<'a, T: EvmTypes>(
                 gas_limit: tx_gas.remaining(),
                 reservoir: tx_gas.reservoir(),
                 destination: to,
+                call_target: to,
                 caller,
                 input: input.clone(),
                 value,
@@ -594,12 +641,8 @@ pub fn prepare_initial_frame<'a, T: EvmTypes>(
         TxKind::Create => {
             let destination = caller.create(nonce);
             if host.feature(EvmFeatures::EIP8037) {
-                let target_alive = host
-                    .state
-                    .account(&destination, false)
-                    .map_err(error_handler!(host))?
-                    .get()
-                    .is_some_and(|info| !info.is_empty());
+                let target_alive =
+                    host.state.account(&destination)?.get().is_some_and(|info| !info.is_empty());
                 if !target_alive {
                     let create_state_gas = host.version().gas_params.create_state_gas();
                     if tx_gas.spend_state(create_state_gas).is_err() {
@@ -614,6 +657,7 @@ pub fn prepare_initial_frame<'a, T: EvmTypes>(
                 gas_limit: tx_gas.remaining(),
                 reservoir: tx_gas.reservoir(),
                 destination,
+                call_target: destination,
                 caller,
                 input: input.clone(),
                 value,
@@ -666,16 +710,16 @@ pub fn execute_initial_frame<T: EvmTypes>(
     tx_gas: &mut GasTracker,
     execution_gas_limit: u64,
     reservoir: u64,
-) -> MessageResult<T> {
+) -> Result<MessageResult<T>, crate::ExecutionError> {
     let Some(InitialFrame { mut message, charged_state_gas }) = frame else {
-        return runtime_oog_result(execution_gas_limit, reservoir);
+        return Ok(runtime_oog_result(execution_gas_limit, reservoir));
     };
 
     // Failed execution has already been rolled back to the message's own checkpoint inside
     // `execute_message`; the settle merges the frame gas into the transaction-level gas.
-    let mut result = host.execute_message(tx_env, &mut message);
+    let mut result = host.execute_message(tx_env, &mut message)?;
     settle_initial_frame_gas(tx_gas, &mut result, charged_state_gas);
-    result
+    Ok(result)
 }
 
 /// Builds the result for a transaction whose EIP-2780 runtime gas phase ran out of gas
@@ -709,10 +753,7 @@ pub fn default_settle_gas<'a, T: EvmTypes>(
         let gas_used = result.tx_gas_used();
         let gas_remaining = gas_limit.saturating_sub(gas_used);
         let caller_refund = U256::from(gas_remaining) * gas_price;
-        host.state
-            .account(&caller, false)
-            .map_err(error_handler!(host))?
-            .add_balance(caller_refund);
+        host.state.account(&caller)?.add_balance(caller_refund);
         let beneficiary_gas_price = if host.feature(EvmFeatures::BASE_FEE_CHECK) {
             gas_price.saturating_sub(host.block.basefee)
         } else {
@@ -720,10 +761,7 @@ pub fn default_settle_gas<'a, T: EvmTypes>(
         };
         let beneficiary = host.block.beneficiary;
         let beneficiary_reward = U256::from(gas_used) * beneficiary_gas_price;
-        host.state
-            .account(&beneficiary, false)
-            .map_err(error_handler!(host))?
-            .add_balance(beneficiary_reward);
+        host.state.account(&beneficiary)?.add_balance(beneficiary_reward);
     }
     Ok(result)
 }
@@ -742,9 +780,6 @@ pub fn finalize_gas<'a, T: EvmTypes>(
         state_refund,
         result,
     } = settlement;
-    if let Some(code) = host.error_code {
-        return Err(HandlerError::Fatal(code));
-    }
 
     let max_refund_quotient = u64::from(host.version().gas_params.get(GasId::MaxRefundQuotient));
     // Self-contained gas breakdown for the result. `total_gas_spent` is defined so that
@@ -847,11 +882,11 @@ pub fn intrinsic_gas(
     value: U256,
 ) -> u64 {
     let params = &version.gas_params;
-    let non_zero_multiplier = if version.feature(EvmFeatures::EIP2028) { 16 } else { 68 };
-    let mut gas = 0;
-    for byte in input {
-        gas += if *byte == 0 { 4 } else { non_zero_multiplier };
-    }
+    let non_zero_multiplier = u64::from(params.get(GasId::TxTokenNonZeroByteMultiplier));
+    let zero_data_len = input.iter().filter(|v| **v == 0).count() as u64;
+    let non_zero_data_len = input.len() as u64 - zero_data_len;
+    let tokens = zero_data_len + non_zero_data_len * non_zero_multiplier;
+    let mut gas = tokens * u64::from(params.get(GasId::TxTokenCost));
     gas += access_list_accounts * u64::from(params.get(GasId::TxAccessListAddressCost));
     gas += access_list_storage_keys * u64::from(params.get(GasId::TxAccessListStorageKeyCost));
 
@@ -862,7 +897,7 @@ pub fn intrinsic_gas(
         let is_self_transfer = matches!(to, TxKind::Call(to) if to == caller);
         gas += eip2780_base_to_value_gas(version, is_create, is_self_transfer, value);
     } else {
-        gas += 21_000;
+        gas += u64::from(params.get(GasId::TxBaseStipend));
         if is_create && version.feature(EvmFeatures::EIP2) {
             gas += u64::from(params.get(GasId::TxCreateCost));
         }
@@ -953,7 +988,10 @@ mod tests {
         let registry = TxRegistry::new().with_handler(
             0,
             TxEnvelope::as_legacy,
-            legacy::handle_with_hooks::<BaseEvmTypes, CalldataSurcharge>,
+            handler(
+                legacy::prepare_with_hooks::<BaseEvmTypes, CalldataSurcharge>,
+                legacy::execute_prepared::<BaseEvmTypes, CalldataSurcharge>,
+            ),
         );
         let mut evm = Evm::<BaseEvmTypes>::new(
             SpecId::PRAGUE,
@@ -963,7 +1001,9 @@ mod tests {
             Precompiles::base(SpecId::PRAGUE),
         );
 
+        let validation = evm.validate_tx(&tx);
         let result = evm.transact(&tx).map(crate::evm::ExecutedTx::discard);
+        assert_eq!(validation, result.as_ref().map(|_| ()).map_err(Clone::clone));
         if gas_limit < 31_050 {
             assert_eq!(
                 result,
@@ -1041,6 +1081,21 @@ mod tests {
             // EIP-8038 sets the per-item access-list base to the cold-minus-warm
             // premium: 2,900 per address and 2,000 per storage key.
             (12_000 + 3000) + (2900 + 20 * 64) + (2000 + 32 * 64)
+        );
+    }
+
+    #[test]
+    fn intrinsic_gas_reads_calldata_and_base_costs_from_gas_params() {
+        let input = Bytes::from_static(&[0, 1, 2]);
+        let sender = Address::with_last_byte(0xaa);
+        let mut version = Version::new(SpecId::PRAGUE);
+        version.gas_params.set(GasId::TxTokenCost, 3);
+        version.gas_params.set(GasId::TxTokenNonZeroByteMultiplier, 5);
+        version.gas_params.set(GasId::TxBaseStipend, 10_000);
+
+        assert_eq!(
+            intrinsic_gas(&version, sender, TxKind::Call(Address::ZERO), &input, 0, 0, U256::ZERO),
+            10_000 + (1 + 2 * 5) * 3
         );
     }
 
@@ -1219,6 +1274,29 @@ mod tests {
     }
 
     #[test]
+    fn charge_upfront_saturates_insufficient_balance() {
+        let caller = Address::with_last_byte(0xaa);
+        let mut database = InMemoryDB::default();
+        database.insert_account_info(&caller, AccountInfo::default().with_balance(U256::from(10)));
+
+        let mut version = Version::new(SpecId::OSAKA);
+        version.features.remove(EvmFeatures::BALANCE_CHECK);
+        version.features.remove(EvmFeatures::BALANCE_TOP_UP);
+        let mut evm = Evm::<BaseEvmTypes>::new_with_execution_config(
+            ExecutionConfig::for_spec_and_version(SpecId::OSAKA, version),
+            SpecId::OSAKA,
+            BlockEnvExt::default(),
+            TxRegistry::new(),
+            database,
+            Precompiles::base(SpecId::OSAKA),
+        );
+
+        assert!(validate_sender(&mut evm, caller, 0, U256::from(100)).is_ok());
+        charge_upfront(&mut evm, caller, U256::from(100)).unwrap();
+        assert_eq!(evm.state.account_info_untracked(&caller).unwrap().unwrap().balance, U256::ZERO);
+    }
+
+    #[test]
     fn initial_delegated_call_uses_delegated_code_address() {
         let caller = Address::with_last_byte(0xaa);
         let target = Address::with_last_byte(0x02);
@@ -1264,7 +1342,7 @@ mod tests {
         assert!(message.disable_precompiles);
         assert_eq!(charged_state_gas, 0);
 
-        let result = Host::execute_message(&mut evm, &TxEnvExt::default(), &mut message);
+        let result = Host::execute_message(&mut evm, &TxEnvExt::default(), &mut message).unwrap();
 
         assert_eq!(result.stop, InstrStop::Return);
         assert_eq!(result.output.len(), 32);

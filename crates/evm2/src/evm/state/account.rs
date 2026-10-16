@@ -1,6 +1,9 @@
 //! Account models held by the state overlay and emitted in transitions.
 
-use super::{DbResult, DynDatabase, JournalEntry, StateInner};
+use super::{
+    AccountChanges, DbResult, DynDatabase, JournalEntry, StateInner, StorageHandle, StorageOverlay,
+    storage_pool::StoragePool,
+};
 use crate::{EvmFeatures, bytecode::Bytecode, interpreter::Word};
 use alloy_primitives::{Address, B256, KECCAK256_EMPTY, U256};
 use derive_where::derive_where;
@@ -8,9 +11,8 @@ use derive_where::derive_where;
 /// Account information loaded from the backing database or emitted in a state
 /// transition.
 ///
-/// Equality and hashing only consider [`Self::balance`], [`Self::nonce`], and
-/// [`Self::code_hash`]; [`Self::code`] is a cache keyed by the code hash and may or may not be
-/// populated.
+/// Equality compares the persisted account fields, including the optional extension.
+/// [`Self::code`] is a cache keyed by the code hash and may or may not be populated.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AccountInfo {
@@ -22,6 +24,16 @@ pub struct AccountInfo {
     pub code_hash: B256,
     /// Bytecode associated with this account.
     pub code: Option<Bytecode>,
+    /// Raw chain-specific data committed to the account leaf by the state provider.
+    ///
+    /// Empty extensions are omitted by Serde. Binary formats must delimit structs
+    /// (e.g. MessagePack); bincode and Postcard account encodings are unsupported.
+    #[cfg(feature = "account-ext")]
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "super::AccountExtension::is_empty")
+    )]
+    pub extension: super::AccountExtension,
     #[doc(hidden)] // Not public API. Please use an existing constructor.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub _non_exhaustive: (),
@@ -33,16 +45,19 @@ pub struct AccountInfo {
 impl PartialEq for AccountInfo {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        self.balance == other.balance
+        let equal = self.balance == other.balance
             && self.nonce == other.nonce
-            && self.code_hash == other.code_hash
+            && self.code_hash == other.code_hash;
+        #[cfg(feature = "account-ext")]
+        let equal = equal && self.extension == other.extension;
+        equal
     }
 }
 
 impl Eq for AccountInfo {}
 
-/// Hashes the same fields compared by [`PartialEq`], skipping `code`, to uphold
-/// the `Eq`/`Hash` invariant that equal values hash equally.
+/// Hashes the Ethereum account fields. Extension-only differences may collide,
+/// but equal accounts always hash equally.
 impl core::hash::Hash for AccountInfo {
     #[inline]
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
@@ -60,26 +75,49 @@ impl Default for AccountInfo {
             nonce: 0,
             code_hash: KECCAK256_EMPTY,
             code: Some(Bytecode::default()),
+            #[cfg(feature = "account-ext")]
+            extension: super::AccountExtension::new(),
             _non_exhaustive: (),
         }
     }
 }
 
 impl AccountInfo {
-    /// Creates a new [`AccountInfo`] with the given fields.
+    /// Creates an empty account with zero balance and nonce, the empty code hash,
+    /// and no cached bytecode.
     #[inline]
-    pub const fn new(balance: Word, nonce: u64, code_hash: B256, code: Bytecode) -> Self {
-        Self { balance, nonce, code_hash, code: Some(code), _non_exhaustive: () }
+    pub const fn empty() -> Self {
+        Self::new(U256::ZERO, 0, KECCAK256_EMPTY, None)
+    }
+
+    /// Creates a new [`AccountInfo`] with the given fields and optional cached bytecode.
+    ///
+    /// `None` means the bytecode is not cached; `code_hash` still identifies the account's code.
+    /// The caller is responsible for `code_hash` matching the bytecode when it is provided.
+    #[inline]
+    pub const fn new(balance: Word, nonce: u64, code_hash: B256, code: Option<Bytecode>) -> Self {
+        Self {
+            balance,
+            nonce,
+            code_hash,
+            code,
+            #[cfg(feature = "account-ext")]
+            extension: super::AccountExtension::new(),
+            _non_exhaustive: (),
+        }
     }
 
     /// Clones this account without bytecode.
     #[inline]
-    pub(crate) const fn clone_no_code(&self) -> Self {
+    #[allow(clippy::missing_const_for_fn)] // Cloning a shared extension cannot be const.
+    pub(crate) fn clone_no_code(&self) -> Self {
         Self {
             balance: self.balance,
             nonce: self.nonce,
             code_hash: self.code_hash,
             code: None,
+            #[cfg(feature = "account-ext")]
+            extension: self.extension.clone(),
             _non_exhaustive: (),
         }
     }
@@ -114,7 +152,10 @@ impl AccountInfo {
     /// Returns whether this account is empty by the Spurious Dragon definition.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.balance.is_zero() && self.nonce == 0 && self.code_hash == KECCAK256_EMPTY
+        let empty = self.balance.is_zero() && self.nonce == 0 && self.code_hash == KECCAK256_EMPTY;
+        #[cfg(feature = "account-ext")]
+        let empty = empty && self.extension.is_empty();
+        empty
     }
 }
 
@@ -149,14 +190,26 @@ pub(crate) struct Account {
     pub(crate) just_created: bool,
     /// Whether the present overlay account's code has been modified.
     pub(crate) code_changed: bool,
+    /// Persistent transaction storage owned by this account.
+    pub(crate) storage: StorageOverlay,
 }
 
 impl Account {
-    /// Creates an account overlay entry from its transaction-boundary original info and its
-    /// present info.
+    /// Creates an account overlay entry from transaction-boundary and present info.
     #[cfg(test)]
     pub(crate) fn new(original: Option<AccountInfo>, present: Option<AccountInfo>) -> Self {
         Self { original, present, ..Self::default() }
+    }
+
+    /// Applies isolated execution changes, retaining parent originals and account warmth.
+    #[cfg(test)]
+    pub(crate) fn merge_isolated(&mut self, child: Self) {
+        self.present = child.present;
+        self.is_touched |= child.is_touched;
+        self.is_destroyed |= child.is_destroyed;
+        self.just_created |= child.just_created;
+        self.code_changed |= child.code_changed;
+        self.storage.merge_isolated(child.storage);
     }
 
     /// Marks the account as created during the transaction, which also flags its code as changed.
@@ -177,10 +230,17 @@ impl Account {
 
     /// Returns whether the account's info changed during the transaction.
     ///
-    /// This compares balance, nonce, code hash, and existence; it does not consider storage.
+    /// This compares persisted account fields and existence; it does not consider storage.
     #[inline]
     pub(crate) fn is_changed(&self) -> bool {
         self.original != self.present
+    }
+
+    /// See [`AccountHandle::is_existing_dead`].
+    #[inline]
+    pub(crate) fn is_existing_dead(&self) -> bool {
+        self.present.as_ref().is_some_and(AccountInfo::is_empty)
+            || (self.present.is_none() && self.original.is_some())
     }
 
     /// Returns the account's new bytecode keyed by code hash when its code changed during the
@@ -196,6 +256,19 @@ impl Account {
             && !code_hash.is_zero()
             && code_hash != KECCAK256_EMPTY)
             .then_some((code_hash, code))
+    }
+
+    /// Returns this account's transaction changes.
+    pub(super) fn changes(&self, address: Address, selfdestructed: bool) -> AccountChanges<'_> {
+        AccountChanges {
+            address,
+            original: self.original.as_ref(),
+            current: self.present.as_ref(),
+            created: self.is_created(),
+            selfdestructed,
+            code: self.changed_code(),
+            storage: &self.storage,
+        }
     }
 }
 
@@ -225,6 +298,9 @@ pub struct AccountHandle<'a, 'db> {
     /// Shared inner state: backing database, revert journal, and base warm set.
     #[derive_where(skip)]
     inner: &'a mut StateInner<'db>,
+    /// Spare slot-map allocations reused between transactions.
+    #[derive_where(skip)]
+    storage_pool: &'a mut StoragePool,
     /// Revert entry capturing the overlay as it was before the first mutation made through this
     /// handle. `Some` once a change has been recorded; on drop it is pushed onto the journal as a
     /// single [`JournalEntry::AccountChange`].
@@ -250,12 +326,22 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
     /// Creates a handle over a loaded account overlay slot and the shared inner state (backing
     /// database, revert journal, and transaction-initial base warm set).
     #[inline]
-    pub(crate) const fn new(
+    pub(super) const fn new(
         address: Address,
         tracked: &'a mut Account,
         inner: &'a mut StateInner<'db>,
+        storage_pool: &'a mut StoragePool,
     ) -> Self {
-        Self { address, tracked, inner, snapshot: None }
+        Self { address, tracked, inner, storage_pool, snapshot: None }
+    }
+
+    /// Returns this account's storage overlay without another address-map lookup.
+    #[inline]
+    pub fn storage(&mut self) -> StorageHandle<'_, 'db> {
+        if self.tracked.storage.slots.capacity() == 0 {
+            self.tracked.storage.slots = self.storage_pool.take();
+        }
+        StorageHandle::new(self.address, &mut self.tracked.storage, self.inner)
     }
 
     /// Records the pre-mutation revert entry the first time a change is made through this handle.
@@ -345,8 +431,7 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
     /// deletes such touched accounts during transaction finalization.
     #[inline]
     pub fn is_existing_dead(&self) -> bool {
-        self.tracked.present.as_ref().is_some_and(AccountInfo::is_empty)
-            || (self.tracked.present.is_none() && self.tracked.original.is_some())
+        self.tracked.is_existing_dead()
     }
 
     /// Returns whether the account is empty for EIP-150 new-account gas checks.
@@ -547,6 +632,13 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
         self.present_mut()
     }
 
+    /// Updates the account payload, touching the account and recording a revert snapshot.
+    #[cfg(feature = "account-ext")]
+    pub fn set_extension(&mut self, extension: super::AccountExtension) {
+        self.touch();
+        self.present_mut().extension = extension;
+    }
+
     /// Deletes the account at transaction finalization.
     ///
     /// Used for self-destructed accounts (pre-EIP-8246, and zero-balance accounts under EIP-8246)
@@ -570,6 +662,30 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
         let balance = self.balance();
         self.tracked.is_destroyed = false;
         self.tracked.present = Some(AccountInfo::default().with_balance(balance));
+    }
+
+    /// Overrides the live balance and the balance restored by this handle's revert snapshot,
+    /// materializing an empty account when absent without touching it.
+    ///
+    /// Earlier handles' journal entries remain unchanged and can still restore older values.
+    #[inline]
+    pub fn override_balance(&mut self, balance: Word) {
+        self.present_mut().balance = balance;
+        if let Some(JournalEntry::AccountChange { previous, .. }) = &mut self.snapshot {
+            previous.get_or_insert_with(empty_account).balance = balance;
+        }
+    }
+
+    /// Overrides the live nonce and the nonce restored by this handle's revert snapshot,
+    /// materializing an empty account when absent without touching it.
+    ///
+    /// Earlier handles' journal entries remain unchanged and can still restore older values.
+    #[inline]
+    pub fn override_nonce(&mut self, nonce: u64) {
+        self.present_mut().nonce = nonce;
+        if let Some(JournalEntry::AccountChange { previous, .. }) = &mut self.snapshot {
+            previous.get_or_insert_with(empty_account).nonce = nonce;
+        }
     }
 }
 
@@ -599,7 +715,7 @@ mod tests {
 
         let checkpoint = state.checkpoint();
         {
-            let mut account = state.account(&address, false).unwrap();
+            let mut account = state.account(&address).unwrap();
             assert!(!account.exists());
             assert!(account.warm(), "first access is cold");
             assert!(!account.warm(), "second access is warm");
@@ -611,7 +727,7 @@ mod tests {
             ])));
         }
 
-        assert!(state.account(&address, false).unwrap().is_warm());
+        assert!(state.account(&address).unwrap().is_warm());
         let info = state
             .account_info_untracked(&address)
             .unwrap()
@@ -621,7 +737,7 @@ mod tests {
         assert_ne!(info.code_hash, KECCAK256_EMPTY);
 
         state.rollback(checkpoint, Version::base(SpecId::FRONTIER).features);
-        assert!(!state.account(&address, false).unwrap().is_warm());
+        assert!(!state.account(&address).unwrap().is_warm());
         assert!(state.account_info_untracked(&address).unwrap().is_none());
         assert!(!state.take_pending_state().is_changed());
     }
@@ -634,10 +750,10 @@ mod tests {
         let code = Bytecode::new_raw(Bytes::from_static(&[0x60, 0x01]));
         let mut state = State::new(CacheDB::default());
 
-        state.account(&address, false).unwrap().get_or_insert().set_code(code.clone());
+        state.account(&address).unwrap().get_or_insert().set_code(code.clone());
         state.commit_transaction();
 
-        let loaded = state.account(&address, false).unwrap().load_code().unwrap();
+        let loaded = state.account(&address).unwrap().load_code().unwrap();
         assert_eq!(loaded, code);
     }
 
@@ -661,7 +777,7 @@ mod tests {
 
         let checkpoint = state.checkpoint();
         {
-            let mut account = state.account(&address, false).unwrap();
+            let mut account = state.account(&address).unwrap();
             account.set_balance(Word::from(999));
             account.set_nonce(5);
             assert!(account.bump_nonce());
@@ -692,7 +808,7 @@ mod tests {
 
         let checkpoint = state.checkpoint();
         {
-            let account = state.account(&address, false).unwrap();
+            let account = state.account(&address).unwrap();
             assert_eq!(account.balance(), Word::from(5));
             assert_eq!(account.nonce(), 0);
         }
@@ -703,7 +819,7 @@ mod tests {
 
     #[test]
     fn journaled_account_skip_cold_load_signals_skip() {
-        use crate::ErrorCode;
+        use crate::LoadError;
 
         let address = Address::from([0x8a; 20]);
         let mut database = CacheDB::default();
@@ -711,14 +827,133 @@ mod tests {
         let mut state = State::new(database);
 
         // A cold, not-yet-loaded account signals the skip instead of reading the database.
-        assert!(matches!(state.account(&address, true), Err(ErrorCode::COLD_LOAD_SKIPPED)));
+        assert!(matches!(state.account_with_skip(&address, true), Err(LoadError::ColdLoadSkipped)));
         // Skipping leaves the overlay untouched, so a later non-skipped load still works.
-        assert_eq!(state.account(&address, false).unwrap().balance(), Word::from(5));
+        assert_eq!(state.account(&address).unwrap().balance(), Word::from(5));
         // Residency alone does not make a cold access affordable: a loaded-but-cold account still
         // signals the skip, since warmth — not overlay residency — decides the cold surcharge.
-        assert!(matches!(state.account(&address, true), Err(ErrorCode::COLD_LOAD_SKIPPED)));
+        assert!(matches!(state.account_with_skip(&address, true), Err(LoadError::ColdLoadSkipped)));
         // Once warmed, the affordable warm access yields a handle even when skipping is requested.
-        state.account(&address, false).unwrap().warm();
-        assert!(state.account(&address, true).is_ok());
+        state.account(&address).unwrap().warm();
+        assert!(state.account_with_skip(&address, true).is_ok());
+    }
+
+    #[test]
+    fn account_overrides_update_only_selected_snapshot_fields() {
+        let address = Address::with_last_byte(0x90);
+        let original = AccountInfo::default().with_balance(Word::from(100)).with_nonce(7);
+        for (override_balance, override_nonce) in [(true, false), (false, true), (true, true)] {
+            let mut db = CacheDB::default();
+            db.insert_account_info(&address, original.clone());
+            let mut state = State::new(db);
+            let checkpoint = state.checkpoint();
+            {
+                let mut account = state.account(&address).unwrap();
+                account.set_balance(Word::from(200));
+                account.set_nonce(8);
+                account.warm();
+                account.mark_created();
+                account.mark_destructed();
+                account.set_code_slow(Bytecode::new_eip7702(Address::with_last_byte(1)));
+                if override_balance {
+                    account.override_balance(Word::from(300));
+                    account.override_balance(Word::from(400));
+                    assert_eq!(account.balance(), Word::from(400));
+                }
+                if override_nonce {
+                    account.override_nonce(9);
+                    account.override_nonce(10);
+                    assert_eq!(account.nonce(), 10);
+                }
+                account.add_balance(Word::from(5));
+                assert!(account.bump_nonce());
+            }
+            assert_eq!(state.checkpoint().journal_len(), checkpoint.journal_len() + 1);
+
+            state.rollback(checkpoint, crate::Version::base(crate::SpecId::CANCUN).features);
+            let account = state.account(&address).unwrap();
+            let mut expected = original.clone();
+            if override_balance {
+                expected.balance = Word::from(400);
+            }
+            if override_nonce {
+                expected.nonce = 10;
+            }
+            assert_eq!(account.get(), Some(&expected));
+            assert!(!account.is_touched());
+            assert!(!account.is_warm());
+            assert!(!account.is_created());
+            assert!(!account.is_destructed());
+            assert!(!account.tracked.code_changed);
+        }
+    }
+
+    #[test]
+    fn account_overrides_materialize_absent_snapshot_without_touching() {
+        let address = Address::with_last_byte(0x91);
+        for (balance, nonce) in [(Word::ZERO, 0), (Word::MAX, u64::MAX)] {
+            for balance_first in [false, true] {
+                let mut state = State::new(CacheDB::default());
+                let checkpoint = state.checkpoint();
+                {
+                    let mut account = state.account(&address).unwrap();
+                    if balance_first {
+                        account.override_balance(balance);
+                        account.override_nonce(nonce);
+                    } else {
+                        account.override_nonce(nonce);
+                        account.override_balance(balance);
+                    }
+                    assert_eq!((account.balance(), account.nonce()), (balance, nonce));
+                    assert!(!account.is_touched());
+                    assert!(!account.is_warm());
+                    account.set_balance(Word::from(1));
+                    account.set_nonce(1);
+                }
+                assert_eq!(state.checkpoint().journal_len(), checkpoint.journal_len() + 1);
+
+                state.rollback(checkpoint, crate::Version::base(crate::SpecId::CANCUN).features);
+                let account = state.account(&address).unwrap();
+                assert!(account.exists());
+                assert_eq!((account.balance(), account.nonce()), (balance, nonce));
+                assert!(!account.is_touched());
+                assert!(!account.is_warm());
+            }
+        }
+    }
+
+    #[test]
+    fn account_overrides_preserve_earlier_handles_snapshots() {
+        let address = Address::with_last_byte(0x92);
+        let original = AccountInfo::default().with_balance(Word::from(100)).with_nonce(7);
+        let mut db = CacheDB::default();
+        db.insert_account_info(&address, original.clone());
+        let mut state = State::new(db);
+        let features = crate::Version::base(crate::SpecId::CANCUN).features;
+        let parent = state.checkpoint();
+        {
+            let mut account = state.account(&address).unwrap();
+            account.set_balance(Word::from(200));
+            account.set_nonce(8);
+        }
+        let child = state.checkpoint();
+        {
+            let mut account = state.account(&address).unwrap();
+            account.override_balance(Word::from(300));
+            account.override_nonce(9);
+        }
+        {
+            let mut account = state.account(&address).unwrap();
+            account.set_balance(Word::from(400));
+            account.set_nonce(10);
+        }
+
+        state.rollback(child, features);
+        {
+            let account = state.account(&address).unwrap();
+            assert_eq!((account.balance(), account.nonce()), (Word::from(300), 9));
+        }
+        state.rollback(parent, features);
+        assert_eq!(state.account(&address).unwrap().get(), Some(&original));
     }
 }

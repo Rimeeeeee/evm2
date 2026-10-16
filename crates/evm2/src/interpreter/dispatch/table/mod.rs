@@ -5,14 +5,16 @@ use crate::{
 };
 use core::hint::cold_path;
 
-cfg_if::cfg_if! {
-    if #[cfg(dispatch_packed)] {
+core::cfg_select! {
+    dispatch_packed => {
         mod packed;
         use packed as imp;
-    } else if #[cfg(dispatch_single_return)] {
+    }
+    dispatch_single_return => {
         mod single_return;
         use single_return as imp;
-    } else {
+    }
+    _ => {
         mod unpacked;
         use unpacked as imp;
     }
@@ -107,6 +109,7 @@ fn dispatch_inner<T: EvmTypesHost, C: EvmConfig<T>, M: InspectMode<T>, G: Dispat
     (pc, gas)
 }
 
+#[inline(always)]
 pub(in crate::interpreter) fn run<T: EvmTypesHost>(
     interpreter: &mut Interpreter<'_, '_, T>,
     instructions: &RawInstrTable<T>,
@@ -130,6 +133,7 @@ fn run_inner<T: EvmTypesHost, M: InspectMode<T>>(
         if M::INSPECT {
             imp::sync_loop_state(state, loop_state);
             M::step(state, pc, stack.len());
+            loop_state = imp::loop_state(state.gas_mut());
             if state.result().is_err() {
                 return finish_run(state, pc, stack.len(), loop_state);
             }
@@ -148,6 +152,7 @@ fn run_inner<T: EvmTypesHost, M: InspectMode<T>>(
         if M::INSPECT {
             imp::sync_loop_state(state, loop_state);
             M::step_end(state, pc, stack.len());
+            loop_state = imp::loop_state(state.gas_mut());
             if state.result().is_err() {
                 return finish_run(state, pc, stack.len(), loop_state);
             }
@@ -166,7 +171,7 @@ fn finish_run<T: EvmTypesHost>(
 ) -> InstrStop {
     cold_path();
     // The NULL `pc` is only a loop-exit sentinel; never publish it.
-    let pc = if pc.as_ptr().is_null() { state.bytecode().as_slice().as_ptr() } else { pc.as_ptr() };
+    let pc = if pc.as_ptr().is_null() { state.bytecode().as_ptr() } else { pc.as_ptr() };
     state.set_pc_stack_len(pc, stack_len);
     imp::finish_loop(state.gas_mut(), loop_state);
     state.result().unwrap_err()

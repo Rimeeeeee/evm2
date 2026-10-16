@@ -51,26 +51,28 @@ pub(crate) use crate::{
 };
 
 // Silence backend dependency lints when another backend takes precedence.
-cfg_if::cfg_if! {
-    if #[cfg(feature = "bn")] {
-        use bn as _;
+core::cfg_select! {
+    feature = "bn" => {
         use ark_bn254 as _;
-        use ark_ff as _;
         use ark_ec as _;
+        use ark_ff as _;
         use ark_serialize as _;
+        use bn as _;
     }
+    _ => {}
 }
 
 use arrayref as _;
 
 // silence arkworks-bls12-381 lint as blst will be used as default if both are enabled.
-cfg_if::cfg_if! {
-    if #[cfg(feature = "blst")] {
+core::cfg_select! {
+    feature = "blst" => {
         use ark_bls12_381 as _;
-        use ark_ff as _;
         use ark_ec as _;
+        use ark_ff as _;
         use ark_serialize as _;
     }
+    _ => {}
 }
 
 // silence aurora-engine-modexp if gmp is enabled
@@ -134,6 +136,11 @@ impl<T: EvmTypesHost> PrecompileProvider<T> for Precompiles<T> {
     }
 
     #[inline]
+    fn for_each_address(&self, f: &mut dyn FnMut(Address)) {
+        self.map.as_ref().addresses().for_each(f);
+    }
+
+    #[inline]
     fn precompile_ids(&self) -> Vec<(Address, PrecompileId)> {
         self.map
             .as_ref()
@@ -147,6 +154,13 @@ impl<T: EvmTypesHost> PrecompileProvider<T> for Precompiles<T> {
     #[inline]
     fn contains(&self, address: &Address) -> bool {
         self.map.as_ref().contains(address)
+    }
+
+    fn move_precompiles(
+        &mut self,
+        moves: &[(Address, Address)],
+    ) -> Result<(), MovePrecompileError> {
+        self.as_map_mut().move_precompiles(moves.iter().copied())
     }
 
     #[inline]

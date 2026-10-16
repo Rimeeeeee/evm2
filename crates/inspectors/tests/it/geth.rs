@@ -18,6 +18,141 @@ use evm2_inspectors::tracing::{
     DebugInspector, MuxInspector, TracingInspector, TracingInspectorConfig,
 };
 
+#[test]
+fn test_calltracer_invalid_opcode_errors() {
+    let account = address!("1000000000000000000000000000000000000001");
+    let parent = address!("2000000000000000000000000000000000000002");
+    for (opcode, expected) in [
+        (op::INVALID, "invalid opcode: INVALID"),
+        (0x0c, "invalid opcode"),
+        (op::PUSH0, "invalid opcode"),
+    ] {
+        for nested in [false, true] {
+            let options =
+                serde_json::from_value(serde_json::json!({"tracer": "callTracer"})).unwrap();
+            let mut inspector = DebugInspector::new(options).unwrap();
+            let mut db = CacheDB::<EmptyDB>::default();
+            db.insert_account_info(
+                &account,
+                AccountInfo {
+                    code: Some(Bytecode::new_raw(Bytes::from(vec![opcode]))),
+                    ..Default::default()
+                },
+            );
+            let mut parent_code = hex!("60006000600060006000").to_vec();
+            parent_code.push(op::PUSH20);
+            parent_code.extend_from_slice(account.as_slice());
+            parent_code.extend_from_slice(&hex!("61fffff15000"));
+            db.insert_account_info(
+                &parent,
+                AccountInfo {
+                    code: Some(Bytecode::new_raw(parent_code.into())),
+                    ..Default::default()
+                },
+            );
+            let mut evm = Context::mainnet()
+                .with_db(db)
+                .modify_cfg_chained(|cfg| cfg.spec = SpecId::LONDON)
+                .build_mainnet()
+                .with_inspector(&mut inspector);
+            let result = evm
+                .inspect_tx(TxEnv {
+                    gas_limit: 150000,
+                    kind: TransactTo::Call(if nested { parent } else { account }),
+                    ..Default::default()
+                })
+                .unwrap();
+            let (ctx, inspector) = evm.ctx_inspector();
+            let tx = ctx.tx().envelope();
+            let block = *ctx.block();
+            let trace =
+                inspector.get_result(None, &tx, &block, &result.tx_result, ctx.db_mut()).unwrap();
+            let trace = serde_json::to_value(trace).unwrap();
+            let frame = if nested { &trace["calls"][0] } else { &trace };
+            assert_eq!(frame["error"], expected, "opcode={opcode:#x}, nested={nested}");
+        }
+    }
+}
+
+#[test]
+fn test_calltracer_eip7702_call_targets() {
+    let parent = address!("1000000000000000000000000000000000000001");
+    let target = address!("2000000000000000000000000000000000000002");
+    let implementation = address!("3000000000000000000000000000000000000003");
+    for opcode in [op::CALL, op::CALLCODE, op::DELEGATECALL, op::STATICCALL] {
+        let trace = |tracer: &str| {
+            let mut db = CacheDB::<EmptyDB>::default();
+            db.insert_account_info(
+                &target,
+                AccountInfo {
+                    code: Some(Bytecode::new_eip7702(implementation)),
+                    ..Default::default()
+                },
+            );
+            db.insert_account_info(
+                &implementation,
+                AccountInfo {
+                    code: Some(Bytecode::new_raw(hex!("602a60005260206000f3").into())),
+                    ..Default::default()
+                },
+            );
+            let mut code = hex!("6000600060006000").to_vec();
+            if matches!(opcode, op::CALL | op::CALLCODE) {
+                code.extend_from_slice(&[op::PUSH1, 0]);
+            }
+            code.push(op::PUSH20);
+            code.extend_from_slice(target.as_slice());
+            code.extend_from_slice(&[op::PUSH2, 0xff, 0xff, opcode, op::STOP]);
+            db.insert_account_info(
+                &parent,
+                AccountInfo { code: Some(Bytecode::new_raw(code.into())), ..Default::default() },
+            );
+            let options = serde_json::from_value(serde_json::json!({"tracer": tracer})).unwrap();
+            let mut inspector = DebugInspector::new(options).unwrap();
+            let mut evm =
+                Context::mainnet().with_db(db).build_mainnet().with_inspector(&mut inspector);
+            let result = evm
+                .inspect_tx(TxEnv {
+                    gas_limit: 150000,
+                    kind: TransactTo::Call(parent),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert!(result.result.is_success());
+            let (ctx, inspector) = evm.ctx_inspector();
+            let tx = ctx.tx().envelope();
+            let block = *ctx.block();
+            let trace =
+                inspector.get_result(None, &tx, &block, &result.tx_result, ctx.db_mut()).unwrap();
+            serde_json::to_value(trace).unwrap()
+        };
+        let geth = trace("callTracer");
+        assert_eq!(geth["calls"][0]["to"], serde_json::json!(target), "opcode={opcode:#x}");
+        assert_eq!(
+            geth["calls"][0]["output"],
+            format!("{:#066x}", U256::from(42)),
+            "opcode={opcode:#x}"
+        );
+        let parity = trace("flatCallTracer");
+        assert_eq!(parity[1]["action"]["to"], serde_json::json!(target), "opcode={opcode:#x}");
+        #[cfg(feature = "js-tracer")]
+        {
+            let js = trace(
+                r#"{
+                targets: [], step: function() {}, fault: function() {},
+                enter: function(frame) { this.targets.push(toHex(frame.getTo())); },
+                exit: function() {}, result: function() { return this.targets; }
+            }"#,
+            );
+            assert_eq!(
+                js.as_array().unwrap().last(),
+                Some(&serde_json::json!(target)),
+                "opcode={opcode:#x}"
+            );
+        }
+    }
+}
+
 /// Exercise the RPC options through dispatch, execution, and result serialization.
 #[test]
 fn test_debug_empty_tracer() {
@@ -1686,4 +1821,51 @@ fn test_geth_opcode_limit_ignores_named_tracers() {
         };
         assert_eq!(config.step_limit, None);
     }
+}
+
+#[test]
+fn test_geth_struct_log_out_of_gas_cost() {
+    let contract = address!("0xc000000000000000000000000000000000000004");
+    let caller = address!("0xa000000000000000000000000000000000000004");
+    let code = [op::PUSH1, 0x01, op::PUSH1, 0x00, op::SSTORE];
+
+    let context = Context::mainnet()
+        .with_db(CacheDB::<EmptyDB>::default())
+        .modify_cfg_chained(|cfg| cfg.spec = SpecId::LONDON)
+        .modify_db_chained(|db| {
+            db.insert_account_info(
+                &contract,
+                AccountInfo {
+                    code: Some(Bytecode::new_raw(code.to_vec().into())),
+                    ..Default::default()
+                },
+            );
+        });
+
+    let mut insp = TracingInspector::new(TracingInspectorConfig::default_geth());
+    let mut evm = context.build_mainnet().with_inspector(&mut insp);
+
+    // Leaves 5000 gas for the cold zero-to-nonzero SSTORE, which costs 22100.
+    let res = evm
+        .inspect_tx(TxEnv {
+            caller,
+            gas_limit: 21_000 + 6 + 5_000,
+            gas_price: 0,
+            kind: TransactTo::Call(contract),
+            data: Bytes::default(),
+            nonce: 0,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(!res.result.is_success(), "{res:#?}");
+
+    let frame = insp.geth_builder().geth_traces(
+        res.result.tx_gas_used(),
+        res.result.output().unwrap_or_default().clone(),
+        GethDefaultTracingOptions::default(),
+    );
+    let sstore = frame.struct_logs.last().unwrap();
+    assert_eq!(sstore.opcode(), "SSTORE");
+    assert_eq!(sstore.gas, 5_000);
+    assert_eq!(sstore.gas_cost, 22_100);
 }

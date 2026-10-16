@@ -1,6 +1,6 @@
 use super::{
-    InitialFrame, LazyAuthorization, access_list_counts, effective_gas_price, floor_gas,
-    initial_gas_and_reservoir, intrinsic_gas, prepare_initial_frame, runtime_oog_result,
+    InitialFrame, LazyAuthorization, PreparedTx, access_list_counts, effective_gas_price,
+    floor_gas, initial_gas_and_reservoir, intrinsic_gas, prepare_initial_frame, runtime_oog_result,
     settle_initial_frame_gas, validate_block_gas_limit, validate_chain_id,
     validate_create_initcode, validate_execution_gas_limit_cap, validate_floor_gas,
     validate_gas_price, validate_intrinsic_gas, validate_nonce_not_overflow, validate_priority_fee,
@@ -9,10 +9,7 @@ use super::{
 use crate::{
     Evm, EvmFeatures, EvmTypes, TxResult, Version,
     env::TxEnvExt,
-    evm::{
-        error_handler,
-        handler::{DefaultTxHandlerHooks, GasSettlement, TxHandlerHooks},
-    },
+    evm::handler::{DefaultTxHandlerHooks, GasSettlement, TxHandlerHooks},
     interpreter::{GasTracker, Host, InstrStop, MessageResult, gas::EIP8038_ACCOUNT_WRITE},
     registry::{HandlerError, HandlerResult, TxRequest},
     version::GasId,
@@ -29,8 +26,16 @@ pub fn handle<T: EvmTypes>(
 
 /// Executes an EIP-7702 transaction using Ethereum rules and custom handler hooks.
 pub fn handle_with_hooks<T: EvmTypes, H: TxHandlerHooks<T>>(
-    req: TxRequest<'_, '_, T, super::LazyTxEip7702>,
+    mut req: TxRequest<'_, '_, T, super::LazyTxEip7702>,
 ) -> HandlerResult<TxResult<T>> {
+    let prepared = prepare_with_hooks::<T, H>(&mut req)?;
+    execute_prepared::<T, H>(req, prepared)
+}
+
+/// Validates an EIP-7702 transaction and applies its pre-execution state changes.
+pub fn prepare_with_hooks<T: EvmTypes, H: TxHandlerHooks<T>>(
+    req: &mut TxRequest<'_, '_, T, super::LazyTxEip7702>,
+) -> HandlerResult<PreparedTx> {
     let caller = req.tx.signer();
     let tx = req.tx.inner();
     let envelope = req.envelope;
@@ -91,8 +96,20 @@ pub fn handle_with_hooks<T: EvmTypes, H: TxHandlerHooks<T>>(
     warm_access_list(req.host, &tx.access_list);
 
     let effective_gas_cost = U256::from(tx.gas_limit) * gas_price;
-    req.host.state.account(&caller, false).map_err(error_handler!(req.host))?.bump_nonce();
+    req.host.state.account(&caller)?.bump_nonce();
     H::before_execution(req.host, envelope, caller, effective_gas_cost)?;
+
+    Ok(PreparedTx { caller, gas_price, intrinsic, initial_state_gas, floor_gas })
+}
+
+/// Executes and settles a prepared EIP-7702 transaction.
+pub fn execute_prepared<T: EvmTypes, H: TxHandlerHooks<T>>(
+    req: TxRequest<'_, '_, T, super::LazyTxEip7702>,
+    prepared: PreparedTx,
+) -> HandlerResult<TxResult<T>> {
+    let PreparedTx { caller, gas_price, intrinsic, initial_state_gas, floor_gas } = prepared;
+    let tx = req.tx.inner();
+    let envelope = req.envelope;
     let chain_id = req.host.version().chain_id;
     let tx_env = TxEnvExt {
         origin: caller,
@@ -188,7 +205,7 @@ pub fn handle_with_hooks<T: EvmTypes, H: TxHandlerHooks<T>>(
     // applied delegations, which stay) inside `execute_message`. The settle merges the frame gas
     // into `tx_gas`, which carries the authorization state gas into the block state-gas
     // accounting.
-    let mut result = req.host.execute_message(&tx_env, &mut message);
+    let mut result = req.host.execute_message(&tx_env, &mut message)?;
     settle_initial_frame_gas(&mut tx_gas, &mut result, charged_state_gas);
     settle(req.host, result)
 }
@@ -230,11 +247,11 @@ pub fn validate_one_auth<'a, T: EvmTypes>(
     let Some(authority) = authorization.authority() else {
         return Ok(None);
     };
-    let mut account = host.state.account(&authority, false).map_err(error_handler!(host))?;
+    let mut account = host.state.account(&authority)?;
     account.warm();
     let existed = account.exists();
     let authority_nonce = account.nonce();
-    let code = account.load_code().map_err(error_handler!(host))?;
+    let code = account.load_code()?;
     // Reject an authority that already carries non-delegation code; otherwise non-empty code is
     // necessarily a valid delegation.
     let delegated_now = !code.is_empty();
@@ -244,7 +261,7 @@ pub fn validate_one_auth<'a, T: EvmTypes>(
     if authorization.nonce() != authority_nonce {
         return Ok(None);
     }
-    let delegated_before_tx = account.original_code().map_err(error_handler!(host))?.is_eip7702();
+    let delegated_before_tx = account.original_code()?.is_eip7702();
     let clearing = authorization.address().is_zero();
     Ok(Some((authority, AppliedAuth { existed, delegated_before_tx, delegated_now, clearing })))
 }
@@ -304,12 +321,20 @@ impl<'g> RuntimeAuthCharges<'g> {
         if !value.is_zero() {
             written.push(recipient);
         }
+        // State gas only exists under EIP-8037.
+        let is_eip8037 = version.feature(EvmFeatures::EIP8037);
         Self {
             gas,
-            new_account_state_gas: version.gas_params.new_account_state_gas(),
-            delegation_bytes_state_gas: u64::from(
-                version.gas_params.get(GasId::TxEip7702PerAuthState),
-            ),
+            new_account_state_gas: if is_eip8037 {
+                version.gas_params.new_account_state_gas()
+            } else {
+                0
+            },
+            delegation_bytes_state_gas: if is_eip8037 {
+                u64::from(version.gas_params.get(GasId::TxEip7702PerAuthState))
+            } else {
+                0
+            },
             account_write_cost: u64::from(EIP8038_ACCOUNT_WRITE),
             written,
             charged_delegation_bytes: Vec::new(),
@@ -444,10 +469,7 @@ pub fn apply_auth_list<'a, T: EvmTypes>(
         if accounting.accepted(authority, &auth).is_err() {
             return Ok(true);
         }
-        host.state
-            .account(&authority, false)
-            .map_err(error_handler!(host))?
-            .set_delegation(*authorization.address());
+        host.state.account(&authority)?.set_delegation(*authorization.address());
     }
     Ok(false)
 }

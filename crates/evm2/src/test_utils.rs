@@ -1,5 +1,5 @@
 use crate::{
-    BaseEvmConfigSelector, EvmFeatures, EvmTypesHost, ExecutionConfig, SpecId,
+    BaseEvmConfigSelector, DatabaseError, EvmFeatures, EvmTypesHost, ExecutionConfig, SpecId,
     bytecode::Bytecode,
     constants::CALL_DEPTH_LIMIT,
     env::{BlockEnv, BlockEnvExt, TxEnv, TxEnvExt},
@@ -33,6 +33,7 @@ impl EvmTypesHost for TestTypes {
 #[derive(Debug)]
 pub(crate) struct TestHost {
     pub(crate) spec_id: SpecId,
+    pub(crate) execution_config: ExecutionConfig<TestTypes>,
     pub(crate) block: BlockEnv<TestTypes>,
     pub(crate) code_hash: B256,
     pub(crate) code: Bytes,
@@ -46,8 +47,9 @@ pub(crate) struct TestHost {
     pub(crate) transient_storage: StorageKeyMap<Word>,
     pub(crate) logs: Vec<Log>,
     pub(crate) execute_result: MessageResult<TestTypes>,
+    pub(crate) execute_error: Option<crate::ExecutionError>,
     pub(crate) selfdestruct_result: SelfDestructResult,
-    pub(crate) selfdestruct_error: Option<InstrStop>,
+    pub(crate) selfdestruct_error: Option<crate::HostError>,
     pub(crate) calls: Vec<Message<TestTypes>>,
     pub(crate) call_static_flags: Vec<bool>,
     pub(crate) selfdestructs: Vec<(Address, Address, bool)>,
@@ -58,6 +60,9 @@ impl Default for TestHost {
     fn default() -> Self {
         Self {
             spec_id: SpecId::OSAKA,
+            execution_config: ExecutionConfig::for_base_spec::<BaseEvmConfigSelector>(
+                SpecId::OSAKA,
+            ),
             block: BlockEnvExt::default(),
             code_hash: B256::ZERO,
             code: Bytes::new(),
@@ -74,6 +79,7 @@ impl Default for TestHost {
                 stop: InstrStop::Return,
                 ..MessageResultExt::default()
             },
+            execute_error: None,
             selfdestruct_result: SelfDestructResult::default(),
             selfdestruct_error: None,
             calls: Vec::new(),
@@ -89,6 +95,10 @@ impl Host<TestTypes> for TestHost {
         self.spec_id
     }
 
+    fn execution_config(&self) -> &ExecutionConfig<TestTypes> {
+        &self.execution_config
+    }
+
     fn block_env(&mut self) -> &BlockEnv<TestTypes> {
         &self.block
     }
@@ -98,9 +108,9 @@ impl Host<TestTypes> for TestHost {
         address: &Address,
         load_code: bool,
         skip_cold_load: bool,
-    ) -> Result<AccountLoad, InstrStop> {
+    ) -> Result<AccountLoad, crate::HostError> {
         if skip_cold_load && self.is_cold {
-            return Err(InstrStop::OutOfGas);
+            return Err(InstrStop::OutOfGas.into());
         }
         Ok(AccountLoad {
             balance: address.into_word().into(),
@@ -122,7 +132,7 @@ impl Host<TestTypes> for TestHost {
         &mut self,
         address: &Address,
         features: EvmFeatures,
-    ) -> Result<bool, InstrStop> {
+    ) -> Result<bool, DatabaseError> {
         self.new_account_checks.push(*address);
         if features.contains(EvmFeatures::EIP161) {
             return Ok(!self.exists || self.is_empty);
@@ -130,9 +140,9 @@ impl Host<TestTypes> for TestHost {
         Ok(!self.exists && !self.is_touched)
     }
 
-    fn block_hash(&mut self, number: &Word) -> Result<B256, InstrStop> {
+    fn block_hash(&mut self, number: &Word) -> Result<B256, DatabaseError> {
         if self.missing_block_hash {
-            return Err(InstrStop::FatalExternalError);
+            return Err(DatabaseError::new(crate::AnyError::from("missing block hash"), true));
         }
         Ok(B256::with_last_byte(number.wrapping_to::<u8>()))
     }
@@ -142,9 +152,9 @@ impl Host<TestTypes> for TestHost {
         address: &Address,
         key: &Word,
         skip_cold_load: bool,
-    ) -> Result<SLoad, InstrStop> {
+    ) -> Result<SLoad, crate::HostError> {
         if skip_cold_load && self.is_cold {
-            return Err(InstrStop::OutOfGas);
+            return Err(InstrStop::OutOfGas.into());
         }
         Ok(SLoad {
             value: self.storage.get(&StorageKey::new(*address, *key)).copied().unwrap_or_default(),
@@ -159,9 +169,9 @@ impl Host<TestTypes> for TestHost {
         key: &Word,
         value: &Word,
         skip_cold_load: bool,
-    ) -> Result<SStore, InstrStop> {
+    ) -> Result<SStore, crate::HostError> {
         if skip_cold_load && self.is_cold {
-            return Err(InstrStop::OutOfGas);
+            return Err(InstrStop::OutOfGas.into());
         }
         let storage_key = StorageKey::new(*address, *key);
         let present_value = self.storage.get(&storage_key).copied().unwrap_or_default();
@@ -196,19 +206,22 @@ impl Host<TestTypes> for TestHost {
         &mut self,
         _tx_env: &TxEnv<TestTypes>,
         message: &mut Message<TestTypes>,
-    ) -> MessageResult<TestTypes> {
+    ) -> Result<MessageResult<TestTypes>, crate::ExecutionError> {
         // Mimics the depth limit enforced by the real host.
         if message.depth > CALL_DEPTH_LIMIT {
-            return MessageResultExt {
+            return Ok(MessageResultExt {
                 stop: InstrStop::CallTooDeep,
                 gas: GasTracker::new(message.gas_limit),
                 ..Default::default()
-            };
+            });
         }
         self.call_static_flags
             .push(message.caller_is_static || message.kind == MessageKind::StaticCall);
         self.calls.push(message.clone());
-        self.execute_result.clone()
+        match self.execute_error.clone() {
+            Some(error) => Err(error),
+            None => Ok(self.execute_result.clone()),
+        }
     }
 
     fn selfdestruct(
@@ -216,8 +229,8 @@ impl Host<TestTypes> for TestHost {
         contract: &Address,
         target: &Address,
         skip_cold_load: bool,
-    ) -> Result<SelfDestructResult, InstrStop> {
-        if let Some(err) = self.selfdestruct_error {
+    ) -> Result<SelfDestructResult, crate::HostError> {
+        if let Some(err) = self.selfdestruct_error.clone() {
             return Err(err);
         }
         self.selfdestructs.push((*contract, *target, skip_cold_load));
@@ -232,6 +245,7 @@ pub(crate) struct TestInterpreter {
     pub(crate) memory: Memory,
     pub(crate) output: Range<u32>,
     pub(crate) err: InstrStop,
+    pub(crate) execution_error: Option<crate::ExecutionError>,
 }
 
 impl TestInterpreter {
@@ -333,10 +347,13 @@ pub(crate) fn run(config: RunConfig<'_>) -> TestInterpreter {
     let mut default_host = TestHost::default();
     let host = host.unwrap_or(&mut default_host);
     host.spec_id = spec_id;
-    let config = ExecutionConfig::for_base_spec::<BaseEvmConfigSelector>(spec_id);
-    let err = inner.run(&config, host);
+    host.execution_config = ExecutionConfig::for_base_spec::<BaseEvmConfigSelector>(spec_id);
+    let (err, execution_error) = match inner.run(host) {
+        Ok(stop) => (stop, None),
+        Err(error) => (InstrStop::FatalExternalError, Some(error)),
+    };
     let (stack, stack_len, gas, memory, output) = inner.into_parts();
-    TestInterpreter { stack, stack_len, gas, memory, output, err }
+    TestInterpreter { stack, stack_len, gas, memory, output, err, execution_error }
 }
 
 pub(crate) trait ToWord {

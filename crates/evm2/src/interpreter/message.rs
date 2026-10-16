@@ -54,6 +54,11 @@ pub struct MessageExt<E = ()> {
     /// yet-to-be-created contract, derived when the message is constructed (from the creator
     /// and nonce, or from the salt and init-code hash).
     pub destination: Address,
+    /// Address requested by the call opcode or transaction, before EIP-7702 code resolution.
+    ///
+    /// Unlike `destination`, this remains the requested callee for `CALLCODE` and
+    /// `DELEGATECALL`. For create messages it is the derived contract address.
+    pub call_target: Address,
     /// Immediate caller.
     pub caller: Address,
     /// Call input data, or initcode for create messages.
@@ -81,6 +86,55 @@ pub struct MessageExt<E = ()> {
     pub ext: E,
     #[doc(hidden)] // Not public API. Please use an existing constructor.
     pub _non_exhaustive: (),
+}
+
+impl<E> MessageExt<E> {
+    /// Replaces the extension, preserving all other message fields.
+    #[inline]
+    pub fn with_ext<F>(self, ext: F) -> MessageExt<F> {
+        self.map_ext(|_| ext)
+    }
+
+    /// Transforms the extension, preserving all other message fields.
+    #[inline]
+    pub fn map_ext<F>(self, f: impl FnOnce(E) -> F) -> MessageExt<F> {
+        let Self {
+            kind,
+            depth,
+            gas_limit,
+            reservoir,
+            destination,
+            call_target,
+            caller,
+            input,
+            value,
+            code,
+            code_address,
+            disable_precompiles,
+            caller_is_static,
+            salt,
+            ext,
+            _non_exhaustive,
+        } = self;
+        MessageExt {
+            kind,
+            depth,
+            gas_limit,
+            reservoir,
+            destination,
+            call_target,
+            caller,
+            input,
+            value,
+            code,
+            code_address,
+            disable_precompiles,
+            caller_is_static,
+            salt,
+            ext: f(ext),
+            _non_exhaustive,
+        }
+    }
 }
 
 /// Derives the contract address a create message deploys to, i.e. its

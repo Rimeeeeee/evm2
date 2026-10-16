@@ -1,0 +1,6 @@
+version: 3
+rules:
+  # Keep the reviewed immutable deny workflow pin.
+  - ignore: true
+    conditions:
+      - expr: ActionName == "tempoxyz/gh-actions/.github/workflows/rust-deny.yml" && ActionVersion == "a8467566cf2204e895d40f6baf19435c8bc7f921"

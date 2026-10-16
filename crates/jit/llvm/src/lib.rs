@@ -1222,9 +1222,10 @@ impl EvmLlvmBuilder<'_> {
             if inline { ".inline" } else { "" },
             fmt_ty(len.get_type().into()),
         );
+        let len_ty = len.get_type();
         let memcpy = self.get_or_add_function(&name, |this| {
             this.ty_void.fn_type(
-                &[this.ty_ptr.into(), this.ty_ptr.into(), this.ty_i64.into(), this.ty_i1.into()],
+                &[this.ty_ptr.into(), this.ty_ptr.into(), len_ty.into(), this.ty_i1.into()],
                 false,
             )
         });
@@ -2047,18 +2048,23 @@ fn init_() -> Result<()> {
     let mut args = vec![
         c"evm2-jit-llvm".as_ptr(),
         c"-x86-asm-syntax=intel".as_ptr(),
-        // CodeGenPrepare's memory optimization has a pathological interaction with our IR shape:
-        // repeated stores to the same `gas_remaining` pointer in a huge function cause
-        // MemoryDependenceResults::getNonLocalPointerDependency to do superlinear work.
-        // Mark functions with ≥1000 BBs as "huge" to skip the expensive CGP memory opts,
-        // which produce identical codegen at that scale. Small functions still benefit from
-        // CGP's address sinking and branch optimizations.
-        c"--cgpp-huge-func=1000".as_ptr(),
+        // CodeGenPrepare restarts from the first block whenever it changes the dominator tree;
+        // in "huge" functions it revisits only the changed blocks. Our functions hit this often,
+        // so the restarts are superlinear: CGP took 40% of codegen time in a 973-block function
+        // (the default threshold is 10000 blocks). Treat every function as huge; codegen barely
+        // changes.
+        c"--cgpp-huge-func=0".as_ptr(),
         // Greedy register allocation's global live range splitting is superlinear on large
         // functions with many long-lived values. Treat smaller live ranges as huge so LLVM uses
         // the cheaper splitting path; this preserves code size on snailtracer while cutting llc
         // time by ~3x.
         c"--huge-size-for-split=64".as_ptr(),
+        // SimplifyCFG folds each block's out-of-gas and stack-bound checks into a logical-or
+        // `select` with branch weights. CodeGenPrepare would turn that back into a branch
+        // diamond with an `i1` phi; kept as a `select`, SelectionDAG splits it into two plain
+        // conditional branches instead. The flag applies to every `select`, but the IR has few
+        // others.
+        c"-disable-cgp-select2branch".as_ptr(),
     ];
     args.extend(extra.iter().map(|s| s.as_ptr()));
     unsafe {
@@ -2179,7 +2185,8 @@ fn convert_attribute(bcx: &EvmLlvmBuilder<'_>, attr: evm2_jit_backend::Attribute
         OurAttr::Writable => ("writable", AttrValue::Enum(0)),
         // memory(argmem: readwrite) = ModRef(3) << ArgMem(0) = 3.
         OurAttr::ArgMemOnly => ("memory", AttrValue::Enum(3)),
-        OurAttr::DeadOnReturn => ("dead_on_return", AttrValue::Enum(0)),
+        // `u64::MAX` marks all reachable memory as dead; `0` would mark zero bytes.
+        OurAttr::DeadOnReturn => ("dead_on_return", AttrValue::Enum(u64::MAX)),
 
         OurAttr::Initializes(size) => {
             return cpp::create_initializes_attr(bcx.cx, 0, size as i64);

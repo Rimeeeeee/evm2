@@ -143,13 +143,12 @@ impl<'a, T: EvmTypesHost> core::ops::DerefMut for dyn Inspector<T> + 'a {
 mod tests {
     use super::Inspector;
     use crate::{
-        BaseEvmConfigSelector, BaseEvmTypes, Evm, EvmTypesHost, ExecutionConfig, Precompiles,
-        SpecId,
+        BaseEvmTypes, DatabaseError, Evm, EvmTypesHost, Precompiles, SpecId,
         bytecode::Bytecode,
         constants::CALL_DEPTH_LIMIT,
         env::{BlockEnvExt, TxEnvExt},
         ethereum::{TxEnvelope, ethereum_tx_registry},
-        evm::{AccountInfo, InMemoryDB, SYSTEM_ADDRESS},
+        evm::{AccountInfo, EmptyDB, InMemoryDB, SYSTEM_ADDRESS, State},
         interpreter::{
             GasTracker, Host, InstrStop, Interpreter, Message, MessageExt, MessageResult,
             MessageResultExt, Word, op,
@@ -158,7 +157,7 @@ mod tests {
         test_utils::{TestHost, TestTypes, legacy_bytecode, push, push_all},
         utils::address_to_word,
     };
-    use alloc::{boxed::Box, vec::Vec};
+    use alloc::{boxed::Box, vec, vec::Vec};
     use alloy_consensus::{TxLegacy, transaction::Recovered};
     use alloy_primitives::{Address, Bytes, Log, TxKind, U256};
     use core::assert_matches;
@@ -393,7 +392,7 @@ mod tests {
         let tx_env = TxEnvExt::default();
         let bytecode = legacy_bytecode(code);
         let mut message = MessageExt { gas_limit, code: bytecode, ..message.clone() };
-        let result = Host::execute_message(&mut evm, &tx_env, &mut message);
+        let result = Host::execute_message(&mut evm, &tx_env, &mut message).unwrap();
         let inspector = evm.clear_inspector_as::<I>().unwrap();
         (result, inspector, evm)
     }
@@ -457,6 +456,187 @@ mod tests {
     }
 
     #[test]
+    fn inspector_gas_edits_survive_dispatch() {
+        #[derive(Default)]
+        struct GasInspector {
+            steps: usize,
+            ends: usize,
+        }
+
+        impl Inspector<BaseEvmTypes> for GasInspector {
+            fn initialize_interp(&mut self, interp: &mut Interpreter<'_, '_, BaseEvmTypes>) {
+                let mut gas = interp.gas();
+                gas.set_remaining(100);
+                gas.set_refunded(7);
+                interp.set_gas(gas);
+            }
+
+            fn step(&mut self, interp: &mut Interpreter<'_, '_, BaseEvmTypes>) {
+                let expected = [100, 128, 156, 184, 212, 236][self.steps];
+                assert_eq!(interp.gas().remaining(), expected);
+                assert_eq!(interp.gas().refunded(), 7);
+                interp.gas_mut().set_remaining(expected + 10);
+                self.steps += 1;
+            }
+
+            fn step_end(&mut self, interp: &mut Interpreter<'_, '_, BaseEvmTypes>) {
+                let expected = [108, 136, 164, 192, 216, 246][self.ends];
+                assert_eq!(interp.gas().remaining(), expected);
+                if self.ends == 1 {
+                    assert_eq!(interp.stack().last(), Some(&Word::from(136)));
+                }
+                interp.gas_mut().set_remaining(expected + 20);
+                self.ends += 1;
+            }
+        }
+
+        let (result, inspector, _) = run_evm_with_inspector(
+            Vec::from([op::PUSH0, op::GAS, op::POP, op::PUSH0, op::MSTORE, op::STOP]),
+            &MessageExt::default(),
+            1000,
+            GasInspector::default(),
+        );
+        assert_eq!(result.stop, InstrStop::Stop);
+        assert_eq!(result.gas.remaining(), 266);
+        assert_eq!(result.gas.refunded(), 7);
+        assert_eq!((inspector.steps, inspector.ends), (6, 6));
+    }
+
+    #[test]
+    fn inspector_message_hooks_preserve_parent_gas_edits() {
+        #[derive(Default)]
+        struct GasInspector {
+            opcode: u8,
+            before: u64,
+            calls: usize,
+            ends: usize,
+        }
+
+        impl Inspector<BaseEvmTypes> for GasInspector {
+            fn step(&mut self, interp: &mut Interpreter<'_, '_, BaseEvmTypes>) {
+                self.opcode = interp.opcode();
+                self.before = interp.gas().remaining();
+            }
+
+            fn step_end(&mut self, interp: &mut Interpreter<'_, '_, BaseEvmTypes>) {
+                if matches!(self.opcode, op::CALL | op::CREATE) {
+                    assert_eq!(interp.gas().remaining(), 4100);
+                } else if self.opcode == op::GAS {
+                    assert_eq!(interp.stack().last(), Some(&Word::from(4098)));
+                }
+            }
+
+            fn call(
+                &mut self,
+                interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+                message: &mut Message<BaseEvmTypes>,
+            ) -> Option<MessageResult<BaseEvmTypes>> {
+                if message.depth == 0 {
+                    return None;
+                }
+                let expected = if self.opcode == op::CALL {
+                    self.before - 2600 - message.gas_limit
+                } else {
+                    self.before - 32000 - message.gas_limit
+                };
+                assert_eq!(interp.gas().remaining(), expected);
+                interp.gas_mut().set_remaining(5000);
+                self.calls += 1;
+                Some(MessageResultExt {
+                    stop: InstrStop::Return,
+                    gas: GasTracker::new(100),
+                    created_address: Some(Address::from([0x77; 20])),
+                    ..Default::default()
+                })
+            }
+
+            fn call_end(
+                &mut self,
+                interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+                message: &Message<BaseEvmTypes>,
+                _result: &mut MessageResult<BaseEvmTypes>,
+            ) {
+                if message.depth > 0 {
+                    assert_eq!(interp.gas().remaining(), 5000);
+                    interp.gas_mut().set_remaining(4000);
+                    self.ends += 1;
+                }
+            }
+
+            fn create(
+                &mut self,
+                interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+                message: &mut Message<BaseEvmTypes>,
+            ) -> Option<MessageResult<BaseEvmTypes>> {
+                self.call(interp, message)
+            }
+
+            fn create_end(
+                &mut self,
+                interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+                message: &Message<BaseEvmTypes>,
+                result: &mut MessageResult<BaseEvmTypes>,
+            ) {
+                self.call_end(interp, message, result);
+            }
+        }
+
+        for (mut code, opcode) in
+            [(call_code(Address::from([0x66; 20])), op::CALL), (create_code(), op::CREATE)]
+        {
+            code.extend([opcode, op::GAS, op::STOP]);
+            let (result, inspector, _) = run_evm_with_inspector(
+                code,
+                &MessageExt::default(),
+                100_000,
+                GasInspector::default(),
+            );
+            assert_eq!(result.stop, InstrStop::Stop);
+            assert_eq!(result.gas.remaining(), 4098);
+            assert_eq!((inspector.calls, inspector.ends), (1, 1));
+        }
+    }
+
+    #[test]
+    fn inspector_gas_is_valid_after_out_of_gas() {
+        struct GasInspector {
+            recover: bool,
+            failures: usize,
+        }
+
+        impl Inspector<BaseEvmTypes> for GasInspector {
+            fn step_end(&mut self, interp: &mut Interpreter<'_, '_, BaseEvmTypes>) {
+                if matches!(interp.result(), Err(InstrStop::OutOfGas | InstrStop::MemoryOOG)) {
+                    assert_eq!(interp.gas().remaining(), 0);
+                    self.failures += 1;
+                    if self.recover {
+                        interp.gas_mut().set_remaining(17);
+                        interp.set_stop(InstrStop::Stop);
+                    }
+                }
+            }
+        }
+
+        for (code, gas_limit, stop) in [
+            (vec![op::PUSH0], 1, InstrStop::OutOfGas),
+            (vec![op::PUSH0, op::PUSH0, op::MSTORE], 9, InstrStop::MemoryOOG),
+            (vec![op::PUSH0, op::SLOAD], 2, InstrStop::OutOfGas),
+        ] {
+            for recover in [false, true] {
+                let (result, inspector, _) = run_evm_with_inspector(
+                    code.clone(),
+                    &MessageExt::default(),
+                    gas_limit,
+                    GasInspector { recover, failures: 0 },
+                );
+                assert_eq!(inspector.failures, 1, "code={code:?}, result={result:?}");
+                assert_eq!(result.stop, if recover { InstrStop::Stop } else { stop });
+                assert_eq!(result.gas.remaining(), if recover { 17 } else { 0 });
+            }
+        }
+    }
+
+    #[test]
     fn step_can_stop_before_current_opcode_executes() {
         #[derive(Default)]
         struct StopOnStepInspector {
@@ -471,6 +651,7 @@ mod tests {
                 self.steps += 1;
                 if interp.opcode() == self.opcode {
                     self.stack = interp.stack().to_vec();
+                    interp.gas_mut().set_remaining(123);
                     interp.set_stop(InstrStop::Revert);
                 }
             }
@@ -491,6 +672,7 @@ mod tests {
         assert_eq!(inspector.stack, [Word::from(1), Word::from(2)]);
         assert_eq!(inspector.steps, 3);
         assert_eq!(inspector.step_ends, 2);
+        assert_eq!(result.gas.remaining(), 123);
     }
 
     #[test]
@@ -514,6 +696,7 @@ mod tests {
                 self.step_ends += 1;
                 if self.last_opcode == Some(self.opcode) {
                     self.stack = interp.stack().to_vec();
+                    interp.gas_mut().set_remaining(123);
                     interp.set_stop(InstrStop::Revert);
                 }
             }
@@ -530,6 +713,7 @@ mod tests {
         assert_eq!(inspector.stack, [Word::from(1)]);
         assert_eq!(inspector.steps, 1);
         assert_eq!(inspector.step_ends, 1);
+        assert_eq!(result.gas.remaining(), 123);
     }
 
     #[test]
@@ -657,7 +841,7 @@ mod tests {
         let tx_env = TxEnvExt::default();
         let bytecode = legacy_bytecode(code);
         let mut message = MessageExt { gas_limit: 100_000, code: bytecode, ..Default::default() };
-        let result = Host::execute_message(&mut evm, &tx_env, &mut message);
+        let result = Host::execute_message(&mut evm, &tx_env, &mut message).unwrap();
 
         assert_matches!(result.stop, InstrStop::Stop);
         // The redirected call transferred the value to the replacement, not the target.
@@ -934,7 +1118,7 @@ mod tests {
             FailingStepInspector::default(),
         );
 
-        assert_eq!(result.stop, InstrStop::InvalidOpcode);
+        assert_eq!(result.stop, InstrStop::InvalidFEOpcode);
         assert_eq!(inspector.steps, 1);
         assert_eq!(inspector.step_ends, 1);
     }
@@ -989,7 +1173,9 @@ mod tests {
         // Host failures are injected through the mock host; this intentionally uses [`TestHost`].
         let target = Address::from([0x99; 20]);
         let mut host = TestHost {
-            selfdestruct_error: Some(InstrStop::FatalExternalError),
+            selfdestruct_error: Some(
+                DatabaseError::new(crate::AnyError::from("selfdestruct failed"), true).into(),
+            ),
             ..Default::default()
         };
         let mut inspector = SelfdestructInspector::default();
@@ -1004,10 +1190,9 @@ mod tests {
             ..Default::default()
         };
         let mut interp = Interpreter::<TestTypes>::new(&tx_env, &message);
-        let config = ExecutionConfig::for_base_spec::<BaseEvmConfigSelector>(SpecId::OSAKA);
-        let stop = interp.run_inspect(&config, &mut host, &mut inspector);
+        let stop = interp.run_inspect(&mut host, &mut inspector);
 
-        assert_eq!(stop, InstrStop::FatalExternalError);
+        assert_matches!(stop, Err(crate::ExecutionError::Database(error)) if error.is_fatal());
         assert_eq!(inspector.selfdestruct, None);
     }
 
@@ -1133,5 +1318,328 @@ mod tests {
         assert_eq!(state.step_ends, 1);
         assert_eq!(state.calls, 0);
         assert_eq!(state.creates, 1);
+    }
+
+    #[test]
+    fn cooling_loaded_slot_respects_access_list() {
+        struct CoolSlotInspector {
+            prewarmed: bool,
+            before: Option<u64>,
+            costs: Vec<u64>,
+        }
+        impl Inspector<BaseEvmTypes> for CoolSlotInspector {
+            fn initialize_interp(&mut self, interp: &mut Interpreter<'_, '_, BaseEvmTypes>) {
+                let address = interp.message().destination;
+                let state = interp.host().state_mut();
+                state.storage_slot(&address, Word::ZERO).unwrap().set(Word::from(7));
+                if self.prewarmed {
+                    state.prewarm_storage_slot(&address, Word::ZERO);
+                }
+            }
+            fn step(&mut self, interp: &mut Interpreter<'_, '_, BaseEvmTypes>) {
+                if interp.opcode() == op::SLOAD {
+                    if self.costs.len() == 1 {
+                        let address = interp.message().destination;
+                        interp.host().state_mut().set_storage_warm(&address, Word::ZERO, false);
+                    }
+                    self.before = Some(interp.gas().remaining());
+                }
+            }
+            fn step_end(&mut self, interp: &mut Interpreter<'_, '_, BaseEvmTypes>) {
+                if let Some(before) = self.before.take() {
+                    self.costs.push(before - interp.gas().remaining());
+                }
+            }
+        }
+        for prewarmed in [false, true] {
+            let mut code = vec![
+                op::PUSH0,
+                op::SLOAD,
+                op::POP,
+                op::PUSH0,
+                op::SLOAD,
+                op::POP,
+                op::PUSH0,
+                op::SLOAD,
+            ];
+            return_top_word(&mut code);
+            let (result, inspector, _) = run_evm_with_inspector(
+                code,
+                &MessageExt::default(),
+                100_000,
+                CoolSlotInspector { prewarmed, before: None, costs: Vec::new() },
+            );
+            assert_eq!(result.stop, InstrStop::Return);
+            assert_eq!(Word::from_be_slice(&result.output), Word::from(7));
+            assert_eq!(
+                inspector.costs,
+                [if prewarmed { 100 } else { 2100 }, if prewarmed { 100 } else { 2100 }, 100]
+            );
+        }
+    }
+
+    /// Reproduces Foundry restoring a snapshot from a still-running child call.
+    #[test]
+    fn restored_snapshot_allows_child_and_parent_revert() {
+        #[derive(Default)]
+        struct SnapshotInspector {
+            snapshot: Option<State<'static>>,
+            restored: bool,
+            child_reverted: bool,
+        }
+
+        impl Inspector<BaseEvmTypes> for SnapshotInspector {
+            fn call(
+                &mut self,
+                interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+                message: &mut Message<BaseEvmTypes>,
+            ) -> Option<MessageResult<BaseEvmTypes>> {
+                let marker = message.destination;
+                if marker == Address::with_last_byte(0x44) {
+                    self.snapshot = Some(interp.host().state().clone_with(EmptyDB::default()));
+                } else if marker == Address::with_last_byte(0x55) {
+                    *interp.host().state_mut() =
+                        self.snapshot.as_ref().unwrap().clone_with(EmptyDB::default());
+                    self.restored = true;
+                } else {
+                    return None;
+                }
+                Some(MessageResultExt {
+                    stop: InstrStop::Return,
+                    gas: GasTracker::new(message.gas_limit),
+                    ..Default::default()
+                })
+            }
+
+            fn call_end(
+                &mut self,
+                interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+                message: &Message<BaseEvmTypes>,
+                result: &mut MessageResult<BaseEvmTypes>,
+            ) {
+                if message.destination == Address::with_last_byte(0xbb) {
+                    assert_eq!(result.stop, InstrStop::Revert);
+                    assert_eq!(
+                        interp
+                            .host()
+                            .state_mut()
+                            .storage_slot_untracked(&Address::with_last_byte(0xaa), &Word::ZERO,)
+                            .unwrap(),
+                        Word::from(7),
+                    );
+                    self.child_reverted = true;
+                }
+            }
+        }
+
+        fn append_call(code: &mut Vec<u8>, target: Address) {
+            push_all(
+                code,
+                [
+                    Word::ZERO,
+                    Word::ZERO,
+                    Word::ZERO,
+                    Word::ZERO,
+                    Word::ZERO,
+                    address_to_word(&target),
+                    Word::from(200_000),
+                ],
+            );
+            code.extend([op::CALL, op::POP]);
+        }
+
+        let parent = Address::with_last_byte(0xaa);
+        let child = Address::with_last_byte(0xbb);
+        let mut parent_code = vec![op::PUSH1, 7, op::PUSH0, op::SSTORE];
+        append_call(&mut parent_code, Address::with_last_byte(0x44));
+        parent_code.extend([op::PUSH1, 8, op::PUSH0, op::SSTORE]);
+        append_call(&mut parent_code, child);
+        parent_code.extend([op::PUSH0, op::PUSH0, op::REVERT]);
+        let mut child_code = Vec::new();
+        append_call(&mut child_code, Address::with_last_byte(0x55));
+        child_code.extend([op::PUSH0, op::PUSH0, op::REVERT]);
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            &child,
+            AccountInfo::default().with_code(legacy_bytecode(child_code)),
+        );
+        let (result, inspector, mut evm) = run_evm_with_inspector_db(
+            db,
+            parent_code,
+            &MessageExt { destination: parent, ..Default::default() },
+            1_000_000,
+            SnapshotInspector::default(),
+        );
+        assert!(inspector.restored);
+        assert!(inspector.child_reverted);
+        assert_eq!(result.stop, InstrStop::Revert);
+        assert_eq!(
+            evm.state_mut().storage_slot_untracked(&parent, &Word::ZERO).unwrap(),
+            Word::ZERO,
+        );
+    }
+
+    #[test]
+    fn snapshot_restore_preserves_logs_without_reinspection() {
+        #[derive(Default)]
+        struct SnapshotInspector {
+            snapshot: Option<State<'static>>,
+            logs: usize,
+        }
+        impl Inspector<BaseEvmTypes> for SnapshotInspector {
+            fn log(&mut self, _log: &Log, _host: &mut Evm<'_, BaseEvmTypes>) {
+                self.logs += 1;
+            }
+            fn call(
+                &mut self,
+                interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+                message: &mut Message<BaseEvmTypes>,
+            ) -> Option<MessageResult<BaseEvmTypes>> {
+                match message.destination.as_slice()[19] {
+                    0x44 => {
+                        self.snapshot = Some(interp.host().state().clone_with(EmptyDB::default()))
+                    }
+                    0x55 => {
+                        let state = interp.host().state_mut();
+                        let logs = core::mem::take(state.logs_mut());
+                        let db = core::mem::replace(
+                            &mut state.overlay_db_mut().db,
+                            Box::new(EmptyDB::default()),
+                        );
+                        *state = self.snapshot.as_ref().unwrap().clone_with(db);
+                        *state.logs_mut() = logs;
+                    }
+                    _ => return None,
+                }
+                Some(MessageResultExt {
+                    stop: InstrStop::Return,
+                    gas: GasTracker::new(message.gas_limit),
+                    ..Default::default()
+                })
+            }
+        }
+        let mut code = Vec::new();
+        for marker in [0x44, 0x55] {
+            code.extend([
+                op::PUSH1,
+                marker,
+                op::PUSH0,
+                op::MSTORE8,
+                op::PUSH1,
+                1,
+                op::PUSH0,
+                op::LOG0,
+            ]);
+            code.extend(call_code(Address::with_last_byte(marker)));
+            code.extend([op::CALL, op::POP]);
+            if marker == 0x44 {
+                code.extend([op::PUSH1, 9, op::PUSH0, op::SSTORE]);
+            }
+        }
+        code.push(op::STOP);
+        let (result, inspector, mut evm) = run_evm_with_inspector(
+            code,
+            &MessageExt::default(),
+            100_000,
+            SnapshotInspector::default(),
+        );
+        assert_eq!(result.stop, InstrStop::Stop);
+        assert_eq!(evm.logs().len(), 2);
+        assert_eq!(evm.logs()[0].data.data.as_ref(), &[0x44]);
+        assert_eq!(evm.logs()[1].data.data.as_ref(), &[0x55]);
+        assert_eq!(inspector.logs, 2);
+        assert_eq!(
+            evm.state_mut().storage_slot_untracked(&Address::ZERO, &Word::ZERO).unwrap(),
+            Word::ZERO
+        );
+    }
+
+    #[test]
+    fn isolated_transaction_resets_transient_state_and_merges_storage() {
+        let target = Address::with_last_byte(0xbb);
+        let caller = Address::with_last_byte(0x99);
+        for reverts in [false, true] {
+            let mut parent = State::new(EmptyDB::default());
+            // Return the initial persistent and transient values, then write persistent storage.
+            let code = vec![
+                op::PUSH0,
+                op::SLOAD,
+                op::PUSH0,
+                op::MSTORE,
+                op::PUSH0,
+                op::TLOAD,
+                op::PUSH1,
+                32,
+                op::MSTORE,
+                op::PUSH1,
+                8,
+                op::PUSH0,
+                op::SSTORE,
+                op::PUSH1,
+                64,
+                op::PUSH0,
+                if reverts { op::REVERT } else { op::RETURN },
+            ];
+            parent.account(&target).unwrap().set_code_slow(legacy_bytecode(code));
+            parent.account(&caller).unwrap().set_balance(Word::from(1_000_000_000));
+            parent.storage_slot(&target, Word::ZERO).unwrap().set(Word::from(7));
+            parent.storage_slot(&target, Word::ZERO).unwrap().warm();
+            parent.tstore(&target, &Word::ZERO, &Word::from(9));
+            let checkpoint = parent.checkpoint();
+            let mut child = Evm::<BaseEvmTypes>::new(
+                SpecId::CANCUN,
+                BlockEnvExt::default(),
+                ethereum_tx_registry(SpecId::CANCUN),
+                EmptyDB::default(),
+                Precompiles::base(SpecId::CANCUN),
+            );
+            child.state_mut().set_pending_state(parent.prepare_isolated_state());
+            let tx = Recovered::new_unchecked(
+                TxEnvelope::Legacy(TxLegacy {
+                    to: TxKind::Call(target),
+                    gas_limit: 100_000,
+                    ..Default::default()
+                }),
+                caller,
+            );
+            let output = child.transact(&tx).unwrap().detach();
+            assert_eq!(output.result.status, !reverts);
+            assert_eq!(Word::from_be_slice(&output.result.output[..32]), Word::from(7));
+            assert_eq!(Word::from_be_slice(&output.result.output[32..]), Word::ZERO);
+            parent.merge_isolated_state(output.pending_state);
+            assert_eq!(parent.checkpoint(), checkpoint);
+            let slot = parent.storage_slot(&target, Word::ZERO).unwrap();
+            assert_eq!(slot.original(), Word::ZERO);
+            assert_eq!(slot.current(), Word::from(if reverts { 7 } else { 8 }));
+            assert!(slot.is_warm());
+            assert_eq!(parent.tload(&target, &Word::ZERO), Word::from(9));
+        }
+    }
+
+    #[test]
+    fn inspector_gas_changes_survive_dispatch_errors() {
+        struct GasEdit;
+        impl Inspector<TestTypes> for GasEdit {
+            fn step_end(&mut self, interp: &mut Interpreter<'_, '_, TestTypes>) {
+                interp.gas_mut().set_remaining(1000);
+            }
+        }
+
+        for (code, gas_limit, expected) in [
+            (Vec::from([op::PUSH1, 0]), 2, InstrStop::OutOfGas),
+            (Vec::from([op::INVALID]), 10_000, InstrStop::InvalidFEOpcode),
+        ] {
+            let tx_env = TxEnvExt::default();
+            let message = Message::<TestTypes> {
+                gas_limit,
+                code: legacy_bytecode(code),
+                ..Default::default()
+            };
+            let mut interp = Interpreter::<TestTypes>::new(&tx_env, &message);
+            let stop = interp.run_inspect(&mut TestHost::default(), &mut GasEdit);
+
+            assert_eq!(stop, Ok(expected));
+            assert_eq!(interp.gas().remaining(), 1000);
+        }
     }
 }

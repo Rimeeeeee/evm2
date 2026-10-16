@@ -2,8 +2,8 @@
 
 use crate::runtime::{JitBackend, LookupDecision, LookupRequest, RuntimeCacheKey};
 use evm2::{
-    BaseEvmTypes, Evm, ExecutionConfig, InterpreterRunner,
-    interpreter::{InstrStop, Interpreter},
+    BaseEvmTypes, Evm, InterpreterRunner,
+    interpreter::{Host, InstrStop, Interpreter},
 };
 
 /// External interpreter runner backed by [`JitBackend`].
@@ -30,11 +30,10 @@ impl InterpreterRunner<BaseEvmTypes> for JitInterpreterRunner {
     #[inline]
     fn run<'frame, 'host>(
         &self,
-        config: &ExecutionConfig<BaseEvmTypes>,
         interpreter: &mut Interpreter<'frame, 'host, BaseEvmTypes>,
         host: &mut Evm<'host, BaseEvmTypes>,
     ) -> Option<InstrStop> {
-        run_interpreter(&self.backend, config, interpreter, host)
+        run_interpreter(&self.backend, interpreter, host)
     }
 }
 
@@ -45,14 +44,17 @@ impl InterpreterRunner<BaseEvmTypes> for JitInterpreterRunner {
 #[inline]
 pub fn run_interpreter<'frame, 'host>(
     backend: &JitBackend,
-    config: &ExecutionConfig<BaseEvmTypes>,
     interpreter: &mut Interpreter<'frame, 'host, BaseEvmTypes>,
     host: &mut Evm<'host, BaseEvmTypes>,
 ) -> Option<InstrStop> {
+    // Disabled runners must not hash code merely to discover that lookup is unavailable.
+    if !backend.enabled() {
+        return None;
+    }
     let code_hash = interpreter.original_bytecode_hash();
     let code = interpreter.original_bytecode();
     let decision = backend.lookup(LookupRequest {
-        key: RuntimeCacheKey { code_hash, spec_id: config.base_spec_id() },
+        key: RuntimeCacheKey { code_hash, spec_id: host.execution_config().base_spec_id() },
         code,
     });
 
@@ -61,7 +63,7 @@ pub fn run_interpreter<'frame, 'host>(
         LookupDecision::Unavailable(_) => return None,
     };
 
-    interpreter.prepare_run(config.base_spec_id(), config.version(), host);
+    interpreter.prepare_run(host);
     Some(unsafe { program.func.call_with_interpreter(interpreter) })
 }
 
@@ -74,7 +76,7 @@ mod tests {
     use alloy_primitives::Address;
     use alloy_primitives::Bytes;
     use evm2::{
-        BaseEvmConfigSelector, BaseEvmTypes, Evm, EvmConfigSelector, Precompiles, SpecId,
+        BaseEvmTypes, Evm, Precompiles, SpecId,
         bytecode::Bytecode,
         env::{BlockEnvExt, TxEnvExt},
         ethereum::ethereum_tx_registry,
@@ -203,9 +205,6 @@ mod tests {
 
     #[test]
     fn disabled_backend_falls_back_to_interpreter() {
-        let config = <BaseEvmConfigSelector as EvmConfigSelector<BaseEvmTypes>>::execution_config(
-            SpecId::CANCUN,
-        );
         let tx_env = TxEnvExt::default();
         let message = MessageExt {
             gas_limit: 1_000_000,
@@ -221,18 +220,12 @@ mod tests {
             Precompiles::base(SpecId::CANCUN),
         );
 
-        assert_eq!(
-            run_interpreter(&JitBackend::disabled(), &config, &mut interpreter, &mut host),
-            None
-        );
+        assert_eq!(run_interpreter(&JitBackend::disabled(), &mut interpreter, &mut host), None);
     }
 
     #[test]
     #[cfg(feature = "llvm")]
     fn compiled_call_executes_message() {
-        let config = <BaseEvmConfigSelector as EvmConfigSelector<BaseEvmTypes>>::execution_config(
-            SpecId::CANCUN,
-        );
         let target = Address::from([0x22; 20]);
         let caller = Address::from([0x11; 20]);
         let mut database = InMemoryDB::default();
@@ -252,7 +245,9 @@ mod tests {
         );
         host.set_interpreter_runner(JitInterpreterRunner::new(backend.clone()));
         let tx_env = TxEnvExt::default();
-        let mut code = vec![op::PUSH1, 0x20, op::PUSH0, op::PUSH0, op::PUSH0, op::PUSH0];
+        // The call output overwrites the word stored before it.
+        let mut code = vec![op::PUSH1, 0x69, op::PUSH0, op::MSTORE];
+        code.extend([op::PUSH1, 0x20, op::PUSH0, op::PUSH0, op::PUSH0, op::PUSH0]);
         push20(&mut code, target);
         code.extend([
             op::PUSH2,
@@ -276,10 +271,7 @@ mod tests {
         };
         let mut interpreter = Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
 
-        assert_eq!(
-            run_interpreter(&backend, &config, &mut interpreter, &mut host),
-            Some(InstrStop::Return),
-        );
+        assert_eq!(run_interpreter(&backend, &mut interpreter, &mut host), Some(InstrStop::Return));
         assert_eq!(interpreter.output().len(), 32);
         assert_eq!(interpreter.output()[31], 0x42);
     }
@@ -287,9 +279,6 @@ mod tests {
     #[test]
     #[cfg(feature = "llvm")]
     fn compiled_create_executes_message() {
-        let config = <BaseEvmConfigSelector as EvmConfigSelector<BaseEvmTypes>>::execution_config(
-            SpecId::CANCUN,
-        );
         let creator = Address::from([0x33; 20]);
         let mut database = InMemoryDB::default();
         database.insert_account_info(&creator, AccountInfo::default());
@@ -340,10 +329,7 @@ mod tests {
         };
         let mut interpreter = Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
 
-        assert_eq!(
-            run_interpreter(&backend, &config, &mut interpreter, &mut host),
-            Some(InstrStop::Return),
-        );
+        assert_eq!(run_interpreter(&backend, &mut interpreter, &mut host), Some(InstrStop::Return));
         assert_eq!(interpreter.output().len(), 32);
         assert_eq!(interpreter.output()[31], 1);
     }
@@ -351,9 +337,6 @@ mod tests {
     #[test]
     #[cfg(feature = "llvm")]
     fn compiled_staticcall_zeros_child_callvalue() {
-        let config = <BaseEvmConfigSelector as EvmConfigSelector<BaseEvmTypes>>::execution_config(
-            SpecId::CANCUN,
-        );
         let caller = Address::from([0x11; 20]);
         let target = Address::with_last_byte(0x68);
         let mut database = InMemoryDB::default();
@@ -407,10 +390,7 @@ mod tests {
         };
         let mut interpreter = Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
 
-        assert_eq!(
-            run_interpreter(&backend, &config, &mut interpreter, &mut host),
-            Some(InstrStop::Return),
-        );
+        assert_eq!(run_interpreter(&backend, &mut interpreter, &mut host), Some(InstrStop::Return));
         assert_eq!(interpreter.output().len(), 32);
         assert_eq!(interpreter.output()[31], 0);
     }
@@ -418,9 +398,6 @@ mod tests {
     #[test]
     #[cfg(feature = "llvm")]
     fn compiled_staticcall_child_callvalue_does_not_transfer() {
-        let config = <BaseEvmConfigSelector as EvmConfigSelector<BaseEvmTypes>>::execution_config(
-            SpecId::CANCUN,
-        );
         let caller = Address::from([0x11; 20]);
         let child = Address::with_last_byte(0x68);
         let beneficiary = Address::with_last_byte(0x69);
@@ -483,10 +460,7 @@ mod tests {
         };
         let mut interpreter = Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
 
-        assert_eq!(
-            run_interpreter(&backend, &config, &mut interpreter, &mut host),
-            Some(InstrStop::Stop),
-        );
+        assert_eq!(run_interpreter(&backend, &mut interpreter, &mut host), Some(InstrStop::Stop));
         let beneficiary_balance = host.read_account_info(&beneficiary).unwrap().unwrap().balance;
         assert_eq!(beneficiary_balance, initial_beneficiary_balance);
     }
@@ -494,9 +468,6 @@ mod tests {
     #[test]
     #[cfg(feature = "llvm")]
     fn compiled_dynamic_call_to_staticcall_loop_matches_interpreter_gas() {
-        let config = <BaseEvmConfigSelector as EvmConfigSelector<BaseEvmTypes>>::execution_config(
-            SpecId::CANCUN,
-        );
         let caller = Address::from([0x11; 20]);
         let outer = Address::with_last_byte(0xfd);
         let middle = Address::with_last_byte(0xed);
@@ -548,9 +519,9 @@ mod tests {
             }
             let mut interpreter = Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
             let stop = if with_jit {
-                run_interpreter(&backend, &config, &mut interpreter, &mut host).unwrap()
+                run_interpreter(&backend, &mut interpreter, &mut host).unwrap()
             } else {
-                interpreter.run(&config, &mut host)
+                interpreter.run(&mut host).unwrap()
             };
             (stop, interpreter.gas().spent(), interpreter.gas().refunded())
         };

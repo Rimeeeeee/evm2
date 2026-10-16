@@ -13,9 +13,11 @@ use alloy_rpc_types_trace::{
     geth::{CallFrame, CallLogFrame, GethDefaultTracingOptions, StructLog},
     parity::{
         Action, ActionType, CallAction, CallOutput, CallType, CreateAction, CreateOutput,
-        CreationMethod, SelfdestructAction, TraceOutput, TransactionTrace,
+        CreationMethod, MemoryDelta, SelfdestructAction, StorageDelta, TraceOutput,
+        TransactionTrace,
     },
 };
+use core::ops::Range;
 use evm2::interpreter::{
     InstrStop, MessageKind,
     opcode::{OpCode, op},
@@ -88,6 +90,10 @@ pub struct CallTrace {
     /// The value transferred in the call.
     pub value: U256,
     /// The calldata/input, or the init code for contract creations.
+    ///
+    /// Empty when
+    /// [`TracingInspectorConfig::record_inputs`](crate::tracing::TracingInspectorConfig::record_inputs)
+    /// is disabled.
     pub data: Bytes,
     /// The return data, or the runtime bytecode of the created contract.
     pub output: Bytes,
@@ -108,6 +114,14 @@ pub struct CallTrace {
     pub status: Option<InstrStop>,
     /// Opcode-level execution steps.
     pub steps: Vec<CallTraceStep>,
+    /// The deltas recorded for [`Self::steps`], in step order.
+    ///
+    /// Only steps that report memory or storage, make a call or gain gas have an entry, and only
+    /// if [`record_step_deltas`] is enabled.
+    ///
+    /// [`record_step_deltas`]: crate::tracing::TracingInspectorConfig::record_step_deltas
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub step_deltas: Vec<StepDelta>,
     /// Optional complementary decoded call data.
     pub decoded: Option<Box<DecodedCallTrace>>,
 }
@@ -321,22 +335,22 @@ impl CallTraceNode {
         TransactionTrace { action, error, result, trace_address, subtraces: self.children.len() }
     }
 
-    /// Returns the `Output` for a parity trace
+    /// Returns the `Output` for a parity trace.
+    ///
+    /// A reverted creation reports its gas and revert data like a call, since no contract exists
+    /// at the address it would have created.
     pub fn parity_trace_output(&self) -> TraceOutput {
-        match self.kind() {
-            CallKind::Call
-            | CallKind::StaticCall
-            | CallKind::CallCode
-            | CallKind::DelegateCall
-            | CallKind::AuthCall => TraceOutput::Call(CallOutput {
-                gas_used: self.trace.gas_used,
-                output: self.trace.output.clone(),
-            }),
-            CallKind::Create | CallKind::Create2 => TraceOutput::Create(CreateOutput {
+        if self.kind().is_any_create() && !self.trace.is_revert() {
+            TraceOutput::Create(CreateOutput {
                 gas_used: self.trace.gas_used,
                 code: self.trace.output.clone(),
                 address: self.trace.address,
-            }),
+            })
+        } else {
+            TraceOutput::Call(CallOutput {
+                gas_used: self.trace.gas_used,
+                output: self.trace.output.clone(),
+            })
         }
     }
 
@@ -431,7 +445,10 @@ impl CallTraceNode {
                 call_frame.to = None;
             }
 
-            if !self.status().is_some_and(|status| status.is_revert()) {
+            if !self
+                .status()
+                .is_some_and(|status| status.is_revert() || status == InstrStop::NonceOverflow)
+            {
                 call_frame.gas_used = U256::from(self.trace.gas_limit);
                 call_frame.output = None;
             }
@@ -687,7 +704,11 @@ impl CallTraceStep {
             gas_cost: self.gas_cost,
             state_gas_cost: self.state_gas_cost,
             state_gas_reservoir: self.state_gas_reservoir,
-            op: if self.op.is_valid() { self.op.as_str().into() } else { "Unknown".into() },
+            op: if self.op.is_valid() {
+                self.op.as_str().into()
+            } else {
+                format!("opcode {:#x} not defined", self.op.get()).into()
+            },
             pc: self.pc as u64,
             refund_counter: Some(self.gas_refund_counter),
             stack: if opts.is_stack_enabled() {
@@ -709,12 +730,6 @@ impl CallTraceStep {
             // This is always `None` in the RPC response.
             memory_size: None,
         }
-    }
-
-    /// Returns true if the step is a STOP opcode
-    #[inline]
-    pub(crate) const fn is_stop(&self) -> bool {
-        matches!(self.op.get(), op::STOP)
     }
 
     /// Returns true if the step is a call operation, any of
@@ -745,6 +760,48 @@ impl CallTraceStep {
     /// Returns `DecodedTraceStep` from `CallTraceStep`.
     pub fn decoded_mut(&mut self) -> &mut DecodedTraceStep {
         self.decoded.get_or_insert_with(|| Box::new(DecodedTraceStep::Line(String::new())))
+    }
+}
+
+/// The deltas a [`CallTraceStep`] produced, as reported by parity's `vmTrace`.
+///
+/// Recorded in [`CallTrace::step_deltas`] for the steps that report memory or storage, make a
+/// call or gain gas, when [`record_step_deltas`] is enabled.
+///
+/// [`record_step_deltas`]: crate::tracing::TracingInspectorConfig::record_step_deltas
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct StepDelta {
+    /// The index of the step in [`CallTrace::steps`].
+    pub step: usize,
+    /// The memory the step wrote, or the word an `MLOAD` read, as it is after the step.
+    pub memory: Option<MemoryDelta>,
+    /// The storage written by an `SSTORE`, taken from its operands, so it is also set when the
+    /// value does not change.
+    pub store: Option<StorageDelta>,
+    /// The remaining gas after a call-like step or an instruction that gained gas.
+    ///
+    /// For all other steps the remaining gas after execution is `gas_remaining - gas_cost`.
+    pub gas_remaining_after: Option<u64>,
+    /// The memory range the step reports, captured before execution and consumed once its
+    /// contents are recorded.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) write_range: Option<Range<usize>>,
+}
+
+impl StepDelta {
+    /// Records the contents of the captured memory range after the step, if one was captured.
+    pub(crate) fn record_memory_write(
+        &mut self,
+        memory: &[u8],
+        budget: &mut super::limits::TraceBudget,
+    ) {
+        if let Some(range) = self.write_range.take().filter(|range| !range.is_empty()) {
+            self.memory = memory
+                .get(range.clone())
+                .filter(|data| budget.reserve(data.len()))
+                .map(|data| MemoryDelta { off: range.start, data: Bytes::copy_from_slice(data) });
+        }
     }
 }
 

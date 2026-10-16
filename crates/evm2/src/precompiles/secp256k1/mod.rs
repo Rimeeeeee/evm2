@@ -25,7 +25,7 @@ use crate::{
     precompiles::{PrecompileOutput, PrecompileResult},
     utils::right_pad,
 };
-use alloy_primitives::{B256, B512, Bytes};
+use alloy_primitives::Bytes;
 
 /// `ecrecover` precompile function. Read more about input and output format in [this module
 /// docs](self).
@@ -41,11 +41,11 @@ pub fn run(input: &[u8], gas: &mut GasTracker) -> PrecompileResult {
         return Ok(PrecompileOutput::new(Bytes::new()));
     }
 
-    let msg = <&B256>::try_from(&input[0..32]).unwrap();
+    let msg = input.first_chunk().unwrap();
     let recid = input[63] - 27;
-    let sig = <&B512>::try_from(&input[64..128]).unwrap();
+    let sig = input.last_chunk().unwrap();
 
-    let res = crate::precompiles::crypto().secp256k1_ecrecover(&sig.0, recid, &msg.0).ok();
+    let res = crate::precompiles::crypto().secp256k1_ecrecover(sig, recid, msg).ok();
     let out = res.map(|o| o.to_vec().into()).unwrap_or_default();
     Ok(PrecompileOutput::new(out))
 }
@@ -58,10 +58,11 @@ pub(crate) fn ecrecover_bytes(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Opti
 }
 
 // Select the correct implementation based on the enabled features.
-cfg_if::cfg_if! {
-    if #[cfg(feature = "secp256k1")] {
+core::cfg_select! {
+    feature = "secp256k1" => {
         pub(crate) use bitcoin_secp256k1::ecrecover;
-    } else {
+    }
+    _ => {
         pub(crate) use k256::ecrecover;
     }
 }

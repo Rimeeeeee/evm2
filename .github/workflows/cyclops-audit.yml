@@ -2,7 +2,9 @@ name: Cyclops audit
 
 on:
   pull_request:
-    types: [labeled]
+    types: [labeled, opened, synchronize, reopened, ready_for_review]
+  pull_request_target: # zizmor: ignore[dangerous-triggers] Audits conflicting same-repo pushes without checking out PR code.
+    types: [opened, synchronize, reopened, ready_for_review]
   issue_comment:
     types: [created]
 
@@ -11,21 +13,25 @@ permissions: {}
 jobs:
   audit:
     if: >-
-      github.event_name == 'pull_request' &&
+      contains(fromJSON('["pull_request","pull_request_target"]'), github.event_name) &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       (
+        github.event.action != 'labeled' ||
         github.event.label.name == 'cyclops' ||
         github.event.label.name == 'agentic-audit'
       )
     permissions:
+      id-token: write
       contents: read
       pull-requests: read
       statuses: write
-    uses: tempoxyz/gh-actions/.github/workflows/pr-audit.yml@7741a8658354abd422dd1b941d07f809682ca96d # tempoxyz/gh-actions#99
+    uses: tempoxyz/gh-actions/.github/workflows/pr-audit.yml@252d87d9636b94551796b4b8a5cb4e27b8916cf6 # 2026-10-12T22-06-06Z-252d87d9
     with:
       required-labels: |
         cyclops
         agentic-audit
+      audit-on-push: true
+      audit-on-command: true
     secrets:
       EVENTS_KEY: ${{ secrets.EVENTS_KEY }}
       EVENTS_CERT: ${{ secrets.EVENTS_CERT }}
@@ -42,11 +48,14 @@ jobs:
       )
     runs-on: ubuntu-latest
     permissions:
+      id-token: write
       contents: read
       issues: write
-      pull-requests: read
+      pull-requests: write
     steps:
-      - uses: tempoxyz/gh-actions/actions/pr-audit-comment@7741a8658354abd422dd1b941d07f809682ca96d # tempoxyz/gh-actions#99
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@252d87d9636b94551796b4b8a5cb4e27b8916cf6 # 2026-10-12T22-06-06Z-252d87d9
+      - uses: tempoxyz/gh-actions/actions/pr-audit-comment@252d87d9636b94551796b4b8a5cb4e27b8916cf6 # 2026-10-12T22-06-06Z-252d87d9
         with:
           command-regex: '^(?:@decofe\s+)?(?:cyclops\s+audit|derek\s+audit)\b'
           permission-check-mode: association

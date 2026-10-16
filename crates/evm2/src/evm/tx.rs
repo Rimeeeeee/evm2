@@ -1,7 +1,7 @@
 //! Transaction execution lifecycle and result types.
 
-use super::{BlockStateAccumulator, Evm, PendingState, StateChangeSink};
-use crate::{ErrorCode, EvmTypesHost, interpreter::InstrStop};
+use super::{AccountChanges, BlockStateAccumulator, Evm, PendingState, StateChangeSink};
+use crate::{EvmTypesHost, interpreter::InstrStop};
 use alloc::vec::Vec;
 use alloy_primitives::{Address, Bytes, Log};
 use core::fmt;
@@ -13,7 +13,7 @@ pub type TxResult<T = crate::BaseEvmTypes> = TxResultExt<<T as EvmTypesHost>::Tx
 /// Transaction execution result without an owned state diff, parameterized by extension data.
 ///
 /// This is the result-only half of transaction execution: status, gas used, output, stop reason,
-/// logs, host error code, and extension data. Logs live here because they are execution
+/// logs, and extension data. Logs live here because they are execution
 /// output, not database state. Use [`ExecutedTx::detach`] only when an owned [`PendingState`]
 /// value is required.
 #[must_use = "transaction results contain execution status, gas, logs, and errors"]
@@ -41,8 +41,6 @@ pub struct TxResultExt<E = ()> {
     pub created_address: Option<Address>,
     /// Logs emitted by the transaction.
     pub logs: Vec<Log>,
-    /// Host error code raised during execution, if any.
-    pub error_code: Option<ErrorCode>,
     /// EVM type-specific extension data.
     pub ext: E,
     #[doc(hidden)] // Not public API. Please use an existing constructor.
@@ -50,6 +48,43 @@ pub struct TxResultExt<E = ()> {
 }
 
 impl<E> TxResultExt<E> {
+    /// Replaces the extension, preserving all other transaction result fields.
+    #[inline]
+    pub fn with_ext<F>(self, ext: F) -> TxResultExt<F> {
+        self.map_ext(|_| ext)
+    }
+
+    /// Transforms the extension, preserving all other transaction result fields.
+    #[inline]
+    pub fn map_ext<F>(self, f: impl FnOnce(E) -> F) -> TxResultExt<F> {
+        let Self {
+            status,
+            total_gas_spent,
+            state_gas_spent,
+            refunded,
+            floor_gas,
+            stop,
+            output,
+            created_address,
+            logs,
+            ext,
+            _non_exhaustive,
+        } = self;
+        TxResultExt {
+            status,
+            total_gas_spent,
+            state_gas_spent,
+            refunded,
+            floor_gas,
+            stop,
+            output,
+            created_address,
+            logs,
+            ext: f(ext),
+            _non_exhaustive,
+        }
+    }
+
     /// Returns the receipt gas-used value: `max(total_gas_spent - refunded, floor_gas)`.
     #[inline]
     pub const fn tx_gas_used(&self) -> u64 {
@@ -78,6 +113,22 @@ impl<E> TxResultExt<E> {
     #[inline]
     pub const fn state_gas_spent(&self) -> u64 {
         self.state_gas_spent
+    }
+
+    /// Returns the effective gas refund after the EIP-7623 floor adjustment.
+    ///
+    /// [`Self::refunded`] is capped per EIP-3529 but still pre-floor. When the floor binds —
+    /// `total_gas_spent - refunded < floor_gas` — the floor charge absorbs the refund entirely
+    /// and this returns zero; otherwise it returns [`Self::refunded`]. Consumers computing net
+    /// cost as `total_gas_spent - refund` should use this rather than the raw field; the receipt
+    /// value is [`Self::tx_gas_used`].
+    #[inline]
+    pub const fn final_refunded(&self) -> u64 {
+        if self.total_gas_spent.saturating_sub(self.refunded) < self.floor_gas {
+            0
+        } else {
+            self.refunded
+        }
     }
 }
 
@@ -181,6 +232,18 @@ impl<'evm, 'host, T: EvmTypesHost> ExecutedTx<'evm, 'host, T> {
             Some(result) => result,
             None => unreachable!("executed transaction result was already taken"),
         }
+    }
+
+    /// Returns each account loaded by the transaction with its changes, in an unspecified order.
+    ///
+    /// This borrows the transaction state without detaching it, so a caller can apply the changes
+    /// and then [`commit`](Self::commit) or [`discard`](Self::discard) the transaction.
+    #[inline]
+    pub fn account_changes(&self) -> impl Iterator<Item = AccountChanges<'_>> {
+        self.has_pending_state()
+            .then(|| self.evm.state.transaction_account_changes())
+            .into_iter()
+            .flatten()
     }
 
     /// Accepts the transaction state into the internal accepted overlay.

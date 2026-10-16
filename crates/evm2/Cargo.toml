@@ -23,11 +23,9 @@ alloy-eip7928.workspace = true
 alloy-eips = { workspace = true, features = ["k256"] }
 alloy-primitives.workspace = true
 auto_impl.workspace = true
-bitvec = { workspace = true, features = ["alloc"] }
 derive-where.workspace = true
 thiserror.workspace = true
 typeid.workspace = true
-cfg-if.workspace = true
 
 # no_std
 once_cell = { workspace = true, features = ["alloc"] }
@@ -39,6 +37,12 @@ serde = { workspace = true, features = ["derive", "alloc"], optional = true }
 
 # "async"
 corosensei = { workspace = true, optional = true }
+
+# "account-ext"
+triomphe = { workspace = true, optional = true }
+
+# nightly
+ruint = { workspace = true, optional = true }
 
 # ecrecover
 k256 = { workspace = true, features = ["ecdsa"] }
@@ -85,6 +89,7 @@ aws-lc-rs = { workspace = true, optional = true }
 
 [dev-dependencies]
 alloy-primitives = { workspace = true, features = ["serde", "std"] }
+rmp-serde.workspace = true
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true, features = ["std"] }
 postcard = { workspace = true, features = ["alloc"] }
@@ -116,7 +121,6 @@ std = [
     "alloy-eip7928/std",
     "alloy-eips/std",
     "alloy-primitives/std",
-    "bitvec/std",
     "ark-bls12-381/std",
     "ark-bn254/std",
     "ark-ec/std",
@@ -132,6 +136,8 @@ std = [
     "c-kzg?/std",
     "secp256k1?/std",
     "serde?/std",
+    "triomphe?/std",
+    "ruint?/std",
 ]
 
 async = ["std", "dep:corosensei"]
@@ -143,7 +149,6 @@ serde = [
     "alloy-eips/serde",
     "alloy-primitives/serde",
     "ark-serialize/serde",
-    "bitvec/serde",
     "derive-where/serde",
     "k256/serde",
     "p256/serde",
@@ -151,12 +156,17 @@ serde = [
     "blst?/serde",
     "c-kzg?/serde",
     "secp256k1?/serde",
+    "triomphe?/serde",
+    "ruint?/serde",
 ]
 arbitrary = [
     "alloy-consensus/arbitrary",
     "alloy-eips/arbitrary",
     "alloy-primitives/arbitrary",
 ]
+
+# Opt-in chain-specific account data; Ethereum builds keep the original account layout.
+account-ext = ["dep:triomphe"]
 
 map-hashbrown = ["alloy-primitives/map-hashbrown"]
 map-foldhash = ["alloy-primitives/map-foldhash"]
@@ -173,5 +183,10 @@ portable = ["c-kzg?/portable", "blst?/portable"]
 p256-aws-lc-rs = ["dep:aws-lc-rs"]
 parse = ["dep:paste", "dep:phf"]
 
-nightly = []
+nightly = [
+    "alloy-primitives/nightly",
+    "derive-where/nightly",
+    "dep:ruint",
+    "ruint/nightly",
+]
 no-tco = []

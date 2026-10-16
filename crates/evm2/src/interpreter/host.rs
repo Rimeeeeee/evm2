@@ -1,6 +1,7 @@
 use super::{GasTracker, InstrStop, Message, Result, Word};
 use crate::{
-    BaseEvmTypes, EvmFeatures, EvmTypesHost, SpecId,
+    BaseEvmTypes, DatabaseError, EvmFeatures, EvmTypesHost, ExecutionConfig, ExecutionError,
+    HostError, SpecId,
     env::{BlockEnv, TxEnv},
     evm::{AccountLoad, SLoad, SStore, SelfDestructResult},
 };
@@ -32,6 +33,19 @@ pub struct MessageResultExt<E = ()> {
 }
 
 impl<E> MessageResultExt<E> {
+    /// Replaces the extension, preserving all other message result fields.
+    #[inline]
+    pub fn with_ext<F>(self, ext: F) -> MessageResultExt<F> {
+        self.map_ext(|_| ext)
+    }
+
+    /// Transforms the extension, preserving all other message result fields.
+    #[inline]
+    pub fn map_ext<F>(self, f: impl FnOnce(E) -> F) -> MessageResultExt<F> {
+        let Self { stop, gas, output, created_address, ext, _non_exhaustive } = self;
+        MessageResultExt { stop, gas, output, created_address, ext: f(ext), _non_exhaustive }
+    }
+
     /// Returns whether the message committed state changes.
     #[inline]
     pub const fn is_success(&self) -> bool {
@@ -100,6 +114,12 @@ pub trait Host<T: EvmTypesHost> {
     /// Returns the active base specification ID.
     fn spec_id(&self) -> SpecId;
 
+    /// Returns the active execution configuration.
+    ///
+    /// The interpreter keeps a reference to the returned version for the whole run, so the host
+    /// must not replace or mutate it while the interpreter runs.
+    fn execution_config(&self) -> &ExecutionConfig<T>;
+
     /// Returns the block environment.
     fn block_env(&mut self) -> &BlockEnv<T>;
 
@@ -109,17 +129,17 @@ pub trait Host<T: EvmTypesHost> {
         address: &Address,
         load_code: bool,
         skip_cold_load: bool,
-    ) -> Result<AccountLoad, InstrStop>;
+    ) -> Result<AccountLoad, HostError>;
 
     /// Returns whether an account is empty/non-existent for new-account gas checks.
     fn target_is_empty_for_new_account_gas(
         &mut self,
         address: &Address,
         features: EvmFeatures,
-    ) -> Result<bool, InstrStop>;
+    ) -> Result<bool, DatabaseError>;
 
     /// Returns a historical block hash.
-    fn block_hash(&mut self, number: &Word) -> Result<B256, InstrStop>;
+    fn block_hash(&mut self, number: &Word) -> Result<B256, DatabaseError>;
 
     /// Loads a persistent storage slot.
     fn sload(
@@ -127,7 +147,7 @@ pub trait Host<T: EvmTypesHost> {
         address: &Address,
         key: &Word,
         skip_cold_load: bool,
-    ) -> Result<SLoad, InstrStop>;
+    ) -> Result<SLoad, HostError>;
 
     /// Stores a persistent storage slot.
     fn sstore(
@@ -136,7 +156,7 @@ pub trait Host<T: EvmTypesHost> {
         key: &Word,
         value: &Word,
         skip_cold_load: bool,
-    ) -> Result<SStore, InstrStop>;
+    ) -> Result<SStore, HostError>;
 
     /// Loads a transient storage slot.
     fn tload(&mut self, address: &Address, key: &Word) -> Word;
@@ -148,7 +168,11 @@ pub trait Host<T: EvmTypesHost> {
     fn log(&mut self, log: Log);
 
     /// Executes a message inside this host.
-    fn execute_message(&mut self, tx_env: &TxEnv<T>, message: &mut Message<T>) -> MessageResult<T>;
+    fn execute_message(
+        &mut self,
+        tx_env: &TxEnv<T>,
+        message: &mut Message<T>,
+    ) -> Result<MessageResult<T>, ExecutionError>;
 
     /// Registers the current contract for self-destruction.
     fn selfdestruct(
@@ -156,7 +180,7 @@ pub trait Host<T: EvmTypesHost> {
         contract: &Address,
         target: &Address,
         skip_cold_load: bool,
-    ) -> Result<SelfDestructResult, InstrStop>;
+    ) -> Result<SelfDestructResult, HostError>;
 }
 
 #[cfg(test)]

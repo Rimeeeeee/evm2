@@ -26,17 +26,22 @@ jobs:
     runs-on: depot-ubuntu-latest
     timeout-minutes: 20
     permissions:
+      id-token: write
       contents: read
     strategy:
       fail-fast: false
       matrix:
         dispatch_backend: [tco, packed, single_return, unpacked]
     steps:
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
-      - uses: rui314/setup-mold@7e4f20ad28a2e8ca6fd0892ccf72e2abb706b9c3 # v1
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
+        with:
+          toolchain: nightly
+      - uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -64,6 +69,8 @@ jobs:
     if: always()
     needs:
       - smoke
+    permissions:
+      contents: read
     steps:
       - name: Decide whether the needed jobs succeeded or failed
         uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # v1.3.0

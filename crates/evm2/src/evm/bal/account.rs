@@ -189,6 +189,8 @@ pub struct AccountInfoBal {
 
 impl AccountInfoBal {
     /// Populate account info from BAL. Return true if account info got changed
+    ///
+    /// Account extensions are not represented in the BAL and are left unchanged.
     pub fn populate_account_info(
         &self,
         bal_index: BlockAccessIndex,
@@ -212,6 +214,8 @@ impl AccountInfoBal {
     }
 
     /// Extend account info from another account info.
+    ///
+    /// Account extensions are not represented in the BAL and are ignored.
     #[inline]
     pub fn update(
         &mut self,

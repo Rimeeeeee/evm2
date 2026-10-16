@@ -85,9 +85,10 @@ fn run(config: RunConfig<'_>) -> TestInterpreter {
     let mut default_host = TestHost::default();
     let host = host.unwrap_or(&mut default_host);
     host.spec_id = spec_id;
-    let err = inner.run(&execution_config, host);
+    host.execution_config = execution_config;
+    let err = inner.run(host).unwrap();
     let (stack, stack_len, gas, memory, output) = inner.into_parts();
-    TestInterpreter { stack, stack_len, gas, memory, output, err }
+    TestInterpreter { stack, stack_len, gas, memory, output, err, execution_error: None }
 }
 
 #[test]

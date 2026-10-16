@@ -3,11 +3,11 @@ use crate::{
     evm::AccountLoad,
     interpreter::{Gas, Host, InstrStop, Memory, Result, Word, private::GasInstructionCx},
     utils::{
-        address_to_word, b256_to_word, word_to_address, word_to_usize, word_to_usize_saturated,
+        address_to_word, b256_to_word, read_word_padded, word_to_address, word_to_usize,
+        word_to_usize_saturated,
     },
     version::GasParams,
 };
-use alloy_primitives::B256;
 use evm2_macros::instruction;
 
 fn load_account<T: EvmTypesHost>(
@@ -18,7 +18,11 @@ fn load_account<T: EvmTypesHost>(
     let cold_load_gas = cx.state.gas_params().cold_account_additional_cost();
     let skip_cold_load = cx.gas.remaining() < cold_load_gas;
     let account_address = word_to_address(addr);
-    let account = cx.state.host().load_account(&account_address, load_code, skip_cold_load)?;
+    let account = cx
+        .state
+        .host()
+        .load_account(&account_address, load_code, skip_cold_load)
+        .map_err(|error| cx.state.fail(error))?;
     if account.is_cold {
         cx.gas.spend(cold_load_gas)?;
     }
@@ -71,13 +75,7 @@ pub fn callvalue(cx: _) -> out {
 #[instruction]
 pub fn calldataload(cx: _, [offset]: [Word]) -> out {
     let offset = word_to_usize_saturated(*offset);
-    let input = cx.state.message().input.as_ref();
-    let mut word = B256::ZERO;
-    if offset < input.len() {
-        let len = 32.min(input.len() - offset);
-        word[..len].copy_from_slice(&input[offset..offset + len]);
-    }
-    *out = b256_to_word(word);
+    *out = b256_to_word(read_word_padded(&cx.state.message().input, offset));
 }
 
 #[instruction]
@@ -88,23 +86,25 @@ pub fn calldatasize(cx: _) -> out {
 #[instruction(dynamic_gas)]
 pub fn calldatacopy(cx: _, [memory_offset, data_offset, len]: [Word]) -> Result {
     let len = word_to_usize(*len)?;
-    cx.gas.spend(cx.state.gas_params().copy_cost(len))?;
+    // SAFETY: Charging and copying data make no host calls.
+    let gas_params = unsafe { cx.state.gas_params_detached() };
+    cx.gas.spend(gas_params.copy_cost(len))?;
     let input = cx.state.message().input.as_ref();
-    let gas_params = cx.state.gas_params();
     copy_data(cx.gas, &mut cx.state.0.memory, gas_params, memory_offset, data_offset, len, input)
 }
 
 #[instruction]
 pub fn codesize(cx: _) -> out {
-    *out = Word::from(cx.state.bytecode().len());
+    *out = Word::from(cx.state.0.bytecode.len());
 }
 
 #[instruction(dynamic_gas)]
 pub fn codecopy(cx: _, [memory_offset, code_offset, len]: [Word]) -> Result {
     let len = word_to_usize(*len)?;
-    cx.gas.spend(cx.state.gas_params().copy_cost(len))?;
+    // SAFETY: Charging and copying data make no host calls.
+    let gas_params = unsafe { cx.state.gas_params_detached() };
+    cx.gas.spend(gas_params.copy_cost(len))?;
     let data = cx.state.0.bytecode.original_byte_slice();
-    let gas_params = cx.state.gas_params();
     copy_data(cx.gas, &mut cx.state.0.memory, gas_params, memory_offset, code_offset, len, data)
 }
 
@@ -158,10 +158,11 @@ pub fn returndatacopy(cx: _, [memory_offset, data_offset, len]: [Word]) -> Resul
         return Err(InstrStop::OutOfOffset);
     }
 
-    cx.gas.spend(cx.state.gas_params().copy_cost(len))?;
+    // SAFETY: Charging and copying data make no host calls.
+    let gas_params = unsafe { cx.state.gas_params_detached() };
+    cx.gas.spend(gas_params.copy_cost(len))?;
     let data = &cx.state.0.return_data;
     let data_offset = Word::from(data_offset);
-    let gas_params = cx.state.gas_params();
     copy_data(cx.gas, &mut cx.state.0.memory, gas_params, memory_offset, &data_offset, len, data)
 }
 
@@ -437,7 +438,7 @@ mod tests {
         assert_eq!(interp.stack(), [Word::from(3)]);
 
         let interp = run(RunConfig::new([op::RETURNDATASIZE]).spec(SpecId::FRONTIER));
-        assert_matches!(interp.err, InstrStop::InvalidOpcode);
+        assert_matches!(interp.err, InstrStop::NotActivated);
     }
 
     #[test]
@@ -486,7 +487,7 @@ mod tests {
             op::RETURNDATACOPY,
         ))
         .spec(SpecId::FRONTIER));
-        assert_matches!(interp.err, InstrStop::InvalidOpcode);
+        assert_matches!(interp.err, InstrStop::NotActivated);
     }
 
     #[test]
@@ -502,6 +503,6 @@ mod tests {
         let interp = run(RunConfig::new([op::PUSH1, 0xbe, op::EXTCODEHASH, op::STOP])
             .host(&mut host)
             .spec(SpecId::BYZANTIUM));
-        assert_matches!(interp.err, InstrStop::InvalidOpcode);
+        assert_matches!(interp.err, InstrStop::NotActivated);
     }
 }
