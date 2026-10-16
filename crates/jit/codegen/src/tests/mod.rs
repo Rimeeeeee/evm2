@@ -2477,6 +2477,75 @@ tests! {
                 assert_eq!(host.storage.get(&0_U256), Some(&1_U256));
             }),
         }),
+
+        // Block analysis keeps only the top 64 stack entries at joins. Popping past them must
+        // not read as an underflow: `cut`'s JUMPI still reaches `body` with `done` below, so
+        // `body`'s jump must not resolve to `other` alone.
+        truncated_stack_underflow(@raw {
+            bytecode: &asm(&[
+                "
+                PUSH0
+                MLOAD
+                PUSH %alt
+                JUMPI
+                PUSH %done
+                PUSH1 0x01
+                PUSH %body
+                ",
+                &"PUSH0\n".repeat(63),
+                "
+            cut:
+                JUMPDEST
+                ",
+                &"POP\n".repeat(63),
+                "
+                JUMPI
+                STOP
+            alt:
+                JUMPDEST
+                PUSH %other
+                PUSH %body
+                JUMP
+            body:
+                JUMPDEST
+                JUMP
+            other:
+                JUMPDEST
+                PUSH1 0x42
+                STOP
+            done:
+                JUMPDEST
+                STOP
+                ",
+            ].concat()),
+            expected_memory: &[0; 32],
+            expected_gas: GAS_WHAT_INTERPRETER_SAYS,
+        }),
+
+        // `tramp` is never reached: `exit` does not return.
+        unreached_return_trampoline(@raw {
+            bytecode: &asm("
+                PUSH %tramp
+                PUSH %ret
+                PUSH %func
+                JUMP
+            ret:
+                JUMPDEST
+                PUSH %exit
+                JUMP
+            tramp:
+                JUMPDEST
+                JUMP
+            func:
+                JUMPDEST
+                JUMP
+            exit:
+                JUMPDEST
+                STOP
+            "),
+            expected_stack: &[11_U256],
+            expected_gas: GAS_WHAT_INTERPRETER_SAYS,
+        }),
     }
 }
 
