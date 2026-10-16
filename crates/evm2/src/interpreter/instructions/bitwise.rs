@@ -62,20 +62,20 @@ pub fn byte([index, value]: [Word]) -> out {
 #[instruction]
 pub fn shl([shift, value]: [Word]) -> out {
     let shift = word_to_usize_saturated(*shift);
-    *out = if shift < 256 { *value << shift } else { Word::ZERO };
+    *out = if shift < 256 { shl_word(value, shift) } else { Word::ZERO };
 }
 
 #[instruction]
 pub fn shr([shift, value]: [Word]) -> out {
     let shift = word_to_usize_saturated(*shift);
-    *out = if shift < 256 { *value >> shift } else { Word::ZERO };
+    *out = if shift < 256 { shr_word(value, shift) } else { Word::ZERO };
 }
 
 #[instruction]
 pub fn sar([shift, value]: [Word]) -> out {
     let shift = word_to_usize_saturated(*shift);
     *out = if shift < 256 {
-        value.arithmetic_shr(shift)
+        sar_word(value, shift)
     } else if value.bit(255) {
         Word::MAX
     } else {
@@ -86,6 +86,66 @@ pub fn sar([shift, value]: [Word]) -> out {
 #[instruction]
 pub fn clz([value]: [Word]) -> out {
     *out = Word::from(value.leading_zeros());
+}
+
+// ruint's shifts index a limb array by a runtime offset, which keeps the result in a stack buffer
+// that is then read back with one wide load. These shift each limb with its carry and select whole
+// limbs in registers instead.
+
+/// Shifts `value` left by `shift < 256` bits.
+#[inline]
+fn shl_word(value: &Word, shift: usize) -> Word {
+    let x = value.as_limbs();
+    let bits = shift % 64;
+    // `lo >> (64 - bits)`, or zero when `bits` is zero.
+    let carry = |lo: u64| (lo >> 1) >> (63 - bits);
+    let t = [
+        x[0] << bits,
+        (x[1] << bits) | carry(x[0]),
+        (x[2] << bits) | carry(x[1]),
+        (x[3] << bits) | carry(x[2]),
+    ];
+    Word::from_limbs(match shift / 64 {
+        0 => t,
+        1 => [0, t[0], t[1], t[2]],
+        2 => [0, 0, t[0], t[1]],
+        _ => [0, 0, 0, t[0]],
+    })
+}
+
+/// Shifts `x` right by `shift < 256` bits, given its shifted top limb and the vacated limb value.
+#[inline]
+fn shr_word_with(x: &[u64; 4], top: u64, fill: u64, shift: usize) -> Word {
+    let bits = shift % 64;
+    // `hi << (64 - bits)`, or zero when `bits` is zero.
+    let carry = |hi: u64| (hi << 1) << (63 - bits);
+    let t = [
+        (x[0] >> bits) | carry(x[1]),
+        (x[1] >> bits) | carry(x[2]),
+        (x[2] >> bits) | carry(x[3]),
+        top,
+    ];
+    Word::from_limbs(match shift / 64 {
+        0 => t,
+        1 => [t[1], t[2], t[3], fill],
+        2 => [t[2], t[3], fill, fill],
+        _ => [t[3], fill, fill, fill],
+    })
+}
+
+/// Shifts `value` right by `shift < 256` bits.
+#[inline]
+fn shr_word(value: &Word, shift: usize) -> Word {
+    let x = value.as_limbs();
+    shr_word_with(x, x[3] >> (shift % 64), 0, shift)
+}
+
+/// Shifts `value` right by `shift < 256` bits, extending the sign bit.
+#[inline]
+fn sar_word(value: &Word, shift: usize) -> Word {
+    let x = value.as_limbs();
+    let top = ((x[3] as i64) >> (shift % 64)) as u64;
+    shr_word_with(x, top, ((x[3] as i64) >> 63) as u64, shift)
 }
 
 #[cfg(test)]
@@ -177,6 +237,7 @@ mod tests {
         assert_stack!(SHL(8, 1), 256);
         assert_stack!(SHL(0, 7), 7);
         assert_stack!(SHL(256, 1), 0);
+        assert_stack!(SHL(65, 0x8000_0000_0000_0001u64), Word::from_limbs([0, 2, 1, 0]));
     }
 
     #[test]
@@ -184,6 +245,7 @@ mod tests {
         assert_stack!(SHR(8, 256), 1);
         assert_stack!(SHR(0, 7), 7);
         assert_stack!(SHR(256, neg(1)), 0);
+        assert_stack!(SHR(65, Word::from_limbs([0, 2, 1, 0])), 0x8000_0000_0000_0001u64);
     }
 
     #[test]
@@ -191,6 +253,10 @@ mod tests {
         assert_stack!(SAR(1, neg(1) - Word::from(1)), neg(1));
         assert_stack!(SAR(1, 4), 2);
         assert_stack!(SAR(256, neg(1)), neg(1));
+        assert_stack!(
+            SAR(129, Word::from_limbs([0, 0, 0, 1 << 63])),
+            Word::from_limbs([0, 0xc000_0000_0000_0000, u64::MAX, u64::MAX])
+        );
     }
 
     #[test]
