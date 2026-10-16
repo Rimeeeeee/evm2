@@ -1624,6 +1624,8 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
         let end = self.bcx.iadd_imm(offset, 32);
         let in_bounds = self.bcx.icmp(IntCC::UnsignedLessThanOrEqual, end, calldatasize);
 
+        // Both paths write the word to its stack slot, as the builtin alone used to.
+        let sp = self.sp_from_top(1);
         let current_block = self.current_block();
         let fast_block = self.create_block_after(current_block, "fast");
         let slow_block = self.create_block_after(fast_block, "slow");
@@ -1638,21 +1640,19 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
         );
         let ptr_type = self.bcx.type_ptr();
         let calldata = self.bcx.load(ptr_type, calldata_addr, "ecx.calldata");
-        let fast_addr = self.bcx.gep(self.i8_type, calldata, &[offset], "calldataload.addr");
+        let addr = self.bcx.gep(self.i8_type, calldata, &[offset], "calldataload.addr");
+        let value = self.bcx.load_aligned(self.word_type, addr, 1, "calldataload.value");
+        let value = if self.little_endian() { self.bcx.bswap(value) } else { value };
+        self.bcx.store(value, sp);
         self.bcx.br(done_block);
 
-        // The builtin writes the zero-padded calldata bytes to the output slot, so both paths
-        // share the load below.
         self.bcx.switch_to_block(slow_block);
-        let sp = self.sp_from_top(1);
         let _ = self.call_builtin(Builtin::CallDataLoadC, &[ecx, sp, offset]);
         self.bcx.br(done_block);
 
         self.bcx.switch_to_block(done_block);
-        let addr = self.bcx.phi(ptr_type, &[(fast_addr, fast_block), (sp, slow_block)]);
-        let value = self.bcx.load_aligned(self.word_type, addr, 1, "calldataload.value");
-        let value = if self.little_endian() { self.bcx.bswap(value) } else { value };
-        self.push(value);
+        self.vstack.push_mem();
+        self.len_offset += 1;
     }
 
     fn can_skip_ensure_memory(&self, inst: Inst) -> bool {
