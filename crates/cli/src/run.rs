@@ -2,7 +2,7 @@ use alloy_consensus::{TxLegacy, transaction::Recovered};
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256, hex, keccak256};
 use clap::ValueEnum;
 use evm2::{
-    BaseEvmTypes, Evm, ExecutionConfig, InterpreterRunner, Precompiles, SpecId, Version,
+    BaseEvmTypes, Evm, InterpreterRunner, Precompiles, SpecId, Version,
     bytecode::Bytecode,
     env::{BlockEnv, BlockEnvExt},
     ethereum::{RecoveredTxEnvelope, TxEnvelope, ethereum_tx_registry},
@@ -263,6 +263,8 @@ impl RunArgs {
             _compiler = None;
             _lib = Some(lib);
         } else if let Some((mut compiler, functions)) = pending_jit {
+            // Keep the entry contract's dump; other fixture contracts would overwrite it.
+            compiler.set_dump_to(None);
             prepared = PreparedBench::load_with_functions(&bench_entry, &mut compiler, functions)?;
             _compiler = Some(compiler);
             _lib = None;
@@ -640,13 +642,11 @@ struct FixedJitRunner {
 impl InterpreterRunner<BaseEvmTypes> for FixedJitRunner {
     fn run<'frame, 'host>(
         &self,
-        config: &ExecutionConfig<BaseEvmTypes>,
         interpreter: &mut Interpreter<'frame, 'host, BaseEvmTypes>,
         host: &mut Evm<'host, BaseEvmTypes>,
     ) -> Option<InstrStop> {
-        let code = interpreter.original_bytecode();
-        let func = *self.functions.get(&keccak256(&code))?;
-        interpreter.prepare_run(config.base_spec_id(), config.version(), host);
+        let func = *self.functions.get(&interpreter.original_bytecode_hash())?;
+        interpreter.prepare_run(host);
         Some(unsafe { func.call_with_interpreter(interpreter) })
     }
 }

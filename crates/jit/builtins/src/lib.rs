@@ -18,7 +18,7 @@ use evm2::{
     bytecode::Bytecode,
     constants::{BLOCK_HASH_HISTORY, CALL_DEPTH_LIMIT},
     interpreter::{Host, MessageExt, MessageKind, Word, derive_create_destination, i256},
-    utils::{word_to_usize, word_to_usize_saturated},
+    utils::{read_word_padded, word_to_usize, word_to_usize_saturated},
     version::{EvmFeatures, GasId},
 };
 use evm2_jit_context::{EvmContext, EvmWord, InstrStop};
@@ -171,15 +171,6 @@ pub unsafe extern "C" fn __revmc_builtin_exp(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __revmc_builtin_exp_gas(
-    ecx: &mut EvmContext,
-    exponent: &EvmWord,
-) -> BuiltinResult {
-    ecx.gas.spend(ecx.gas_params().exp_cost(exponent.to_u256()))?;
-    Ok(())
-}
-
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __revmc_builtin_keccak256(
     ecx: &mut EvmContext,
     sp: &mut [EvmWord; 2],
@@ -227,11 +218,6 @@ pub unsafe extern "C" fn __revmc_builtin_balance(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __revmc_builtin_origin(ecx: &EvmContext, slot: &mut EvmWord) {
-    *slot = EvmWord::from_be_bytes(ecx.tx_env().origin.into_word());
-}
-
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __revmc_builtin_calldataload(
     ecx: &mut EvmContext,
     offset_ptr: &mut EvmWord,
@@ -249,21 +235,9 @@ pub unsafe extern "C" fn __revmc_builtin_calldataload_c(
 }
 
 fn do_calldataload(ecx: &mut EvmContext, out: &mut EvmWord, offset: usize) {
-    let mut word = B256::ZERO;
     let message = ecx.message();
     let input = message.input.as_slice(ecx.host().call_memory());
-    let input_len = input.len();
-    if offset < input_len {
-        let count = 32.min(input_len - offset);
-        // SAFETY: `count` is bounded by the calldata length.
-        // This is `word[..count].copy_from_slice(input[offset..offset + count])`, written using
-        // raw pointers as apparently the compiler cannot optimize the slice version, and using
-        // `get_unchecked` twice is uglier.
-        unsafe {
-            core::ptr::copy_nonoverlapping(input.as_ptr().add(offset), word.as_mut_ptr(), count)
-        };
-    }
-    *out = EvmWord::from_be_bytes(word);
+    *out = EvmWord::from_be_bytes(read_word_padded(input, offset));
 }
 
 #[unsafe(no_mangle)]
@@ -290,11 +264,6 @@ pub unsafe extern "C" fn __revmc_builtin_codecopy(
 ) -> BuiltinResult {
     let bytecode = ecx.bytecode();
     unsafe { copy_operation(ecx, sp, bytecode.as_ref()) }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn __revmc_builtin_gas_price(ecx: &EvmContext, slot: &mut EvmWord) {
-    *slot = ecx.tx_env().gas_price.into();
 }
 
 #[unsafe(no_mangle)]
@@ -391,7 +360,6 @@ pub unsafe extern "C" fn __revmc_builtin_blockhash(
     }
 
     if diff <= BLOCK_HASH_HISTORY {
-        let requested_number = U256::from(word_to_u64_saturated(requested_number));
         let hash = ecx.host().block_hash(&requested_number).map_err(|error| ecx.interpreter_mut().fail(error))?;
         *number_ptr = EvmWord::from_be_bytes(hash);
     } else {
@@ -403,52 +371,18 @@ pub unsafe extern "C" fn __revmc_builtin_blockhash(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __revmc_builtin_coinbase(ecx: &mut EvmContext, slot: &mut EvmWord) {
-    *slot = EvmWord::from_be_bytes(ecx.block_env().beneficiary.into_word());
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn __revmc_builtin_timestamp(ecx: &mut EvmContext, slot: &mut EvmWord) {
-    *slot = ecx.block_env().timestamp.into();
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn __revmc_builtin_number(ecx: &mut EvmContext, slot: &mut EvmWord) {
-    *slot = ecx.block_env().number.into();
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn __revmc_builtin_difficulty(ecx: &mut EvmContext, slot: &mut EvmWord) {
-    *slot = if ecx.enables(EvmFeatures::EIP4399) {
-        ecx.block_env().prevrandao.into()
-    } else {
-        ecx.block_env().difficulty.into()
-    };
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn __revmc_builtin_gaslimit(ecx: &mut EvmContext, slot: &mut EvmWord) {
-    *slot = ecx.block_env().gas_limit.into();
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn __revmc_builtin_chainid(ecx: &EvmContext, slot: &mut EvmWord) {
-    *slot = ecx.tx_env().chain_id.into();
-}
-
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __revmc_builtin_self_balance(
     ecx: &mut EvmContext,
     slot: &mut EvmWord,
 ) -> BuiltinResult {
-    let balance = load_account(ecx, &ecx.message().destination, false)?.balance;
+    let destination = ecx.message().destination;
+    let balance = ecx
+        .host()
+        .load_account(&destination, false, false)
+        .map_err(|stop| ecx.interpreter_mut().fail(stop))?
+        .balance;
     *slot = balance.into();
     Ok(())
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn __revmc_builtin_basefee(ecx: &mut EvmContext, slot: &mut EvmWord) {
-    *slot = ecx.block_env().basefee.into();
 }
 
 #[unsafe(no_mangle)]
@@ -459,21 +393,8 @@ pub unsafe extern "C" fn __revmc_builtin_blob_hash(ecx: &EvmContext, index_ptr: 
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __revmc_builtin_blob_base_fee(
-    ecx: &mut EvmContext,
-    slot: &mut EvmWord,
-) {
-    *slot = ecx.block_env().blob_basefee.into();
-}
-
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __revmc_builtin_mresize(ecx: &mut EvmContext, min_size: u64) -> BuiltinResult {
     ensure_memory(ecx, min_size as usize, 0)
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn __revmc_builtin_slot_num(ecx: &mut EvmContext, slot: &mut EvmWord) {
-    *slot = ecx.block_env().slot_num.into();
 }
 
 #[unsafe(no_mangle)]
@@ -924,12 +845,14 @@ fn load_acc_and_calc_gas(
         code_address = delegated_address;
     }
     let features = ecx.version().features;
+    // Check emptiness only when new-account gas can apply: after EIP-161 a zero-value call never
+    // pays it, so it skips the extra account lookup.
     if create_empty_account
-        && should_charge_new_account_gas(
-            features.contains(EvmFeatures::EIP161),
-            transfers_value,
-            ecx.host().target_is_empty_for_new_account_gas(&to, features).map_err(|error| ecx.interpreter_mut().fail(error))?,
-        )
+        && (!features.contains(EvmFeatures::EIP161) || transfers_value)
+        && ecx
+            .host()
+            .target_is_empty_for_new_account_gas(&to, features)
+            .map_err(|error| ecx.interpreter_mut().fail(error))?
     {
         cost += u64::from(version.gas_params.get(GasId::NewAccountCost));
         if features.contains(EvmFeatures::EIP8037) && transfers_value {
@@ -1043,10 +966,9 @@ pub unsafe extern "C" fn __revmc_builtin_selfdestruct(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::boxed::Box;
     use alloy_primitives::Address;
     use evm2::{
-        BaseEvmConfigSelector, BaseEvmTypes, Evm, EvmConfigSelector, Precompiles, SpecId,
+        BaseEvmTypes, Evm, Precompiles, SpecId,
         env::{BlockEnvExt, TxEnvExt},
         ethereum::ethereum_tx_registry,
         evm::{AccountInfo, EmptyDB, InMemoryDB, inspector::Inspector},
@@ -1141,18 +1063,7 @@ mod tests {
         interpreter: &'ctx mut evm2::interpreter::Interpreter<'frame, 'host, BaseEvmTypes>,
         host: &'ctx mut Evm<'host, BaseEvmTypes>,
     ) -> PreparedJitFrame<'ctx, 'frame, 'host> {
-        prepare_frame_for_spec(interpreter, host, SpecId::CANCUN)
-    }
-
-    fn prepare_frame_for_spec<'ctx, 'frame, 'host>(
-        interpreter: &'ctx mut evm2::interpreter::Interpreter<'frame, 'host, BaseEvmTypes>,
-        host: &'ctx mut Evm<'host, BaseEvmTypes>,
-        spec_id: SpecId,
-    ) -> PreparedJitFrame<'ctx, 'frame, 'host> {
-        let config =
-            <BaseEvmConfigSelector as EvmConfigSelector<BaseEvmTypes>>::execution_config(spec_id);
-        let config = Box::leak(Box::new(config));
-        interpreter.prepare_run(config.base_spec_id(), config.version(), host);
+        interpreter.prepare_run(host);
         let (ecx, stack, _stack_len) =
             unsafe { EvmContext::from_interpreter_with_stack(interpreter) };
         PreparedJitFrame { ecx, stack }
@@ -1462,8 +1373,7 @@ mod tests {
                     evm2::interpreter::Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
 
                 {
-                    let mut frame =
-                        prepare_frame_for_spec(&mut interpreter, &mut host, SpecId::AMSTERDAM);
+                    let mut frame = prepare_frame(&mut interpreter, &mut host);
                     frame.ecx.set_return_data(Bytes::from_static(b"stale"));
                     match create_kind {
                         CreateKind::Create => {

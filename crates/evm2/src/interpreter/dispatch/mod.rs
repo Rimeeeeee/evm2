@@ -7,11 +7,12 @@ use crate::{
     trustme,
 };
 
-cfg_if::cfg_if! {
-    if #[cfg(tco)] {
+core::cfg_select! {
+    tco => {
         mod tco;
         use tco as imp;
-    } else {
+    }
+    _ => {
         mod table;
         use table as imp;
     }
@@ -23,6 +24,8 @@ pub(in crate::interpreter) use imp::run;
 fn run_state<'a, 'frame, 'host, T: EvmTypesHost>(
     interpreter: &'a mut Interpreter<'frame, 'host, T>,
 ) -> (&'a mut InterpreterState<'frame, 'host, T>, Pc, RawStack<'a>) {
+    let pc = Pc::new(interpreter.pc);
+    let stack = RawStack::new(&raw mut *interpreter.stack, interpreter.stack_len);
     // SAFETY: Only the active interpreter lifetime is erased; this stays as a raw pointer so
     // the dispatch loop does not create an extra `&mut` alias for `interpreter`.
     let raw =
@@ -30,8 +33,6 @@ fn run_state<'a, 'frame, 'host, T: EvmTypesHost>(
     // SAFETY: Instruction methods must not access the stack through `InterpreterState` while
     // the separate stack view is live.
     let state = InterpreterState::wrap_mut(unsafe { &mut *raw });
-    let pc = Pc::new(interpreter.pc);
-    let stack = RawStack::new(&raw mut *interpreter.stack, interpreter.stack_len);
     (state, pc, stack)
 }
 

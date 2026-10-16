@@ -1,6 +1,6 @@
 //! Transaction execution lifecycle and result types.
 
-use super::{BlockStateAccumulator, Evm, PendingState, StateChangeSink};
+use super::{AccountChanges, BlockStateAccumulator, Evm, PendingState, StateChangeSink};
 use crate::{EvmTypesHost, interpreter::InstrStop};
 use alloc::vec::Vec;
 use alloy_primitives::{Address, Bytes, Log};
@@ -114,6 +114,22 @@ impl<E> TxResultExt<E> {
     pub const fn state_gas_spent(&self) -> u64 {
         self.state_gas_spent
     }
+
+    /// Returns the effective gas refund after the EIP-7623 floor adjustment.
+    ///
+    /// [`Self::refunded`] is capped per EIP-3529 but still pre-floor. When the floor binds —
+    /// `total_gas_spent - refunded < floor_gas` — the floor charge absorbs the refund entirely
+    /// and this returns zero; otherwise it returns [`Self::refunded`]. Consumers computing net
+    /// cost as `total_gas_spent - refund` should use this rather than the raw field; the receipt
+    /// value is [`Self::tx_gas_used`].
+    #[inline]
+    pub const fn final_refunded(&self) -> u64 {
+        if self.total_gas_spent.saturating_sub(self.refunded) < self.floor_gas {
+            0
+        } else {
+            self.refunded
+        }
+    }
 }
 
 /// Whether the transaction scratch is still pending resolution. Not the owned
@@ -216,6 +232,18 @@ impl<'evm, 'host, T: EvmTypesHost> ExecutedTx<'evm, 'host, T> {
             Some(result) => result,
             None => unreachable!("executed transaction result was already taken"),
         }
+    }
+
+    /// Returns each account loaded by the transaction with its changes, in an unspecified order.
+    ///
+    /// This borrows the transaction state without detaching it, so a caller can apply the changes
+    /// and then [`commit`](Self::commit) or [`discard`](Self::discard) the transaction.
+    #[inline]
+    pub fn account_changes(&self) -> impl Iterator<Item = AccountChanges<'_>> {
+        self.has_pending_state()
+            .then(|| self.evm.state.transaction_account_changes())
+            .into_iter()
+            .flatten()
     }
 
     /// Accepts the transaction state into the internal accepted overlay.

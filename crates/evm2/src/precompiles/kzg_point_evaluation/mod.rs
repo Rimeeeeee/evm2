@@ -49,10 +49,10 @@ pub fn run(input: &[u8], gas: &mut GasTracker) -> PrecompileResult {
     }
 
     // Verify KZG proof with z and y in big endian format
-    let commitment: &[u8; 48] = commitment.try_into().unwrap();
-    let z = input[32..64].try_into().unwrap();
-    let y = input[64..96].try_into().unwrap();
-    let proof = input[144..192].try_into().unwrap();
+    let commitment = commitment.as_array().unwrap();
+    let z = input[32..].first_chunk().unwrap();
+    let y = input[64..].first_chunk().unwrap();
+    let proof = input.last_chunk().unwrap();
     crate::precompiles::crypto().verify_kzg_proof(z, y, commitment, proof)?;
 
     // Return FIELD_ELEMENTS_PER_BLOB and BLS_MODULUS as padded 32 byte big endian values
@@ -85,20 +85,25 @@ pub(crate) fn verify_kzg_proof(
     y: &[u8; 32],
     proof: &[u8; 48],
 ) -> bool {
-    cfg_if::cfg_if! {
-        if #[cfg(feature = "c-kzg")] {
-            use c_kzg::{Bytes48, Bytes32};
+    core::cfg_select! {
+        feature = "c-kzg" => {
+            use c_kzg::{Bytes32, Bytes48};
 
             let as_bytes48 = |bytes: &[u8; 48]| -> &Bytes48 { unsafe { &*bytes.as_ptr().cast() } };
             let as_bytes32 = |bytes: &[u8; 32]| -> &Bytes32 { unsafe { &*bytes.as_ptr().cast() } };
 
             let kzg_settings = c_kzg::ethereum_kzg_settings(8);
-            kzg_settings.verify_kzg_proof(as_bytes48(commitment), as_bytes32(z), as_bytes32(y), as_bytes48(proof)).unwrap_or(false)
-        } else if #[cfg(feature = "blst")] {
-            blst::verify_kzg_proof(commitment, z, y, proof)
-        } else {
-            arkworks::verify_kzg_proof(commitment, z, y, proof)
+            kzg_settings
+                .verify_kzg_proof(
+                    as_bytes48(commitment),
+                    as_bytes32(z),
+                    as_bytes32(y),
+                    as_bytes48(proof),
+                )
+                .unwrap_or(false)
         }
+        feature = "blst" => blst::verify_kzg_proof(commitment, z, y, proof),
+        _ => arkworks::verify_kzg_proof(commitment, z, y, proof),
     }
 }
 #[cfg(test)]

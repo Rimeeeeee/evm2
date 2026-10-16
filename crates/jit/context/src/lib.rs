@@ -35,11 +35,15 @@ pub use arch::evm2_jit_exit;
 /// generates code that accesses fields by offset using `offset_of!`.
 #[repr(C)]
 pub struct EvmContext<'ctx, 'frame, 'host> {
+    /// The gas.
+    ///
+    /// First, so compiled code addresses the remaining gas through the context pointer
+    /// itself instead of keeping a separate pointer live.
+    pub gas: Gas,
+
     /// Active interpreter frame.
     pub interpreter: NonNull<Interpreter<'frame, 'host, BaseEvmTypes>>,
 
-    /// The gas.
-    pub gas: Gas,
     /// The size of return data from the last call-like operation.
     pub return_data_len: usize,
     /// The size of the call input data, cached for CALLDATASIZE.
@@ -56,6 +60,11 @@ pub struct EvmContext<'ctx, 'frame, 'host> {
     /// Cached length of the current memory context in bytes.
     /// Refreshed after any memory resize.
     pub mem_len: usize,
+
+    /// The host's block environment, cached for block opcodes.
+    pub block_env: NonNull<BlockEnv<BaseEvmTypes>>,
+    /// The transaction environment, cached for transaction opcodes.
+    pub tx_env: &'frame TxEnv<BaseEvmTypes>,
 
     _marker: PhantomData<&'ctx mut Interpreter<'frame, 'host, BaseEvmTypes>>,
 }
@@ -87,6 +96,8 @@ impl<'ctx, 'frame, 'host> EvmContext<'ctx, 'frame, 'host> {
     ) -> (Self, &'ctx mut EvmStack, &'ctx mut usize) {
         let interpreter_ptr = ptr::from_mut(&mut *interpreter);
         let interpreter_ptr = unsafe { NonNull::new_unchecked(interpreter_ptr) };
+        let block_env = NonNull::from(interpreter.host().block_env());
+        let tx_env = interpreter.tx_env();
         let gas = interpreter.gas();
         let calldatasize = interpreter.message().input.len();
         let return_data_len = interpreter.return_data().len();
@@ -101,6 +112,8 @@ impl<'ctx, 'frame, 'host> EvmContext<'ctx, 'frame, 'host> {
             exit_sp: ptr::null_mut(),
             mem_base: ptr::null_mut(),
             mem_len: 0,
+            block_env,
+            tx_env,
             _marker: PhantomData,
         };
         this.refresh_memory_cache();
@@ -157,25 +170,25 @@ impl<'ctx, 'frame, 'host> EvmContext<'ctx, 'frame, 'host> {
 
     /// Returns the current block environment.
     #[inline]
-    pub fn block_env(&mut self) -> &BlockEnv<BaseEvmTypes> {
-        self.host().block_env()
+    pub const fn block_env(&self) -> &BlockEnv<BaseEvmTypes> {
+        unsafe { self.block_env.as_ref() }
     }
 
     /// Returns the transaction-global environment.
     #[inline]
     pub const fn tx_env(&self) -> &'frame TxEnv<BaseEvmTypes> {
-        self.interpreter().tx_env()
+        self.tx_env
     }
 
     /// Returns active runtime version data.
     #[inline]
-    pub const fn version(&self) -> &evm2::Version {
+    pub fn version(&self) -> &evm2::Version {
         self.interpreter().version()
     }
 
     /// Returns active runtime gas parameters.
     #[inline]
-    pub const fn gas_params(&self) -> &GasParams {
+    pub fn gas_params(&self) -> &GasParams {
         &self.version().gas_params
     }
 
@@ -187,7 +200,7 @@ impl<'ctx, 'frame, 'host> EvmContext<'ctx, 'frame, 'host> {
 
     /// Returns whether the active runtime version enables `feature`.
     #[inline]
-    pub const fn enables(&self, feature: EvmFeatures) -> bool {
+    pub fn enables(&self, feature: EvmFeatures) -> bool {
         self.version().feature(feature)
     }
 
@@ -805,7 +818,7 @@ impl EvmWord {
 mod tests {
     use super::*;
     use evm2::{
-        DatabaseError, Evm, ExecutionConfig, ExecutionError, InterpreterRunner,
+        DatabaseError, Evm, ExecutionError, InterpreterRunner,
         bytecode::Bytecode,
         env::{BlockEnvExt, TxEnvExt},
         evm::{EmptyDB, precompile::NoPrecompiles},
@@ -819,11 +832,10 @@ mod tests {
     impl InterpreterRunner<BaseEvmTypes> for TestRunner {
         fn run<'frame, 'host>(
             &self,
-            config: &ExecutionConfig<BaseEvmTypes>,
             interpreter: &mut Interpreter<'frame, 'host, BaseEvmTypes>,
             host: &mut Evm<'host, BaseEvmTypes>,
         ) -> Option<InstrStop> {
-            interpreter.prepare_run(config.base_spec_id(), config.version(), host);
+            interpreter.prepare_run(host);
             // SAFETY: The test functions only access this initialized interpreter's context.
             Some(unsafe { self.0.call_with_interpreter(interpreter) })
         }

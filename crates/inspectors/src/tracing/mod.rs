@@ -72,7 +72,7 @@ pub use debug::{DebugInspector, DebugInspectorError};
 /// Returns the effective gas refund after the calldata floor adjustment.
 #[inline]
 pub(crate) const fn final_refunded<E>(gas: &TxResultExt<E>) -> u64 {
-    if gas.total_gas_spent.saturating_sub(gas.refunded) < gas.floor_gas { 0 } else { gas.refunded }
+    gas.final_refunded()
 }
 
 /// An inspector that collects call traces.
@@ -506,7 +506,7 @@ impl TracingInspector {
             let size = usize::from(immediate_size(op.get()));
             if size != 0 {
                 let pc = interp.pc() + 1;
-                let bytes = interp.bytecode().as_slice().get(pc..pc + size).unwrap_or_default();
+                let bytes = interp.original_bytecode_slice().get(pc..pc + size).unwrap_or_default();
                 if self.budget.reserve(bytes.len()) {
                     immediate_bytes = Some(Bytes::copy_from_slice(bytes));
                 }
@@ -639,7 +639,9 @@ impl TracingInspector {
         // The gas cost is the difference between the recorded gas remaining at the start of the
         // step the remaining gas here, at the end of the step.
         // TODO: Figure out why this can overflow. https://github.com/paradigmxyz/revm-inspectors/pull/38
-        step.gas_cost = step.gas_remaining.saturating_sub(interp.gas().remaining());
+        step.gas_cost = interp
+            .failed_charge()
+            .unwrap_or_else(|| step.gas_remaining.saturating_sub(interp.gas().remaining()));
         let state_gas_delta = interp.gas().state_gas_spent().saturating_sub(step.state_gas_spent);
         if step.state_gas_reservoir.is_some() && state_gas_delta != 0 {
             step.state_gas_cost = Some(state_gas_delta);
