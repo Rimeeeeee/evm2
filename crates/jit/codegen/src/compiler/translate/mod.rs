@@ -954,6 +954,10 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
                 self.section_len_offset += diff;
 
                 if is_multi {
+                    // The analysis proved the target is one of `targets`, all of which fit in
+                    // 64 bits, so switch on the low bits instead of the whole word.
+                    let i64_type = self.bcx.type_int(64);
+                    let target_value = self.bcx.ireduce(i64_type, target_value.unwrap());
                     let targets = self.bytecode.multi_jump_targets(inst).unwrap();
                     let switch_targets: Vec<_> = targets
                         .iter()
@@ -963,7 +967,7 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
                         })
                         .collect();
                     let invalid_jump = self.add_invalid_jump();
-                    self.bcx.switch(target_value.unwrap(), invalid_jump, &switch_targets, true);
+                    self.bcx.switch(target_value, invalid_jump, &switch_targets, true);
                     goto_return!(no_branch);
                 }
 
