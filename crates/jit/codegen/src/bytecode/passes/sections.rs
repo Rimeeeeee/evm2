@@ -247,6 +247,10 @@ impl SectionsAnalysis {
         {
             self.gas.process_extra(bytecode.gas_params.exp_cost(exponent));
         }
+        // Likewise for the copy gas of a `CODECOPY` that codegen copies inline.
+        if let Some((_, len)) = bytecode.inline_codecopy(inst) {
+            self.gas.process_extra(bytecode.gas_params.copy_cost(len));
+        }
 
         // Branching instructions and host effects that depend on the remaining gas end both
         // sections.

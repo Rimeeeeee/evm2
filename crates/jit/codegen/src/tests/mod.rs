@@ -1058,6 +1058,67 @@ tests! {
             expected_memory: &hex!("60055f5f39000000000000000000000000000000000000000000000000000000"),
             expected_gas: 3 + 2 + 2 + (verylowcopy_cost(32).unwrap() + memory_gas_cost(1)),
         }),
+        codecopy_len0(op::CODECOPY, 0_U256, 0_U256, 0_U256 => ; op_gas(3)),
+        codecopy_len0_huge_offsets(op::CODECOPY, U256::MAX, U256::MAX, 0_U256 => ; op_gas(3)),
+        codecopy_straddle(@raw {
+            bytecode: &hex!("6008 6003 5f 39"),
+            expected_memory: &hex!("035f390000000000000000000000000000000000000000000000000000000000"),
+            expected_gas: 3 + 3 + 2 + (verylowcopy_cost(8).unwrap() + memory_gas_cost(1)),
+        }),
+        codecopy_past_end(@raw {
+            bytecode: &hex!("6004 6006 5f 39"),
+            expected_memory: &[0; 32],
+            expected_gas: 3 + 3 + 2 + (verylowcopy_cost(4).unwrap() + memory_gas_cost(1)),
+        }),
+        codecopy_past_u64(@raw {
+            bytecode: &hex!("6004 68010000000000000000 5f 39"),
+            expected_memory: &[0; 32],
+            expected_gas: 3 + 3 + 2 + (verylowcopy_cost(4).unwrap() + memory_gas_cost(1)),
+        }),
+        codecopy_max_inline_len(@raw {
+            bytecode: &hex!("6020 6001 5f 39"),
+            expected_memory: &hex!("2060015f39000000000000000000000000000000000000000000000000000000"),
+            expected_gas: 3 + 3 + 2 + (verylowcopy_cost(32).unwrap() + memory_gas_cost(1)),
+        }),
+        codecopy_builtin_len(@raw {
+            bytecode: &hex!("6021 6001 5f 39"),
+            expected_memory: &{
+                let mut mem = [0; 64];
+                mem[..5].copy_from_slice(&hex!("2160015f39"));
+                mem
+            },
+            expected_gas: 3 + 3 + 2 + (verylowcopy_cost(33).unwrap() + memory_gas_cost(2)),
+        }),
+        codecopy_dyn_dst(@raw {
+            // CALLDATASIZE is 64.
+            bytecode: &hex!("6005 5f 36 39"),
+            expected_memory: &{
+                let mut mem = [0; 96];
+                mem[64..69].copy_from_slice(&hex!("60055f3639"));
+                mem
+            },
+            expected_gas: 3 + 2 + 2 + (verylowcopy_cost(5).unwrap() + memory_gas_cost(3)),
+        }),
+        codecopy_dyn_dst_no_resize(@raw {
+            bytecode: &hex!("5f 6040 52 6004 6002 36 39"),
+            expected_memory: &{
+                let mut mem = [0; 96];
+                mem[64..68].copy_from_slice(&hex!("40526004"));
+                mem
+            },
+            expected_gas: 2 + 3 + (3 + memory_gas_cost(3)) + 3 + 3 + 2 + verylowcopy_cost(4).unwrap(),
+        }),
+        codecopy_resize(@raw {
+            bytecode: &hex!("60aa 5f 53 6020 6000 6030 39"),
+            expected_memory: &{
+                let mut mem = [0; 96];
+                mem[0] = 0xaa;
+                mem[0x30..0x3b].copy_from_slice(&hex!("60aa5f53602060006030 39"));
+                mem
+            },
+            expected_gas: 3 + 2 + (3 + memory_gas_cost(1)) + 3 + 3 + 3
+                + (verylowcopy_cost(32).unwrap() + memory_gas_cost(3) - memory_gas_cost(1)),
+        }),
     }
 
     returndata {

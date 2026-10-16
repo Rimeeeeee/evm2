@@ -314,6 +314,8 @@ pub trait Builder: BackendTypes + TypeMethods {
         self.str_const(value.to_str().unwrap())
     }
     fn str_const(&mut self, value: &str) -> Self::Value;
+    /// Returns a pointer to a private constant global holding `value`.
+    fn bytes_const(&mut self, value: &[u8], name: &str) -> Self::Value;
     fn nullptr(&mut self) -> Self::Value;
 
     fn new_stack_slot(&mut self, ty: Self::Type, name: &str) -> Pointer<Self> {

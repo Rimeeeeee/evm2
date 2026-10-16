@@ -1442,6 +1442,17 @@ impl Builder for EvmLlvmBuilder<'_> {
         self.bcx.build_global_string_ptr(value, "").unwrap().as_pointer_value().into()
     }
 
+    fn bytes_const(&mut self, value: &[u8], name: &str) -> Self::Value {
+        let value = self.cx.const_string(value, false);
+        let global = self.module().add_global(value.get_type(), None, self.name(name));
+        global.set_initializer(&value);
+        global.set_constant(true);
+        global.set_linkage(inkwell::module::Linkage::Private);
+        global.set_unnamed_addr(true);
+        global.set_alignment(1);
+        global.as_pointer_value().into()
+    }
+
     fn nullptr(&mut self) -> Self::Value {
         self.ty_ptr.const_null().into()
     }

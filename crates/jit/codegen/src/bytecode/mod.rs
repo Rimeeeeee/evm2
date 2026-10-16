@@ -715,6 +715,26 @@ impl<'a> Bytecode<'a> {
         }
     }
 
+    /// Returns the constant `(code_offset, len)` of a `CODECOPY` that codegen copies inline.
+    ///
+    /// `code_offset` is clamped to the code size. Copies longer than a word call the builtin:
+    /// they are mostly revert strings on cold paths, where LLVM merges the identical builtin
+    /// calls and an inline copy only adds code and data.
+    pub(crate) fn inline_codecopy(&self, inst: Inst) -> Option<(usize, usize)> {
+        const MAX_LEN: usize = 32;
+
+        if self.inst(inst).opcode != op::CODECOPY {
+            return None;
+        }
+        let len = usize::try_from(self.const_operand(inst, 2)?).ok().filter(|&n| n <= MAX_LEN)?;
+        let code_offset = match self.const_operand(inst, 1) {
+            Some(offset) => usize::try_from(offset).unwrap_or(usize::MAX).min(self.codesize()),
+            None if len == 0 => 0,
+            None => return None,
+        };
+        Some((code_offset, len))
+    }
+
     /// Returns the memory section for the given instruction.
     #[allow(dead_code)]
     pub(crate) fn memory_section(&self, inst: Inst) -> MemorySection {

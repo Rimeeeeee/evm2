@@ -34,6 +34,7 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
             op::BYTE => self.peephole_byte(),
 
             op::CALLDATALOAD | op::SLOAD => self.peephole_load(data.opcode),
+            op::CODECOPY => self.peephole_codecopy(),
 
             op::KECCAK256 => self.peephole_keccak256(),
             op::RETURN | op::REVERT => self.peephole_return(data.opcode),
@@ -345,6 +346,26 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
         } else {
             false
         }
+    }
+
+    /// CODECOPY dst, code_offset, len => copy from a constant global holding the code bytes.
+    ///
+    /// The copy gas is folded into the section gas cost by `SectionsAnalysis`.
+    fn peephole_codecopy(&mut self) -> bool {
+        let inst = self.current_inst.unwrap();
+        let Some((code_offset, len)) = self.bytecode.inline_codecopy(inst) else { return false };
+        if len == 0 {
+            self.pop_ignore(3);
+            return true;
+        }
+        let [dst, _, _] = self.popn();
+        let addr = self.build_ensure_memory(dst, len as u64);
+        let end = (code_offset + len).min(self.bytecode.codesize());
+        let mut bytes = self.bytecode.code[code_offset..end].to_vec();
+        bytes.resize(len, 0);
+        let code = self.bcx.bytes_const(&bytes, "code");
+        self.bcx.memcpy_inline(addr, code, len as i64);
+        true
     }
 
     fn peephole_keccak256(&mut self) -> bool {
