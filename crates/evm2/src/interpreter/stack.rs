@@ -570,23 +570,21 @@ impl<'a> StackMut<'a> {
 #[inline(always)]
 #[allow(clippy::missing_const_for_fn)] // Inline assembly cannot be const.
 pub(crate) fn write_u64(dst: &mut Word, value: u64) {
-    // LLVM splits a 32-byte store of a zero-extended value, so use inline assembly.
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx", not(miri)))]
-    unsafe {
-        // A typed 256-bit operand lets LLVM see the dirty upper state and emit `vzeroupper`.
-        let _tmp: core::arch::x86_64::__m256i;
-        core::arch::asm!(
-            "vmovq {tmp:x}, {value}",
-            "vmovdqu ymmword ptr [{dst}], {tmp:y}",
-            dst = in(reg) core::ptr::from_mut(dst),
-            value = in(reg) value,
-            tmp = out(ymm_reg) _tmp,
-            options(nostack, preserves_flags),
-        );
-    }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx", not(miri))))]
-    {
-        *dst = Word::from(value);
+    core::cfg_select! {
+        // LLVM splits a 32-byte store of a zero-extended value, so use inline assembly.
+        all(target_arch = "x86_64", target_feature = "avx", not(miri)) => unsafe {
+            // A typed 256-bit operand lets LLVM see the dirty upper state and emit `vzeroupper`.
+            let _tmp: core::arch::x86_64::__m256i;
+            core::arch::asm!(
+                "vmovq {tmp:x}, {value}",
+                "vmovdqu ymmword ptr [{dst}], {tmp:y}",
+                dst = in(reg) core::ptr::from_mut(dst),
+                value = in(reg) value,
+                tmp = out(ymm_reg) _tmp,
+                options(nostack, preserves_flags),
+            );
+        },
+        _ => *dst = Word::from(value),
     }
 }
 
@@ -597,31 +595,29 @@ pub(crate) fn write_u64(dst: &mut Word, value: u64) {
 #[inline(always)]
 #[allow(clippy::missing_const_for_fn)] // Inline assembly cannot be const.
 pub(crate) fn write_word(dst: &mut Word, value: Word) {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx", not(miri)))]
-    unsafe {
-        let [l0, l1, l2, l3] = value.into_limbs();
-        let _lo: core::arch::x86_64::__m256i;
-        let _hi: core::arch::x86_64::__m128i;
-        core::arch::asm!(
-            "vmovq {lo:x}, {l0}",
-            "vpinsrq {lo:x}, {lo:x}, {l1}, 1",
-            "vmovq {hi:x}, {l2}",
-            "vpinsrq {hi:x}, {hi:x}, {l3}, 1",
-            "vinsertf128 {lo:y}, {lo:y}, {hi:x}, 1",
-            "vmovdqu ymmword ptr [{dst}], {lo:y}",
-            dst = in(reg) core::ptr::from_mut(dst),
-            l0 = in(reg) l0,
-            l1 = in(reg) l1,
-            l2 = in(reg) l2,
-            l3 = in(reg) l3,
-            lo = out(ymm_reg) _lo,
-            hi = out(xmm_reg) _hi,
-            options(nostack, preserves_flags),
-        );
-    }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx", not(miri))))]
-    {
-        *dst = value;
+    core::cfg_select! {
+        all(target_arch = "x86_64", target_feature = "avx", not(miri)) => unsafe {
+            let [l0, l1, l2, l3] = value.into_limbs();
+            let _lo: core::arch::x86_64::__m256i;
+            let _hi: core::arch::x86_64::__m128i;
+            core::arch::asm!(
+                "vmovq {lo:x}, {l0}",
+                "vpinsrq {lo:x}, {lo:x}, {l1}, 1",
+                "vmovq {hi:x}, {l2}",
+                "vpinsrq {hi:x}, {hi:x}, {l3}, 1",
+                "vinsertf128 {lo:y}, {lo:y}, {hi:x}, 1",
+                "vmovdqu ymmword ptr [{dst}], {lo:y}",
+                dst = in(reg) core::ptr::from_mut(dst),
+                l0 = in(reg) l0,
+                l1 = in(reg) l1,
+                l2 = in(reg) l2,
+                l3 = in(reg) l3,
+                lo = out(ymm_reg) _lo,
+                hi = out(xmm_reg) _hi,
+                options(nostack, preserves_flags),
+            );
+        },
+        _ => *dst = value,
     }
 }
 
@@ -633,17 +629,15 @@ pub(crate) fn write_word(dst: &mut Word, value: Word) {
 #[inline(always)]
 #[allow(clippy::missing_const_for_fn)] // The intrinsics are not const.
 unsafe fn swap_words(a: *mut Word, b: *mut Word) {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-    unsafe {
-        use core::arch::x86_64::{_mm256_loadu_si256, _mm256_storeu_si256};
-        let x = _mm256_loadu_si256(a.cast());
-        let y = _mm256_loadu_si256(b.cast());
-        _mm256_storeu_si256(a.cast(), y);
-        _mm256_storeu_si256(b.cast(), x);
-    }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
-    unsafe {
-        core::ptr::swap_nonoverlapping(a, b, 1);
+    core::cfg_select! {
+        all(target_arch = "x86_64", target_feature = "avx512f") => unsafe {
+            use core::arch::x86_64::{_mm256_loadu_si256, _mm256_storeu_si256};
+            let x = _mm256_loadu_si256(a.cast());
+            let y = _mm256_loadu_si256(b.cast());
+            _mm256_storeu_si256(a.cast(), y);
+            _mm256_storeu_si256(b.cast(), x);
+        },
+        _ => unsafe { core::ptr::swap_nonoverlapping(a, b, 1) },
     }
 }
 
