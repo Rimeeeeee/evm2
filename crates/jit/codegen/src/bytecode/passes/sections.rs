@@ -305,17 +305,11 @@ impl SectionsAnalysis {
 /// Returns `true` if the stack section can continue past `inst` into the next instruction:
 /// `inst` is a `JUMPI` that may fall through, and nothing else enters the next instruction.
 fn continues_into(bytecode: &Bytecode<'_>, inst: Inst) -> bool {
-    let data = bytecode.inst(inst);
     let next = inst + 1;
-    let cfg = &bytecode.cfg;
-    data.opcode == op::JUMPI
-        && data.can_fall_through()
-        && cfg.inst_to_block.get(next).copied().flatten().is_some_and(|block| {
-            let next_data = bytecode.inst(next);
-            cfg.blocks[block].preds[..] == [cfg.inst_to_block[inst].unwrap()]
-                && !next_data.is_dead_code()
-                && !next_data.is_reachable_jumpdest(bytecode.has_dynamic_jumps())
-        })
+    bytecode.inst(inst).opcode == op::JUMPI
+        && next < bytecode.insts.len_idx()
+        && !bytecode.inst(next).is_dead_code()
+        && bytecode.is_fall_through_only(next)
 }
 
 #[cfg(test)]

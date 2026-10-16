@@ -69,6 +69,21 @@ pub fn with_jit_compiler<R>(
     f(&mut compiler)
 }
 
+/// A section that falls through a `JUMPI` whose condition is zero at runtime but unknown to the
+/// analysis, so the next section is entered only by falling through.
+const FALL_THROUGH: [u8; 4] = [op::CALLVALUE, op::ISZERO, op::PUSH0, op::JUMPI];
+/// Gas charged by [`FALL_THROUGH`].
+const FALL_THROUGH_GAS: u64 = 2 + 3 + 2 + 10;
+
+/// An `MSTORE` that grows memory, in a section entered only by falling through, then `STOP`.
+const MSTORE_THEN_STOP: [u8; 8] =
+    [op::PUSH0, op::PUSH0, op::MSTORE, op::CALLVALUE, op::ISZERO, op::PUSH0, op::JUMPI, op::STOP];
+
+/// Returns `n` copies of [`FALL_THROUGH`] followed by `tail`.
+fn fall_through_then(n: usize, tail: &[u8]) -> Vec<u8> {
+    [&FALL_THROUGH.repeat(n)[..], tail].concat()
+}
+
 const I256_MIN: U256 = U256::from_limbs([
     0x0000000000000000,
     0x0000000000000000,
@@ -722,6 +737,81 @@ tests! {
             expected_gas: GAS_WHAT_INTERPRETER_SAYS,
         }),
 
+        // Sections entered only by falling through skip their gas check, so these run out of
+        // gas partway through such a run and must still fail at the next exit or builtin.
+        fall_through_oog_then_stop(@raw {
+            bytecode: &fall_through_then(6, &[op::STOP]),
+            gas_limit: 3 * FALL_THROUGH_GAS + 5,
+            expected_return: InstrStop::OutOfGas,
+        }),
+        fall_through_exact_gas_then_stop(@raw {
+            bytecode: &fall_through_then(6, &[op::STOP]),
+            gas_limit: 6 * FALL_THROUGH_GAS,
+            expected_gas: 6 * FALL_THROUGH_GAS,
+        }),
+        fall_through_oog_by_one_then_stop(@raw {
+            bytecode: &fall_through_then(6, &[op::STOP]),
+            gas_limit: 6 * FALL_THROUGH_GAS - 1,
+            expected_return: InstrStop::OutOfGas,
+        }),
+        fall_through_then_revert(@raw {
+            bytecode: &fall_through_then(6, &[op::PUSH0, op::PUSH0, op::REVERT]),
+            expected_return: InstrStop::Revert,
+            expected_gas: 6 * FALL_THROUGH_GAS + 2 + 2,
+        }),
+        fall_through_oog_then_revert(@raw {
+            bytecode: &fall_through_then(6, &[op::PUSH0, op::PUSH0, op::REVERT]),
+            gas_limit: 6 * FALL_THROUGH_GAS,
+            expected_return: InstrStop::OutOfGas,
+        }),
+        fall_through_oog_then_invalid(@raw {
+            bytecode: &fall_through_then(6, &[op::INVALID]),
+            gas_limit: 3 * FALL_THROUGH_GAS,
+            expected_return: InstrStop::OutOfGas,
+        }),
+        fall_through_then_gas(@raw {
+            bytecode: &fall_through_then(6, &[op::GAS]),
+            expected_stack: &[U256::from(DEF_GAS_LIMIT - 6 * FALL_THROUGH_GAS - 2)],
+            expected_gas: 6 * FALL_THROUGH_GAS + 2,
+        }),
+        fall_through_oog_then_sload(@raw {
+            bytecode: &fall_through_then(6, &[op::PUSH0, op::SLOAD]),
+            gas_limit: 3 * FALL_THROUGH_GAS,
+            expected_return: InstrStop::OutOfGas,
+        }),
+        fall_through_oog_then_log(@raw {
+            bytecode: &fall_through_then(6, &[op::PUSH0, op::PUSH0, op::LOG0]),
+            gas_limit: 3 * FALL_THROUGH_GAS,
+            expected_return: InstrStop::OutOfGas,
+            assert_host: Some(|host| assert!(host.logs.is_empty())),
+        }),
+        // The memory resize builtin checks the gas inline on its cold path.
+        fall_through_then_mstore(@raw {
+            bytecode: &fall_through_then(6, &MSTORE_THEN_STOP),
+            expected_memory: &[0; 32],
+            expected_gas: 7 * FALL_THROUGH_GAS + 2 + 2 + 3 + 3,
+        }),
+        fall_through_oog_then_mstore(@raw {
+            bytecode: &fall_through_then(6, &MSTORE_THEN_STOP),
+            gas_limit: 3 * FALL_THROUGH_GAS,
+            expected_return: InstrStop::OutOfGas,
+            assert_ecx: Some(|ecx| assert!(ecx.memory().is_empty())),
+        }),
+        fall_through_memory_oog_then_mstore(@raw {
+            bytecode: &fall_through_then(6, &MSTORE_THEN_STOP),
+            gas_limit: 7 * FALL_THROUGH_GAS + 2 + 2 + 3 + 2,
+            expected_return: InstrStop::OutOfGas,
+        }),
+        fall_through_past_threshold_then_stop(@raw {
+            bytecode: &fall_through_then(70, &[op::STOP]),
+            gas_limit: 70 * FALL_THROUGH_GAS,
+            expected_gas: 70 * FALL_THROUGH_GAS,
+        }),
+        fall_through_oog_past_threshold_then_stop(@raw {
+            bytecode: &fall_through_then(70, &[op::STOP]),
+            gas_limit: 10 * FALL_THROUGH_GAS,
+            expected_return: InstrStop::OutOfGas,
+        }),
     }
 
     arith {
