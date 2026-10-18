@@ -87,15 +87,11 @@ pub fn calldatacopy(cx: _, [memory_offset, data_offset, len]: [Word]) -> Result 
     let gas_params = unsafe { cx.state.gas_params_detached() };
     cx.gas.spend(gas_params.copy_cost(len))?;
     if len != 0 {
-        let memory_offset = word_to_usize(*memory_offset)?;
+        let memory_offset = memory_offset.to_usize()?;
         cx.state.resize_memory(cx.gas, memory_offset, len)?;
         // SAFETY: The host remains installed while the instruction executes.
         unsafe {
-            cx.state.0.copy_input_to_memory(
-                memory_offset,
-                word_to_usize_saturated(*data_offset),
-                len,
-            )
+            cx.state.0.copy_input_to_memory(memory_offset, data_offset.to_usize_saturated(), len)
         };
     }
     Ok(())
