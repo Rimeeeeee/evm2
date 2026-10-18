@@ -1548,6 +1548,21 @@ tests! {
             gas_limit: 7 * FALL_THROUGH_GAS + 2 + 2 + 3 + 2,
             expected_return: InstrStop::OutOfGas,
         }),
+        // The `MLOAD` skips its resize at runtime, so its cold-path check must not clear the debt
+        // before `TSTORE`.
+        fall_through_oog_then_mload_then_tstore(@raw {
+            bytecode: &[
+                &[op::PUSH0, op::PUSH0, op::MSTORE][..],
+                &FALL_THROUGH.repeat(6),
+                &[op::CALLVALUE, op::ISZERO, op::MLOAD, op::POP],
+                &[op::CALLVALUE, op::PUSH0, op::TSTORE],
+                &fall_through_then(1, &[op::STOP])[..],
+            ]
+            .concat(),
+            gas_limit: 2 + 2 + 3 + 3 + 3 * FALL_THROUGH_GAS,
+            expected_return: InstrStop::OutOfGas,
+            assert_host: Some(|host| assert!(host.transient_storage.is_empty())),
+        }),
         fall_through_past_threshold_then_stop(@raw {
             bytecode: &fall_through_then(70, &[op::STOP]),
             gas_limit: 70 * FALL_THROUGH_GAS,

@@ -958,7 +958,7 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
                     // When the fall-through continues this section, it keeps the virtual stack
                     // in SSA and only the taken edge stores it, in its own block.
                     let keep_vstack = self.bytecode.inst(inst + 1).continues_stack_section()
-                        && self.vstack.pending_stores(self.vstack.live_range()).next().is_some();
+                        && self.vstack.virtual_count() != 0;
                     if !keep_vstack {
                         self.materialize_live_stack();
                     }
@@ -1653,7 +1653,6 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
             || (self.unchecked_gas != 0 && self.section_needs_gas_check(head))
         {
             self.build_gas_check();
-            self.unchecked_gas = 0;
         }
     }
 
@@ -1685,9 +1684,10 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
 
     /// Fails with `OutOfGas` if gas subtracted without a check left the remaining gas negative.
     ///
-    /// Leaves `unchecked_gas` alone, so it is safe to call on a conditional path.
+    /// The check covers all gas charged so far, so it clears `unchecked_gas`;
+    /// [`if_then`](Self::if_then) restores it after a conditional path.
     fn build_gas_check(&mut self) {
-        if self.unchecked_gas == 0 {
+        if mem::take(&mut self.unchecked_gas) == 0 {
             return;
         }
         let remaining = self.load_gas_remaining();
@@ -2040,7 +2040,10 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
         self.bcx.brif(cond, then_block, done_block);
 
         self.bcx.switch_to_block(then_block);
+        // A gas check on this path does not cover the path that skips it.
+        let unchecked_gas = self.unchecked_gas;
         then(self);
+        self.unchecked_gas = unchecked_gas;
         self.bcx.br(done_block);
 
         self.bcx.switch_to_block(done_block);
