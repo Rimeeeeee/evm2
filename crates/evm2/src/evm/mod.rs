@@ -220,6 +220,7 @@ pub struct Evm<'a, T: EvmTypesHost> {
     precompiles: Box<dyn PrecompileProvider<T> + 'a>,
     #[derive_where(skip)]
     interpreter_pool: InterpreterPool<T>,
+    #[derive_where(skip)]
     call_memory: CallMemory,
     #[derive_where(skip)]
     inspector: Option<Box<dyn Inspector<T> + 'a>>,
