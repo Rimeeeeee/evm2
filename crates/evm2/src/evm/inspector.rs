@@ -1833,6 +1833,7 @@ mod tests {
 
     /// A panic that unwinds out of a nested frame and is caught leaves the caller registered as
     /// the running frame again.
+    #[cfg(feature = "std")]
     #[test]
     fn caught_unwind_restores_the_running_frame() {
         #[derive(Default)]
