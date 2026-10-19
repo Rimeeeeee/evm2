@@ -244,7 +244,9 @@ impl<'a, T: EvmTypesHost> Evm<'a, T> {
     /// one that issued the call, as seen by call hooks and precompiles. This never fails: bytes the
     /// memory does not hold, or all of them if no frame is running, read as zero. A range inside
     /// the memory is copied, so that a frame the caller can still reach cannot invalidate the
-    /// result. A frame reads its own calldata with [`Interpreter::input`] instead.
+    /// result. Call it while the frame that issued the call is the running frame: from the call
+    /// hooks and from precompiles. A frame reads its own calldata with [`Interpreter::input`]
+    /// instead.
     #[inline]
     pub fn call_input<'b>(&'b self, input: &'b CallInput) -> Cow<'b, [u8]> {
         match input {
@@ -259,11 +261,11 @@ impl<'a, T: EvmTypesHost> Evm<'a, T> {
     #[inline]
     fn running_frame_memory(&self) -> &[u8] {
         // SAFETY: `current_frame` points to the running frame, which outlives this borrow of the
-        // EVM, and it is cleared when the frame is. The slice borrows the EVM, so hooks, which need
-        // `&mut self` to be reached, cannot run while it is alive. Safe code that holds its own
-        // `&mut` to the frame (a runner, a hook) cannot invalidate a slice that does not escape
-        // this module: callers copy it or, in `run_interpreter`, rely on the contract of
-        // `Host::execute_shared_message`.
+        // EVM, and is restored to the previous frame when the frame ends. The slice borrows the
+        // EVM, so hooks, which need `&mut self` to be reached, cannot run while it is
+        // alive. Safe code that holds its own `&mut` to the frame (a runner, a hook) cannot
+        // invalidate a slice that does not escape this module: callers copy it or, in
+        // `run_interpreter`, rely on the contract of `Host::execute_shared_message`.
         self.current_frame.map_or(&[], |frame| unsafe { frame.as_ref() }.memory().as_slice())
     }
 
@@ -277,15 +279,12 @@ impl<'a, T: EvmTypesHost> Evm<'a, T> {
     #[inline]
     fn resolve_call_input(&self, message: &mut Message<T>, keep_shared: bool) {
         if let CallInput::SharedBuffer(range) = &message.input
-            && !(keep_shared
-                && self.current_frame.is_some()
-                && self.running_frame_memory().get(range.clone()).is_some())
+            && !(keep_shared && self.running_frame_memory().get(range.clone()).is_some())
         {
             self.own_call_input(message);
         }
     }
 
-    #[cold]
     #[inline(never)]
     fn own_call_input(&self, message: &mut Message<T>) {
         message.input = CallInput::Bytes(message.input.to_bytes_from(self.running_frame_memory()));
@@ -464,7 +463,8 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     const fn enter_execution(&mut self) -> ExecutionGuard<'_, 'a, T> {
         let was_running = self.running;
         self.running = true;
-        ExecutionGuard { evm: self, was_running }
+        let prev_frame = self.current_frame;
+        ExecutionGuard { evm: self, was_running, prev_frame }
     }
 
     /// Returns the transaction handler registry.
@@ -986,46 +986,19 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     }
 }
 
-/// Registers a frame as the running frame and restores the previous one when dropped, including
-/// on unwind, before the frame is destroyed.
-struct RunningFrame<T: EvmTypesHost> {
-    slot: *mut Option<NonNull<Interpreter<'static, 'static, T>>>,
-    prev: Option<NonNull<Interpreter<'static, 'static, T>>>,
-}
-
-impl<T: EvmTypesHost> RunningFrame<T> {
-    #[inline]
-    const fn new(
-        slot: *mut Option<NonNull<Interpreter<'static, 'static, T>>>,
-        frame: NonNull<Interpreter<'static, 'static, T>>,
-    ) -> Self {
-        // SAFETY: `slot` is `Evm::current_frame`, and the guard is dropped before the EVM is.
-        let prev = unsafe { slot.replace(Some(frame)) };
-        Self { slot, prev }
-    }
-}
-
-impl<T: EvmTypesHost> Drop for RunningFrame<T> {
-    #[inline]
-    fn drop(&mut self) {
-        // SAFETY: As in `new`.
-        unsafe { *self.slot = self.prev };
-    }
-}
-
+/// Marks the EVM as executing for a scope. The running frame, if the scope changes it, is
+/// restored when the scope ends, including on unwind.
 struct ExecutionGuard<'guard, 'evm, T: EvmTypesHost> {
     evm: &'guard mut Evm<'evm, T>,
     was_running: bool,
+    prev_frame: Option<NonNull<Interpreter<'static, 'static, T>>>,
 }
 
 impl<'guard, 'evm, T: EvmTypesHost> Drop for ExecutionGuard<'guard, 'evm, T> {
     #[inline]
     fn drop(&mut self) {
         self.evm.running = self.was_running;
-        if !self.was_running {
-            // After an unwind out of a hook, the running frame is gone.
-            self.evm.current_frame = None;
-        }
+        self.evm.current_frame = self.prev_frame;
     }
 }
 
@@ -1610,10 +1583,8 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         let mut interp: Box<Interpreter<'frame, 'a, T>> =
             guard.evm.interpreter_pool.pop(tx_env, message, input);
         let interp_ref = interp.as_mut();
-        let running = RunningFrame::new(
-            &raw mut guard.evm.current_frame,
-            NonNull::from(&mut *interp_ref).cast::<Interpreter<'static, 'static, T>>(),
-        );
+        guard.evm.current_frame =
+            Some(NonNull::from(&mut *interp_ref).cast::<Interpreter<'static, 'static, T>>());
         guard.evm.inspect_initialize_interp(interp_ref);
         let inspector = guard.evm.inspector.as_deref_mut().map(|inspector| {
             // SAFETY: The inspector is stored in `self` and remains alive for the duration of the
@@ -1630,7 +1601,6 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         } else {
             interp_ref.run(guard.evm)
         };
-        drop(running);
         guard.evm.interpreter_pool.push(interp);
         stop
     }

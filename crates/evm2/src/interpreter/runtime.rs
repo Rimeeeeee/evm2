@@ -73,6 +73,12 @@ where
 impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     /// Creates an interpreter from a transaction-global environment and a frame-local message,
     /// which carries the bytecode to run.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the message's input is a
+    /// [`CallInput::SharedBuffer`](super::CallInput::SharedBuffer), which only a running caller
+    /// frame can resolve.
     pub fn new(tx_env: &'frame TxEnv<T>, message: &'frame Message<T>) -> Self {
         // SAFETY: Calling init right after.
         let mut interp = unsafe { Self::uninit() };
@@ -753,18 +759,12 @@ impl<T: EvmTypesHost> InterpreterPool<T> {
         message: &'frame Message<T>,
         input: &[u8],
     ) -> Box<Interpreter<'frame, 'host, T>> {
-        let frame = match self.frames.pop() {
-            Some(mut frame) => {
-                frame.init(tx_env, message, input);
-                frame
-            }
-            None => {
-                // SAFETY: Calling init right after.
-                let mut frame = Box::new(unsafe { Interpreter::uninit() });
-                frame.init(tx_env, message, input);
-                frame
-            }
-        };
+        let mut frame = self
+            .frames
+            // SAFETY: Calling init right after.
+            .pop()
+            .unwrap_or_else(|| Box::new(unsafe { Interpreter::uninit() }));
+        frame.init(tx_env, message, input);
         // SAFETY: Frames stored in the pool have their frame-local references cleared before they
         // are erased to `'static`. Rebinding the lifetime is only used to initialize the next
         // frame.

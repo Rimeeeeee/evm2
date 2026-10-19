@@ -1554,6 +1554,33 @@ mod tests {
         );
     }
 
+    /// The word the callers of the call input tests keep in memory: bytes 1 to 32.
+    const CALL_INPUT_WORD: [u8; 32] = {
+        let mut word = [0; 32];
+        let mut i = 0;
+        while i < 32 {
+            word[i] = i as u8 + 1;
+            i += 1;
+        }
+        word
+    };
+
+    /// Code that returns its first calldata word and its calldata size.
+    const CALLDATA_ECHO_CODE: [u8; 12] = [
+        op::PUSH0,
+        op::CALLDATALOAD,
+        op::PUSH0,
+        op::MSTORE,
+        op::CALLDATASIZE,
+        op::PUSH1,
+        32,
+        op::MSTORE,
+        op::PUSH1,
+        64,
+        op::PUSH0,
+        op::RETURN,
+    ];
+
     /// What a call hook does to the caller's memory after the call instruction made its message.
     #[derive(Clone, Copy)]
     enum MemoryEdit {
@@ -1628,7 +1655,7 @@ mod tests {
             code.extend([op::CALL, op::POP]);
         };
 
-        let word: [u8; 32] = core::array::from_fn(|i| i as u8 + 1);
+        let word = CALL_INPUT_WORD;
         let mut parent_code = vec![op::PUSH32];
         parent_code.extend(word);
         parent_code.extend([op::PUSH0, op::MSTORE]);
@@ -1639,20 +1666,7 @@ mod tests {
         } else {
             parent_code.extend([op::STOP]);
         }
-        let child_code = vec![
-            op::PUSH0,
-            op::CALLDATALOAD,
-            op::PUSH0,
-            op::MSTORE,
-            op::CALLDATASIZE,
-            op::PUSH1,
-            32,
-            op::MSTORE,
-            op::PUSH1,
-            64,
-            op::PUSH0,
-            op::RETURN,
-        ];
+        let child_code = CALLDATA_ECHO_CODE;
         let mut db = InMemoryDB::default();
         db.insert_account_info(
             &child,
@@ -1673,7 +1687,7 @@ mod tests {
     /// issued the call.
     #[test]
     fn call_input_resolves_against_caller_memory() {
-        let word: [u8; 32] = core::array::from_fn(|i| i as u8 + 1);
+        let word = CALL_INPUT_WORD;
         let input = Bytes::copy_from_slice(&word[4..12]);
         let mut expected_output = [0; 72];
         expected_output[..8].copy_from_slice(&input);
@@ -1690,7 +1704,7 @@ mod tests {
     /// input the child reads.
     #[test]
     fn call_hook_growing_caller_memory_keeps_input() {
-        let word: [u8; 32] = core::array::from_fn(|i| i as u8 + 1);
+        let word = CALL_INPUT_WORD;
         let input = Bytes::copy_from_slice(&word[4..12]);
 
         let (result, inspector) = call_with_memory_edit(MemoryEdit::Grow, true);
@@ -1780,7 +1794,7 @@ mod tests {
         let parent = Address::ZERO;
         let child = Address::with_last_byte(0xbb);
         let mut parent_code = vec![op::PUSH32];
-        parent_code.extend(core::array::from_fn::<u8, 32, _>(|i| i as u8 + 1));
+        parent_code.extend(CALL_INPUT_WORD);
         parent_code.extend([op::PUSH0, op::MSTORE]);
         push_all(
             &mut parent_code,
@@ -1795,20 +1809,7 @@ mod tests {
             ],
         );
         parent_code.extend([op::CALL, op::STOP]);
-        let child_code = vec![
-            op::PUSH0,
-            op::CALLDATALOAD,
-            op::PUSH0,
-            op::MSTORE,
-            op::CALLDATASIZE,
-            op::PUSH1,
-            32,
-            op::MSTORE,
-            op::PUSH1,
-            64,
-            op::PUSH0,
-            op::RETURN,
-        ];
+        let child_code = CALLDATA_ECHO_CODE;
         let mut db = InMemoryDB::default();
         db.insert_account_info(&parent, AccountInfo::default().with_balance(Word::from(10)));
         db.insert_account_info(

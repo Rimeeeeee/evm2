@@ -1,6 +1,6 @@
 use super::Memory;
-use crate::{BaseEvmTypes, EvmTypesHost, bytecode::Bytecode};
-use alloc::{borrow::Cow, vec, vec::Vec};
+use crate::{BaseEvmTypes, EvmTypesHost, bytecode::Bytecode, utils::right_pad_vec};
+use alloc::borrow::Cow;
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use core::ops::Range;
 
@@ -113,7 +113,11 @@ impl CallInput {
             Self::Bytes(bytes) => Cow::Borrowed(bytes),
             Self::SharedBuffer(range) => match caller_memory.get(range.clone()) {
                 Some(bytes) => Cow::Borrowed(bytes),
-                None => Cow::Owned(pad_range(caller_memory, range)),
+                None => {
+                    let start = range.start.min(caller_memory.len());
+                    let end = range.end.min(caller_memory.len()).max(start);
+                    right_pad_vec(&caller_memory[start..end], range.len())
+                }
             },
         }
     }
@@ -130,24 +134,9 @@ impl CallInput {
     pub(crate) fn to_bytes_from(&self, caller_memory: &[u8]) -> Bytes {
         match self {
             Self::Bytes(bytes) => bytes.clone(),
-            Self::SharedBuffer(_) => match self.as_bytes_from(caller_memory) {
-                Cow::Borrowed(bytes) => Bytes::copy_from_slice(bytes),
-                Cow::Owned(bytes) => bytes.into(),
-            },
+            Self::SharedBuffer(_) => self.as_bytes_from(caller_memory).into_owned().into(),
         }
     }
-}
-
-/// Copies `range` out of `memory`, reading zero for the bytes `memory` does not hold.
-#[cold]
-#[inline(never)]
-fn pad_range(memory: &[u8], range: &Range<usize>) -> Vec<u8> {
-    let mut bytes = vec![0; range.len()];
-    let end = range.end.min(memory.len());
-    if let Some(available) = memory.get(range.start..end) {
-        bytes[..available.len()].copy_from_slice(available);
-    }
-    bytes
 }
 
 /// Frame-local EVM call/create message executed by the interpreter for an EVM type family.
