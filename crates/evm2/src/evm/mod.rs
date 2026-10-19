@@ -260,20 +260,6 @@ impl<'a, T: EvmTypesHost> Evm<'a, T> {
             }
         }
     }
-
-    /// Registers `frame` as the running frame, or clears it with `None`.
-    ///
-    /// [`Evm::execute_message`](Host::execute_message) does this itself. Only adapters that run a
-    /// frame outside of it need this, so that the frame's calls can resolve shared call input
-    /// against its memory.
-    ///
-    /// # Safety
-    ///
-    /// `frame` must stay alive and at the same address until it is cleared.
-    #[doc(hidden)]
-    pub unsafe fn set_running_frame(&mut self, frame: Option<&mut Interpreter<'_, '_, T>>) {
-        self.current_frame = frame.map(|frame| NonNull::from(frame).cast());
-    }
 }
 
 impl<'a, T: EvmTypes> Evm<'a, T> {

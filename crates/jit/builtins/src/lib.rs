@@ -971,8 +971,8 @@ mod tests {
         BaseEvmTypes, Evm, Precompiles, SpecId,
         env::{BlockEnvExt, TxEnvExt},
         ethereum::ethereum_tx_registry,
-        evm::{AccountInfo, EmptyDB, InMemoryDB, inspector::Inspector},
-        interpreter::{GasTracker, Message, MessageResult, MessageResultExt, op},
+        evm::{AccountInfo, EmptyDB, InMemoryDB, InterpreterRunner, inspector::Inspector},
+        interpreter::{GasTracker, Interpreter, Message, MessageResult, MessageResultExt, op},
     };
     use evm2_jit_context::EvmStack;
 
@@ -1069,6 +1069,52 @@ mod tests {
         PreparedJitFrame { ecx, stack }
     }
 
+    /// Runs the CALL builtin inside a running frame, as compiled code does, so the call input
+    /// resolves against the frame's memory.
+    #[derive(Debug)]
+    struct IdentityCallRunner;
+
+    impl InterpreterRunner<BaseEvmTypes> for IdentityCallRunner {
+        fn run<'frame, 'host>(
+            &self,
+            interpreter: &mut Interpreter<'frame, 'host, BaseEvmTypes>,
+            host: &mut Evm<'host, BaseEvmTypes>,
+        ) -> Option<InstrStop> {
+            let identity = Address::with_last_byte(4);
+            let mut frame = prepare_frame(interpreter, host);
+            frame.ecx.memory_mut().resize(0, 16).unwrap();
+            frame.ecx.memory_mut().set(4, b"in");
+            frame.stack.set(0, EvmWord::from(Word::from(2)));
+            frame.stack.set(1, EvmWord::from(Word::from(8)));
+            frame.stack.set(2, EvmWord::from(Word::from(2)));
+            frame.stack.set(3, EvmWord::from(Word::from(4)));
+            frame.stack.set(4, EvmWord::ZERO);
+            frame.stack.set(5, address_word(&identity));
+            frame.stack.set(6, EvmWord::from(Word::from(50_000)));
+
+            let sp = frame.stack.as_mut_ptr();
+            unsafe { __revmc_builtin_call(&mut frame.ecx, sp, CallKind::Call) };
+
+            assert_eq!(unsafe { frame.stack.get_unchecked(0) }.to_u256(), Word::from(1));
+            assert_eq!(frame.ecx.return_data().as_ref(), b"in");
+            assert_eq!(frame.ecx.memory().slice(8, 2), b"in");
+            Some(InstrStop::Stop)
+        }
+    }
+
+    #[test]
+    fn call_builtin_reads_input_from_caller_memory() {
+        let mut host = base_evm(SpecId::CANCUN);
+        host.set_interpreter_runner(IdentityCallRunner);
+        let mut message = MessageExt {
+            gas_limit: 1_000_000,
+            code: Bytecode::new_legacy(Bytes::from_static(&[op::STOP])),
+            ..MessageExt::default()
+        };
+        let result = host.execute_message(&TxEnvExt::default(), &mut message).unwrap();
+        assert_eq!(result.stop, InstrStop::Stop);
+    }
+
     #[test]
     fn call_builtin_executes_message() {
         let target = Address::from([0x22; 20]);
@@ -1095,18 +1141,15 @@ mod tests {
             evm2::interpreter::Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
 
         {
-            // SAFETY: The frame is cleared below, before `interpreter` is dropped.
-            unsafe { host.set_running_frame(Some(&mut interpreter)) };
             let mut frame = prepare_frame(&mut interpreter, &mut host);
-            frame.ecx.memory_mut().resize(0, 16).unwrap();
-            frame.ecx.memory_mut().set(4, b"in");
             frame.stack.set(0, EvmWord::from(Word::from(2)));
             frame.stack.set(1, EvmWord::from(Word::from(8)));
-            frame.stack.set(2, EvmWord::from(Word::from(2)));
-            frame.stack.set(3, EvmWord::from(Word::from(4)));
+            frame.stack.set(2, EvmWord::ZERO);
+            frame.stack.set(3, EvmWord::ZERO);
             frame.stack.set(4, EvmWord::ZERO);
             frame.stack.set(5, address_word(&target));
             frame.stack.set(6, EvmWord::from(Word::from(50_000)));
+            frame.ecx.memory_mut().resize(0, 16).unwrap();
 
             let sp = frame.stack.as_mut_ptr();
             unsafe { __revmc_builtin_call(&mut frame.ecx, sp, CallKind::Call) };
@@ -1121,14 +1164,12 @@ mod tests {
             frame.ecx.interpreter_mut().set_output(0..output.len() as u32);
             assert_eq!(frame.ecx.return_data(), child_output.as_ref());
         }
-        unsafe { host.set_running_frame(None) };
 
         let inspector = host.clear_inspector_as::<MessageInspector>().unwrap();
         assert_eq!(inspector.calls.len(), 1);
         assert_eq!(inspector.calls[0].kind, MessageKind::Call);
         assert_eq!(inspector.calls[0].destination, target);
         assert_eq!(inspector.calls[0].caller, caller);
-        assert_eq!(inspector.calls[0].input, CallInput::SharedBuffer(4..6));
         assert!(!inspector.call_static_flags[0]);
     }
 

@@ -89,19 +89,6 @@ mod tests {
         interpreter::Word,
     };
 
-    /// Runs `interpreter` as `Evm::execute_message` would, with the frame registered as running.
-    fn run_registered<'frame, 'host>(
-        backend: &JitBackend,
-        interpreter: &mut Interpreter<'frame, 'host, BaseEvmTypes>,
-        host: &mut Evm<'host, BaseEvmTypes>,
-    ) -> Option<InstrStop> {
-        // SAFETY: The frame is cleared before `interpreter` is used again.
-        unsafe { host.set_running_frame(Some(&mut *interpreter)) };
-        let stop = run_interpreter(backend, interpreter, host);
-        unsafe { host.set_running_frame(None) };
-        stop
-    }
-
     #[cfg(feature = "llvm")]
     const BYTECODE_RET42: &[u8] =
         &[op::PUSH1, 0x42, op::PUSH0, op::MSTORE, op::PUSH1, 0x20, op::PUSH0, op::RETURN];
@@ -233,7 +220,7 @@ mod tests {
             Precompiles::base(SpecId::CANCUN),
         );
 
-        assert_eq!(run_registered(&JitBackend::disabled(), &mut interpreter, &mut host), None);
+        assert_eq!(run_interpreter(&JitBackend::disabled(), &mut interpreter, &mut host), None);
     }
 
     #[test]
@@ -284,7 +271,7 @@ mod tests {
         };
         let mut interpreter = Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
 
-        assert_eq!(run_registered(&backend, &mut interpreter, &mut host), Some(InstrStop::Return));
+        assert_eq!(run_interpreter(&backend, &mut interpreter, &mut host), Some(InstrStop::Return));
         assert_eq!(interpreter.output().len(), 32);
         assert_eq!(interpreter.output()[31], 0x42);
     }
@@ -342,7 +329,7 @@ mod tests {
         };
         let mut interpreter = Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
 
-        assert_eq!(run_registered(&backend, &mut interpreter, &mut host), Some(InstrStop::Return));
+        assert_eq!(run_interpreter(&backend, &mut interpreter, &mut host), Some(InstrStop::Return));
         assert_eq!(interpreter.output().len(), 32);
         assert_eq!(interpreter.output()[31], 1);
     }
@@ -403,7 +390,7 @@ mod tests {
         };
         let mut interpreter = Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
 
-        assert_eq!(run_registered(&backend, &mut interpreter, &mut host), Some(InstrStop::Return));
+        assert_eq!(run_interpreter(&backend, &mut interpreter, &mut host), Some(InstrStop::Return));
         assert_eq!(interpreter.output().len(), 32);
         assert_eq!(interpreter.output()[31], 0);
     }
@@ -473,7 +460,7 @@ mod tests {
         };
         let mut interpreter = Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
 
-        assert_eq!(run_registered(&backend, &mut interpreter, &mut host), Some(InstrStop::Stop));
+        assert_eq!(run_interpreter(&backend, &mut interpreter, &mut host), Some(InstrStop::Stop));
         let beneficiary_balance = host.read_account_info(&beneficiary).unwrap().unwrap().balance;
         assert_eq!(beneficiary_balance, initial_beneficiary_balance);
     }
@@ -532,7 +519,7 @@ mod tests {
             }
             let mut interpreter = Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
             let stop = if with_jit {
-                run_registered(&backend, &mut interpreter, &mut host).unwrap()
+                run_interpreter(&backend, &mut interpreter, &mut host).unwrap()
             } else {
                 interpreter.run(&mut host).unwrap()
             };
