@@ -191,8 +191,8 @@ fn prepare_call<T: EvmTypesHost>(
             kind == MessageKind::Call,
             local_gas_limit,
         )?;
-    // The child reads its calldata straight from this frame's memory, which stays untouched until
-    // the call returns, if the host runs this frame; otherwise the input is copied.
+    // The child reads its calldata straight from this frame's memory if the host runs this frame;
+    // otherwise the input is copied.
     let input = if input_range.is_empty() {
         CallInput::default()
     } else if state.is_running_frame() {
@@ -251,8 +251,10 @@ fn call_inner<T: EvmTypesHost>(
     let tx_env = state.tx();
     let shared = matches!(message.input, CallInput::SharedBuffer(_));
     let result = if shared {
-        // SAFETY: `prepare_call` only makes a shared input if the host runs this frame. This frame
-        // is suspended here, and nothing else reaches its memory until the call returns.
+        // SAFETY: `prepare_call` only makes a shared input if the host runs this frame, and this
+        // frame is suspended in this call instruction. The host bounds-checks the range after the
+        // last hook that can reach this frame and before the child starts; from then on the child
+        // is the running frame, so no hook reaches this frame's memory until the call returns.
         unsafe { state.host().execute_shared_message(tx_env, &mut message) }
     } else {
         state.host().execute_message(tx_env, &mut message)

@@ -775,9 +775,11 @@ pub unsafe extern "C" fn __revmc_builtin_call(
 
     let tx_env = ecx.tx_env();
     let result = if matches!(message.input, CallInput::SharedBuffer(_)) {
-        // SAFETY: The input is only shared if the host runs this frame. This builtin is the frame's
-        // call instruction, so the frame is suspended here and nothing else reaches its memory
-        // until the call returns.
+        // SAFETY: The input is only shared if the host runs this frame, and this builtin is the
+        // frame's call instruction, so the frame is suspended here. The host bounds-checks the
+        // range after the last hook that can reach this frame and before the child starts; from
+        // then on the child is the running frame, so no hook reaches this frame's memory until the
+        // call returns.
         unsafe { ecx.host().execute_shared_message(tx_env, &mut message) }
     } else {
         ecx.host().execute_message(tx_env, &mut message)

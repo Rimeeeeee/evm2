@@ -209,7 +209,7 @@ pub trait Host<T: EvmTypesHost> {
     /// Executes a message inside this host.
     ///
     /// A shared call input in `message` is copied out of the running frame's memory before the
-    /// message executes.
+    /// message executes, unless the message is a create, which has no call input.
     fn execute_message(
         &mut self,
         tx_env: &TxEnv<T>,

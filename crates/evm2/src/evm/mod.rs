@@ -261,11 +261,11 @@ impl<'a, T: EvmTypesHost> Evm<'a, T> {
     #[inline]
     fn running_frame_memory(&self) -> &[u8] {
         // SAFETY: `current_frame` points to the running frame, which outlives this borrow of the
-        // EVM, and is restored to the previous frame when the frame ends. The slice borrows the
-        // EVM, so hooks, which need `&mut self` to be reached, cannot run while it is
-        // alive. Safe code that holds its own `&mut` to the frame (a runner, a hook) cannot
-        // invalidate a slice that does not escape this module: callers copy it or, in
-        // `run_interpreter`, rely on the contract of `Host::execute_shared_message`.
+        // EVM, and is restored to the previous frame when the frame ends. The public callers copy
+        // the slice before returning, so it does not outlive this borrow. `resolve_call_input`
+        // only bounds-checks it. `run_interpreter` keeps a range into it alive while the child
+        // runs; that range was resolved right before dispatch, and no hook can reach the caller
+        // from then on, because the child is the running frame (see `run_interpreter`).
         self.current_frame.map_or(&[], |frame| unsafe { frame.as_ref() }.memory().as_slice())
     }
 
@@ -1227,7 +1227,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
                 // SAFETY: The message outlives the frame, which is returned to the pool below.
                 let frame_message = unsafe { trustme::decouple_lt(&*message) };
                 // The hooks may replace the message's input, so the frame keeps its own handle.
-                let input = top_input.insert(message.input.as_owned().cloned().unwrap_or_default());
+                let input = top_input.insert(message.input.to_bytes_from(&[]));
                 // SAFETY: `top_input` outlives the frame, which is returned to the pool below.
                 let input = unsafe { trustme::decouple_lt(input.as_ref()) };
                 let frame =

@@ -100,7 +100,8 @@ impl CallInput {
     ///
     /// This never fails: bytes of the range that `caller_memory` does not hold read as zero, as
     /// bytes past the end of memory do, which happens when a hook shrank the memory after the
-    /// range was made. Those are returned as owned bytes; a range inside the memory is borrowed.
+    /// range was made. Those are returned as owned bytes, which allocates `range.len()` bytes; a
+    /// range inside the memory is borrowed.
     #[inline]
     pub fn as_bytes<'a>(&'a self, caller_memory: &'a Memory) -> Cow<'a, [u8]> {
         self.as_bytes_from(caller_memory.as_slice())
