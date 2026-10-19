@@ -407,10 +407,14 @@ fn with_evm_context_and_host_mut<
     };
     let mut interpreter = Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
     interpreter.prepare_run(host);
+    // SAFETY: The frame is cleared below, before `interpreter` is dropped.
+    unsafe { host.set_running_frame(Some(&mut interpreter)) };
 
     let (mut ecx, stack, stack_len) =
         unsafe { EvmContext::from_interpreter_with_stack(&mut interpreter) };
-    f(&mut ecx, stack, stack_len)
+    let result = f(&mut ecx, stack, stack_len);
+    unsafe { host.set_running_frame(None) };
+    result
 }
 
 pub fn with_evm_context_and_host<
@@ -524,7 +528,10 @@ fn run_compiled_test_case_with_context(
     };
     let mut interpreter = Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
     let mut int_host = prepare_host(spec_id);
+    // SAFETY: The frame is cleared right after the run.
+    unsafe { int_host.set_running_frame(Some(&mut interpreter)) };
     let int_stop = interpreter.run(&mut int_host).unwrap();
+    unsafe { int_host.set_running_frame(None) };
     let int_result = int_stop;
     let interpreter_output = interpreter.output();
 
