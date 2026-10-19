@@ -123,8 +123,8 @@ use crate::{
     constants::{CALL_DEPTH_LIMIT, EIP7708_TRANSFER_TOPIC},
     env::{BlockEnv, TxEnv},
     interpreter::{
-        Gas, GasTracker, Host, InstrStop, Interpreter, InterpreterPool, Message, MessageKind,
-        MessageResult, MessageResultExt, Word,
+        CallInput, Gas, GasTracker, Host, InstrStop, Interpreter, InterpreterPool, Message,
+        MessageKind, MessageResult, MessageResultExt, Word,
     },
     registry::{HandlerResult, TxRegistry},
     trustme,
@@ -235,6 +235,31 @@ pub struct Evm<'a, T: EvmTypesHost> {
     #[derive_where(skip)]
     async_stack: r#async::FiberStack,
     evm_send: bool,
+}
+
+impl<'a, T: EvmTypesHost> Evm<'a, T> {
+    /// Returns the bytes of a message's call input.
+    ///
+    /// A [`CallInput::SharedBuffer`] range resolves against the memory of the frame that is
+    /// running while the message executes: the one that issued the call, as seen by call hooks and
+    /// precompiles. A frame reads its own calldata with [`Interpreter::input`] instead.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the input is a shared-buffer range and no frame is running.
+    #[inline]
+    #[track_caller]
+    pub fn call_input<'b>(&'b self, input: &'b CallInput) -> &'b [u8] {
+        match input {
+            CallInput::Bytes(bytes) => bytes,
+            CallInput::SharedBuffer(_) => {
+                let frame = self.current_frame.expect("shared call input without a running frame");
+                // SAFETY: `current_frame` points to the running frame, which outlives this borrow
+                // of the EVM.
+                input.as_bytes(unsafe { frame.as_ref() }.memory())
+            }
+        }
+    }
 }
 
 impl<'a, T: EvmTypes> Evm<'a, T> {
@@ -1145,7 +1170,11 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
             None => {
                 // SAFETY: The message outlives the frame, which is returned to the pool below.
                 let frame_message = unsafe { trustme::decouple_lt(&*message) };
-                let frame = top_frame.insert(guard.evm.interpreter_pool.pop(tx_env, frame_message));
+                let input = guard.evm.call_input(&message.input);
+                // SAFETY: The message owns the input and outlives the frame.
+                let input = unsafe { trustme::decouple_lt(input) };
+                let frame =
+                    top_frame.insert(guard.evm.interpreter_pool.pop(tx_env, frame_message, input));
                 frame.prepare_run(guard.evm);
                 frame
             }
@@ -1471,8 +1500,13 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         message: &'frame Message<T>,
     ) -> Result<InstrStop, ExecutionError> {
         let guard = self.enter_execution();
+        let input = guard.evm.call_input(&message.input);
+        // SAFETY: The input lives in the message or in the caller frame's memory. The caller frame
+        // is suspended in the call instruction that created the message until this one returns,
+        // so it cannot resize its memory meanwhile.
+        let input = unsafe { trustme::decouple_lt(input) };
         let mut interp: Box<Interpreter<'frame, 'a, T>> =
-            guard.evm.interpreter_pool.pop(tx_env, message);
+            guard.evm.interpreter_pool.pop(tx_env, message, input);
         let interp_ref = interp.as_mut();
         guard.evm.inspect_initialize_interp(interp_ref);
         let inspector = guard.evm.inspector.as_deref_mut().map(|inspector| {
@@ -2014,7 +2048,7 @@ mod tests {
             destination: address,
             call_target: address,
             caller: Address::ZERO,
-            input: Bytes::new(),
+            input: CallInput::default(),
             value: U256::ZERO,
             code: Bytecode::default(),
             code_address: address,
@@ -2105,7 +2139,7 @@ mod tests {
             evm.set_inspector(LogInspector::default());
             let mut message = precompile_message(TEST_PRECOMPILE);
             if revert {
-                message.input = Bytes::from_static(b"revert");
+                message.input = Bytes::from_static(b"revert").into();
             }
             let result =
                 Host::execute_message(&mut evm, &TxEnvExt::default(), &mut message).unwrap();
@@ -2853,7 +2887,7 @@ mod tests {
             assert_eq!(message.depth, 67);
             assert_eq!(message.destination, TEST_PRECOMPILE);
             assert_eq!(message.caller, Address::with_last_byte(0x7a));
-            assert_eq!(message.input, Bytes::from_static(b"message input"));
+            assert_eq!(message.input, Bytes::from_static(b"message input").into());
             assert_eq!(message.value, U256::from(99));
             assert_eq!(message.code_address, TEST_PRECOMPILE);
             assert!(!message.disable_precompiles);
@@ -2874,7 +2908,7 @@ mod tests {
             destination: address,
             call_target: address,
             caller: Address::with_last_byte(0x7a),
-            input: Bytes::from_static(b"message input"),
+            input: Bytes::from_static(b"message input").into(),
             value: U256::from(99),
             code: Bytecode::default(),
             code_address: address,

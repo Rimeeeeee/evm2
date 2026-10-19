@@ -25,6 +25,10 @@ pub struct Interpreter<'frame, 'host, T: EvmTypesHost> {
     bytecode_ref: Option<BytecodeRef<'static>>,
     pub(in crate::interpreter) memory: Memory,
     pub(in crate::interpreter) return_data: Bytes,
+    // Calldata of the active frame: borrows either `message.input` or the caller frame's memory,
+    // both of which outlive the frame. Reset before pooling; accessors shorten the erased
+    // lifetime to the borrow of this interpreter.
+    pub(in crate::interpreter) input: NonNull<[u8]>,
 
     pub(in crate::interpreter) pc: *const u8,
     output: Range<u32>,
@@ -67,7 +71,11 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     pub fn new(tx_env: &'frame TxEnv<T>, message: &'frame Message<T>) -> Self {
         // SAFETY: Calling init right after.
         let mut interp = unsafe { Self::uninit() };
-        interp.init(tx_env, message);
+        let input = message
+            .input
+            .as_owned()
+            .expect("an interpreter created without a caller frame needs owned message input");
+        interp.init(tx_env, message, input);
         interp
     }
 
@@ -92,6 +100,7 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
             message: None,
             is_static: false,
             return_data: Bytes::new(),
+            input: NonNull::<[u8]>::from_ref(&[]),
             host: None,
             inspector: None,
             spec: SpecId::DEFAULT,
@@ -102,7 +111,9 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     }
 
     /// Initializes this interpreter for a new frame, retaining reusable allocations.
-    fn init(&mut self, tx_env: &'frame TxEnv<T>, message: &'frame Message<T>) {
+    ///
+    /// `input` is the resolved `message.input`; it must stay valid until the frame is pooled.
+    fn init(&mut self, tx_env: &'frame TxEnv<T>, message: &'frame Message<T>, input: &[u8]) {
         let bytecode = message.code.clone();
         let gas_limit = message.gas_limit;
         let is_static = message.caller_is_static || matches!(message.kind, MessageKind::StaticCall);
@@ -121,9 +132,11 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
         self.message = Some(message);
         self.is_static = is_static;
         self.return_data = Bytes::new();
+        self.input = NonNull::from(input);
     }
 
     pub(crate) const fn clear_frame_refs(&mut self) {
+        self.input = NonNull::<[u8]>::from_ref(&[]);
         self.tx_env = None;
         self.message = None;
         self.host = None;
@@ -291,6 +304,17 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     pub const fn tx_env(&self) -> &'frame TxEnv<T> {
         // SAFETY: `tx_env` is initialized before execution starts.
         unsafe { self.tx_env.unwrap_unchecked() }
+    }
+
+    /// Returns the calldata of the active frame.
+    ///
+    /// Unlike `message().input`, this resolves a shared-buffer input against the caller frame's
+    /// memory.
+    #[inline]
+    pub const fn input(&self) -> &[u8] {
+        // SAFETY: `init` stores a slice that outlives the frame, and the caller frame cannot
+        // change its memory while this frame runs.
+        unsafe { self.input.as_ref() }
     }
 
     /// Returns return data from the last call-like operation.
@@ -713,13 +737,19 @@ impl<T: EvmTypesHost> InterpreterPool<T> {
         &mut self,
         tx_env: &'frame TxEnv<T>,
         message: &'frame Message<T>,
+        input: &[u8],
     ) -> Box<Interpreter<'frame, 'host, T>> {
         let frame = match self.frames.pop() {
             Some(mut frame) => {
-                frame.init(tx_env, message);
+                frame.init(tx_env, message, input);
                 frame
             }
-            None => Box::new(Interpreter::new(tx_env, message)),
+            None => {
+                // SAFETY: Calling init right after.
+                let mut frame = Box::new(unsafe { Interpreter::uninit() });
+                frame.init(tx_env, message, input);
+                frame
+            }
         };
         // SAFETY: Frames stored in the pool have their frame-local references cleared before they
         // are erased to `'static`. Rebinding the lifetime is only used to initialize the next

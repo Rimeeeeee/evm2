@@ -1554,6 +1554,89 @@ mod tests {
         );
     }
 
+    /// A call reads its input from the caller's memory: the child frame, a precompile, and the
+    /// call hooks all see the bytes the caller held when it issued the call.
+    #[test]
+    fn call_input_resolves_against_caller_memory() {
+        #[derive(Default)]
+        struct InputInspector {
+            call_inputs: Vec<Bytes>,
+        }
+        impl Inspector<BaseEvmTypes> for InputInspector {
+            fn call(
+                &mut self,
+                interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+                message: &mut Message<BaseEvmTypes>,
+            ) -> Option<MessageResult<BaseEvmTypes>> {
+                self.call_inputs.push(message.input.to_bytes(interp.memory()));
+                None
+            }
+        }
+
+        let child = Address::with_last_byte(0xbb);
+        let identity = Address::with_last_byte(4);
+        let call = |code: &mut Vec<u8>, target: Address, out_offset: u8, out_len: u8| {
+            push_all(
+                code,
+                [
+                    Word::from(out_len),
+                    Word::from(out_offset),
+                    Word::from(8),
+                    Word::from(4),
+                    Word::ZERO,
+                    address_to_word(&target),
+                    Word::from(100_000),
+                ],
+            );
+            code.extend([op::CALL, op::POP]);
+        };
+
+        let word: [u8; 32] = core::array::from_fn(|i| i as u8 + 1);
+        let mut parent_code = vec![op::PUSH32];
+        parent_code.extend(word);
+        parent_code.extend([op::PUSH0, op::MSTORE]);
+        call(&mut parent_code, child, 32, 64);
+        call(&mut parent_code, identity, 96, 8);
+        parent_code.extend([op::PUSH1, 72, op::PUSH1, 32, op::RETURN]);
+        // Returns the first calldata word and the calldata size.
+        let child_code = vec![
+            op::PUSH0,
+            op::CALLDATALOAD,
+            op::PUSH0,
+            op::MSTORE,
+            op::CALLDATASIZE,
+            op::PUSH1,
+            32,
+            op::MSTORE,
+            op::PUSH1,
+            64,
+            op::PUSH0,
+            op::RETURN,
+        ];
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            &child,
+            AccountInfo::default().with_code(legacy_bytecode(child_code)),
+        );
+        let (result, inspector, _) = run_evm_with_inspector_db(
+            db,
+            parent_code,
+            &MessageExt::default(),
+            1_000_000,
+            InputInspector::default(),
+        );
+
+        let input = &word[4..12];
+        let mut expected_output = [0; 72];
+        expected_output[..8].copy_from_slice(input);
+        expected_output[63] = 8;
+        expected_output[64..].copy_from_slice(input);
+        assert_eq!(result.stop, InstrStop::Return);
+        assert_eq!(result.output.as_ref(), expected_output);
+        let input = Bytes::copy_from_slice(input);
+        assert_eq!(inspector.call_inputs, [Bytes::new(), input.clone(), input]);
+    }
+
     #[test]
     fn isolated_transaction_resets_transient_state_and_merges_storage() {
         let target = Address::with_last_byte(0xbb);

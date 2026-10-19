@@ -1,5 +1,7 @@
+use super::Memory;
 use crate::{BaseEvmTypes, EvmTypesHost, bytecode::Bytecode};
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
+use core::ops::Range;
 
 /// EVM message kind.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -26,6 +28,104 @@ impl MessageKind {
     pub const fn is_create(&self) -> bool {
         matches!(self, Self::Create | Self::Create2)
     }
+}
+
+/// Input data of a [`Message`].
+///
+/// `CALL`-family instructions do not copy their input out of the caller's memory: the message
+/// carries the [`SharedBuffer`](Self::SharedBuffer) range instead, which stays valid because the
+/// caller frame is suspended until the message returns. Create messages and the top-level
+/// transaction message hold [`Bytes`](Self::Bytes).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CallInput {
+    /// Owned input bytes.
+    Bytes(Bytes),
+    /// Range of the memory of the frame that executes the message's `CALL`-family instruction.
+    ///
+    /// Call hooks receive that frame as their interpreter argument; resolve the range with
+    /// [`CallInput::as_bytes`] on its memory. A running frame reads its own calldata with
+    /// [`Interpreter::input`](crate::interpreter::Interpreter::input) instead, since its memory
+    /// is not the caller's.
+    SharedBuffer(Range<usize>),
+}
+
+impl Default for CallInput {
+    #[inline]
+    fn default() -> Self {
+        Self::Bytes(Bytes::new())
+    }
+}
+
+impl From<Bytes> for CallInput {
+    #[inline]
+    fn from(bytes: Bytes) -> Self {
+        Self::Bytes(bytes)
+    }
+}
+
+impl CallInput {
+    /// Returns the length of the input in bytes.
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Bytes(bytes) => bytes.len(),
+            Self::SharedBuffer(range) => range.len(),
+        }
+    }
+
+    /// Returns whether the input is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns the owned bytes, or `None` for a shared-buffer input.
+    #[inline]
+    pub const fn as_owned(&self) -> Option<&Bytes> {
+        match self {
+            Self::Bytes(bytes) => Some(bytes),
+            Self::SharedBuffer(_) => None,
+        }
+    }
+
+    /// Returns the input bytes, resolving a shared-buffer range against `caller_memory`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a shared-buffer range is out of bounds of `caller_memory`, which means it is not
+    /// the memory of the frame that created the message.
+    #[inline]
+    #[track_caller]
+    pub fn as_bytes<'a>(&'a self, caller_memory: &'a Memory) -> &'a [u8] {
+        match self {
+            Self::Bytes(bytes) => bytes,
+            Self::SharedBuffer(range) => match caller_memory.as_slice().get(range.clone()) {
+                Some(bytes) => bytes,
+                None => shared_buffer_out_of_bounds(range, caller_memory.len()),
+            },
+        }
+    }
+
+    /// Returns the input as owned bytes, copying a shared-buffer range out of `caller_memory`.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same condition as [`CallInput::as_bytes`].
+    #[inline]
+    #[track_caller]
+    pub fn to_bytes(&self, caller_memory: &Memory) -> Bytes {
+        match self {
+            Self::Bytes(bytes) => bytes.clone(),
+            Self::SharedBuffer(_) => Bytes::copy_from_slice(self.as_bytes(caller_memory)),
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+#[track_caller]
+fn shared_buffer_out_of_bounds(range: &Range<usize>, len: usize) -> ! {
+    panic!("shared call input {range:?} is out of bounds of the caller memory (len {len})")
 }
 
 /// Frame-local EVM call/create message executed by the interpreter for an EVM type family.
@@ -62,7 +162,7 @@ pub struct MessageExt<E = ()> {
     /// Immediate caller.
     pub caller: Address,
     /// Call input data, or initcode for create messages.
-    pub input: Bytes,
+    pub input: CallInput,
     /// Value transferred with the message.
     pub value: U256,
     /// Bytecode this frame executes: the code at [`MessageExt::code_address`] (the resolved

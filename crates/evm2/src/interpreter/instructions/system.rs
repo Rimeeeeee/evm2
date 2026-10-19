@@ -5,8 +5,8 @@ use crate::{
     bytecode::Bytecode,
     constants::CALL_DEPTH_LIMIT,
     interpreter::{
-        Gas, Host, InstrStop, InterpreterState, Message, MessageExt, MessageKind, Result, StackMut,
-        Word, derive_create_destination,
+        CallInput, Gas, Host, InstrStop, InterpreterState, Message, MessageExt, MessageKind,
+        Result, StackMut, Word, derive_create_destination,
     },
     utils::WordExt,
     version::GasId,
@@ -191,7 +191,13 @@ fn prepare_call<T: EvmTypesHost>(
             kind == MessageKind::Call,
             local_gas_limit,
         )?;
-    let input = memory_range_bytes(state, input_range)?;
+    // The child reads its calldata straight from this frame's memory, which stays untouched until
+    // the call returns.
+    let input = if input_range.is_empty() {
+        CallInput::default()
+    } else {
+        CallInput::SharedBuffer(input_range)
+    };
 
     let current = state.message();
     let (destination, caller, call_value, code_address) = match kind {
@@ -387,7 +393,7 @@ fn create_inner<T: EvmTypesHost>(
         call_target: destination,
         caller,
         code: Bytecode::new_legacy(input.clone()),
-        input,
+        input: CallInput::Bytes(input),
         value,
         code_address: caller,
         disable_precompiles: false,
