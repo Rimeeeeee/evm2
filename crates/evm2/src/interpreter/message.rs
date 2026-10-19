@@ -33,10 +33,11 @@ impl MessageKind {
 
 /// Input data of a [`Message`].
 ///
-/// `CALL`-family instructions do not copy their input out of the caller's memory: the message
-/// carries the [`SharedBuffer`](Self::SharedBuffer) range instead, which stays valid because the
-/// caller frame is suspended until the message returns. Create messages and the top-level
-/// transaction message hold [`Bytes`](Self::Bytes).
+/// `CALL`-family instructions do not copy their input out of the caller's memory when the host
+/// runs the caller frame: the message carries the [`SharedBuffer`](Self::SharedBuffer) range
+/// instead, which stays valid because the caller frame is suspended until the message returns.
+/// Otherwise, and for create and top-level transaction messages, it holds
+/// [`Bytes`](Self::Bytes).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CallInput {
     /// Owned input bytes.

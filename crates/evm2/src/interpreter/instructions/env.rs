@@ -87,7 +87,7 @@ pub fn calldatacopy(cx: _, [memory_offset, data_offset, len]: [Word]) -> Result 
     let gas_params = unsafe { cx.state.gas_params_detached() };
     cx.gas.spend(gas_params.copy_cost(len))?;
     // SAFETY: The input lives in the message or the caller frame's memory, never in this frame's
-    // memory, which `copy_data` writes.
+    // memory, which `copy_data` writes; see `Interpreter::input`.
     let input = unsafe { cx.state.0.input.as_ref() };
     copy_data(cx.gas, &mut cx.state.0.memory, gas_params, memory_offset, data_offset, len, input)
 }

@@ -25,9 +25,12 @@ pub struct Interpreter<'frame, 'host, T: EvmTypesHost> {
     bytecode_ref: Option<BytecodeRef<'static>>,
     pub(in crate::interpreter) memory: Memory,
     pub(in crate::interpreter) return_data: Bytes,
-    // Calldata of the active frame: borrows either `message.input` or the caller frame's memory,
-    // both of which outlive the frame. Reset before pooling; accessors shorten the erased
-    // lifetime to the borrow of this interpreter.
+    // Calldata of the active frame: borrows either `message.input`, which the frame's `&Message`
+    // keeps immutable, or the caller frame's memory. The caller is suspended in the call
+    // instruction until this frame is pooled, and `Evm::run_interpreter` registers this frame as
+    // the running frame before any hook can run for it, so no hook or nested message can reach
+    // the caller's memory meanwhile. Reset before pooling; accessors shorten the erased lifetime
+    // to the borrow of this interpreter.
     pub(in crate::interpreter) input: NonNull<[u8]>,
 
     pub(in crate::interpreter) pc: *const u8,
@@ -312,8 +315,8 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     /// memory.
     #[inline]
     pub const fn input(&self) -> &[u8] {
-        // SAFETY: `init` stores a slice that outlives the frame, and the caller frame cannot
-        // change its memory while this frame runs.
+        // SAFETY: `init` stores a slice that stays valid until the frame is pooled, which resets
+        // it; see the field.
         unsafe { self.input.as_ref() }
     }
 
