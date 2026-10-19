@@ -192,11 +192,13 @@ fn prepare_call<T: EvmTypesHost>(
             local_gas_limit,
         )?;
     // The child reads its calldata straight from this frame's memory, which stays untouched until
-    // the call returns.
+    // the call returns, if the host runs this frame; otherwise the input is copied.
     let input = if input_range.is_empty() {
         CallInput::default()
-    } else {
+    } else if state.is_running_frame() {
         CallInput::SharedBuffer(input_range)
+    } else {
+        CallInput::Bytes(memory_range_bytes(state, input_range)?)
     };
 
     let current = state.message();

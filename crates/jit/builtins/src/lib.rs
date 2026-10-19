@@ -13,7 +13,7 @@ extern crate alloc;
 extern crate tracing;
 
 use alloy_primitives::{Address, B256, Bytes, KECCAK256_EMPTY, U256, keccak256};
-use core::cmp::min;
+use core::{cmp::min, ptr};
 use evm2::{
     bytecode::Bytecode,
     constants::{BLOCK_HASH_HISTORY, CALL_DEPTH_LIMIT},
@@ -721,7 +721,12 @@ pub unsafe extern "C" fn __revmc_builtin_call(
     let input = if in_len != 0 {
         let in_offset = word_to_usize(in_offset.to_u256())?;
         ensure_memory(ecx, in_offset, in_len)?;
-        CallInput::SharedBuffer(in_offset..in_offset + in_len)
+        let frame = ptr::from_ref(ecx.interpreter());
+        if ecx.host().is_running_frame(frame) {
+            CallInput::SharedBuffer(in_offset..in_offset + in_len)
+        } else {
+            CallInput::Bytes(Bytes::copy_from_slice(ecx.memory().slice(in_offset, in_len)))
+        }
     } else {
         CallInput::default()
     };
@@ -1142,14 +1147,15 @@ mod tests {
 
         {
             let mut frame = prepare_frame(&mut interpreter, &mut host);
+            frame.ecx.memory_mut().resize(0, 16).unwrap();
+            frame.ecx.memory_mut().set(4, b"in");
             frame.stack.set(0, EvmWord::from(Word::from(2)));
             frame.stack.set(1, EvmWord::from(Word::from(8)));
-            frame.stack.set(2, EvmWord::ZERO);
-            frame.stack.set(3, EvmWord::ZERO);
+            frame.stack.set(2, EvmWord::from(Word::from(2)));
+            frame.stack.set(3, EvmWord::from(Word::from(4)));
             frame.stack.set(4, EvmWord::ZERO);
             frame.stack.set(5, address_word(&target));
             frame.stack.set(6, EvmWord::from(Word::from(50_000)));
-            frame.ecx.memory_mut().resize(0, 16).unwrap();
 
             let sp = frame.stack.as_mut_ptr();
             unsafe { __revmc_builtin_call(&mut frame.ecx, sp, CallKind::Call) };
@@ -1170,6 +1176,7 @@ mod tests {
         assert_eq!(inspector.calls[0].kind, MessageKind::Call);
         assert_eq!(inspector.calls[0].destination, target);
         assert_eq!(inspector.calls[0].caller, caller);
+        assert_eq!(inspector.calls[0].input.as_owned().unwrap().as_ref(), b"in");
         assert!(!inspector.call_static_flags[0]);
     }
 

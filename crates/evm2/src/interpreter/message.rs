@@ -1,5 +1,6 @@
 use super::Memory;
 use crate::{BaseEvmTypes, EvmTypesHost, bytecode::Bytecode};
+use alloc::vec;
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use core::ops::Range;
 
@@ -108,15 +109,24 @@ impl CallInput {
 
     /// Returns the input as owned bytes, copying a shared-buffer range out of `caller_memory`.
     ///
-    /// # Panics
-    ///
-    /// Panics under the same condition as [`CallInput::as_bytes`].
+    /// Bytes of the range that `caller_memory` does not hold read as zero.
     #[inline]
-    #[track_caller]
     pub fn to_bytes(&self, caller_memory: &Memory) -> Bytes {
+        self.to_bytes_from(caller_memory.as_slice())
+    }
+
+    /// Like [`CallInput::to_bytes`], for the bytes of the caller's memory.
+    pub(crate) fn to_bytes_from(&self, caller_memory: &[u8]) -> Bytes {
         match self {
             Self::Bytes(bytes) => bytes.clone(),
-            Self::SharedBuffer(_) => Bytes::copy_from_slice(self.as_bytes(caller_memory)),
+            Self::SharedBuffer(range) => {
+                let mut bytes = vec![0; range.len()];
+                let end = range.end.min(caller_memory.len());
+                if let Some(available) = caller_memory.get(range.start..end) {
+                    bytes[..available.len()].copy_from_slice(available);
+                }
+                bytes.into()
+            }
         }
     }
 }

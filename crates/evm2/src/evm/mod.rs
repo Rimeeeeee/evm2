@@ -240,13 +240,16 @@ pub struct Evm<'a, T: EvmTypesHost> {
 impl<'a, T: EvmTypesHost> Evm<'a, T> {
     /// Returns the bytes of a message's call input.
     ///
-    /// A [`CallInput::SharedBuffer`] range resolves against the memory of the frame that is
-    /// running while the message executes: the one that issued the call, as seen by call hooks and
-    /// precompiles. A frame reads its own calldata with [`Interpreter::input`] instead.
+    /// A [`CallInput::SharedBuffer`] range resolves against the memory of the running frame: the
+    /// one that issued the call, as seen by call hooks and precompiles. A frame reads its own
+    /// calldata with [`Interpreter::input`] instead.
     ///
     /// # Panics
     ///
-    /// Panics if the input is a shared-buffer range and no frame is running.
+    /// Panics if the input is a shared-buffer range and no frame is running, or if the range is
+    /// out of bounds of the running frame's memory. The EVM resolves out-of-bounds ranges before it
+    /// executes a message, so only a precompile that resizes the caller's memory through a nested
+    /// message's hooks and then reads its input again can hit the latter.
     #[inline]
     #[track_caller]
     pub fn call_input<'b>(&'b self, input: &'b CallInput) -> &'b [u8] {
@@ -255,10 +258,39 @@ impl<'a, T: EvmTypesHost> Evm<'a, T> {
             CallInput::SharedBuffer(_) => {
                 let frame = self.current_frame.expect("shared call input without a running frame");
                 // SAFETY: `current_frame` points to the running frame, which outlives this borrow
-                // of the EVM.
+                // of the EVM. The slice borrows the EVM, so no hook, which needs `&mut self` to
+                // be reached, can resize the frame's memory while it is alive.
                 input.as_bytes(unsafe { frame.as_ref() }.memory())
             }
         }
+    }
+
+    /// Returns the running frame's memory, or an empty slice if no frame is running.
+    #[inline]
+    fn running_frame_memory(&self) -> &[u8] {
+        // SAFETY: As in `call_input`.
+        self.current_frame.map_or(&[], |frame| unsafe { frame.as_ref() }.memory().as_slice())
+    }
+
+    /// Replaces a shared-buffer input that is out of bounds of the running frame's memory with
+    /// owned bytes, so that resolving it cannot fail.
+    ///
+    /// Hooks run between the call instruction and the execution of its message, and may edit the
+    /// message or shrink the caller's memory. Bytes the memory no longer holds read as zero, as
+    /// bytes past the end of memory do.
+    #[inline]
+    fn resolve_call_input(&self, message: &mut Message<T>) {
+        if let CallInput::SharedBuffer(range) = &message.input
+            && self.running_frame_memory().get(range.clone()).is_none()
+        {
+            self.pad_call_input(message);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn pad_call_input(&self, message: &mut Message<T>) {
+        message.input = CallInput::Bytes(message.input.to_bytes_from(self.running_frame_memory()));
     }
 }
 
@@ -965,6 +997,10 @@ impl<'guard, 'evm, T: EvmTypesHost> Drop for ExecutionGuard<'guard, 'evm, T> {
     #[inline]
     fn drop(&mut self) {
         self.evm.running = self.was_running;
+        if !self.was_running {
+            // After an unwind out of a hook, the running frame is gone.
+            self.evm.current_frame = None;
+        }
     }
 }
 
@@ -1119,6 +1155,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         tx_env: &TxEnv<T>,
         message: &mut Message<T>,
     ) -> Result<MessageResult<T>, ExecutionError> {
+        self.resolve_call_input(message);
         let mut result = match message.kind {
             MessageKind::Create | MessageKind::Create2 => {
                 self.execute_create_message(tx_env, message)
@@ -1158,6 +1195,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         let is_create = matches!(message.kind, MessageKind::Create | MessageKind::Create2);
 
         let mut top_frame: Option<Box<Interpreter<'frame, 'a, T>>> = None;
+        let mut top_input: Option<Bytes> = None;
         let frame = match guard.evm.current_frame {
             // SAFETY: The parent frame is suspended on this call stack for the duration of the
             // message execution.
@@ -1170,9 +1208,10 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
             None => {
                 // SAFETY: The message outlives the frame, which is returned to the pool below.
                 let frame_message = unsafe { trustme::decouple_lt(&*message) };
-                let input = guard.evm.call_input(&message.input);
-                // SAFETY: The message owns the input and outlives the frame.
-                let input = unsafe { trustme::decouple_lt(input) };
+                // The hooks may replace the message's input, so the frame keeps its own handle.
+                let input = top_input.insert(message.input.as_owned().cloned().unwrap_or_default());
+                // SAFETY: `top_input` outlives the frame, which is returned to the pool below.
+                let input = unsafe { trustme::decouple_lt(input.as_ref()) };
                 let frame =
                     top_frame.insert(guard.evm.interpreter_pool.pop(tx_env, frame_message, input));
                 frame.prepare_run(guard.evm);
@@ -1501,23 +1540,27 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     ) -> Result<InstrStop, ExecutionError> {
         let guard = self.enter_execution();
         let input = guard.evm.call_input(&message.input);
-        // SAFETY: The input lives in the message or in the caller frame's memory. The caller frame
-        // is suspended in the call instruction that created the message until this one returns,
-        // so it cannot resize its memory meanwhile.
+        // SAFETY: The input lives in the message or in the caller frame's memory, and the frame
+        // keeps reading it until it is pooled below. Nothing can write or resize the caller's
+        // memory until then: the caller is suspended in the call instruction that created the
+        // message, and the new frame is registered as the running frame before any hook can run
+        // on its behalf, so hooks and nested messages reach the new frame rather than the caller.
+        // Hooks that ran on the caller before this point are done, and `resolve_call_input`
+        // checked the range after them.
         let input = unsafe { trustme::decouple_lt(input) };
         let mut interp: Box<Interpreter<'frame, 'a, T>> =
             guard.evm.interpreter_pool.pop(tx_env, message, input);
         let interp_ref = interp.as_mut();
+        let prev_frame = guard
+            .evm
+            .current_frame
+            .replace(NonNull::from(&mut *interp_ref).cast::<Interpreter<'static, 'static, T>>());
         guard.evm.inspect_initialize_interp(interp_ref);
         let inspector = guard.evm.inspector.as_deref_mut().map(|inspector| {
             // SAFETY: The inspector is stored in `self` and remains alive for the duration of the
             // interpreter run.
             unsafe { trustme::decouple_lt_mut(inspector) }
         });
-        let prev_frame = guard
-            .evm
-            .current_frame
-            .replace(NonNull::from(&mut *interp_ref).cast::<Interpreter<'static, 'static, T>>());
         let interpreter_runner = guard.evm.interpreter_runner.clone();
         let stop = if let Some(inspector) = inspector {
             interp_ref.run_inspect(guard.evm, inspector)
@@ -1553,6 +1596,11 @@ impl<'a, T: EvmTypes> Host<T> for Evm<'a, T> {
 
     fn execution_config(&self) -> &ExecutionConfig<T> {
         &self.execution_config
+    }
+
+    #[inline]
+    fn is_running_frame(&self, frame: *const Interpreter<'_, '_, T>) -> bool {
+        self.current_frame.is_some_and(|current| core::ptr::addr_eq(current.as_ptr(), frame))
     }
 
     fn block_env(&mut self) -> &BlockEnv<T> {

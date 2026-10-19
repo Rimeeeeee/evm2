@@ -586,6 +586,15 @@ impl<'frame, 'host, T: EvmTypesHost> InterpreterState<'frame, 'host, T> {
         unsafe { self.0.host.unwrap_unchecked().as_mut() }
     }
 
+    /// Returns whether the host runs this frame, so that it can resolve a range of this frame's
+    /// memory as call input.
+    #[inline]
+    pub(crate) fn is_running_frame(&self) -> bool {
+        // SAFETY: As in `host`.
+        let host = unsafe { self.0.host.unwrap_unchecked().as_ref() };
+        host.is_running_frame(&raw const self.0)
+    }
+
     /// Returns the active runtime version data.
     #[inline]
     pub fn version(&self) -> &Version {

@@ -1,4 +1,4 @@
-use super::{GasTracker, InstrStop, Message, Result, Word};
+use super::{GasTracker, InstrStop, Interpreter, Message, Result, Word};
 use crate::{
     BaseEvmTypes, DatabaseError, EvmFeatures, EvmTypesHost, ExecutionConfig, ExecutionError,
     HostError, SpecId,
@@ -170,6 +170,18 @@ pub trait Host<T: EvmTypesHost> {
     /// `LOG0`-`LOG4` pass `topics` and `data` borrowed from interpreter buffers, and other callers
     /// may pass owned values. The host copies borrowed values only if it keeps the log.
     fn log(&mut self, address: &Address, topics: Cow<'_, [B256]>, data: Cow<'_, [u8]>);
+
+    /// Returns whether `frame` is the frame this host is running.
+    ///
+    /// A call instruction passes its input to the host as a range of the caller's memory
+    /// ([`CallInput::SharedBuffer`](super::CallInput::SharedBuffer)) only when the host runs the
+    /// caller, since the host resolves the range against the running frame's memory. Otherwise it
+    /// copies the input out. `frame` is only compared, never dereferenced.
+    #[inline]
+    fn is_running_frame(&self, frame: *const Interpreter<'_, '_, T>) -> bool {
+        let _ = frame;
+        false
+    }
 
     /// Executes a message inside this host.
     fn execute_message(
