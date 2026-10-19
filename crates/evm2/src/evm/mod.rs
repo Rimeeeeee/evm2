@@ -241,26 +241,16 @@ impl<'a, T: EvmTypesHost> Evm<'a, T> {
     /// Returns the bytes of a message's call input.
     ///
     /// A [`CallInput::SharedBuffer`] range resolves against the memory of the running frame: the
-    /// one that issued the call, as seen by call hooks and precompiles. A frame reads its own
-    /// calldata with [`Interpreter::input`] instead.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the input is a shared-buffer range and no frame is running, or if the range is
-    /// out of bounds of the running frame's memory. The EVM resolves out-of-bounds ranges before it
-    /// executes a message, so only a precompile that resizes the caller's memory through a nested
-    /// message's hooks and then reads its input again can hit the latter.
+    /// one that issued the call, as seen by call hooks and precompiles. This never fails: bytes the
+    /// memory does not hold, or all of them if no frame is running, read as zero. A range inside
+    /// the memory is copied, so that a frame the caller can still reach cannot invalidate the
+    /// result. A frame reads its own calldata with [`Interpreter::input`] instead.
     #[inline]
-    #[track_caller]
-    pub fn call_input<'b>(&'b self, input: &'b CallInput) -> &'b [u8] {
+    pub fn call_input<'b>(&'b self, input: &'b CallInput) -> Cow<'b, [u8]> {
         match input {
-            CallInput::Bytes(bytes) => bytes,
+            CallInput::Bytes(bytes) => Cow::Borrowed(bytes),
             CallInput::SharedBuffer(_) => {
-                let frame = self.current_frame.expect("shared call input without a running frame");
-                // SAFETY: `current_frame` points to the running frame, which outlives this borrow
-                // of the EVM. The slice borrows the EVM, so no hook, which needs `&mut self` to
-                // be reached, can resize the frame's memory while it is alive.
-                input.as_bytes(unsafe { frame.as_ref() }.memory())
+                Cow::Owned(input.to_bytes_from(self.running_frame_memory()).into())
             }
         }
     }
@@ -268,28 +258,36 @@ impl<'a, T: EvmTypesHost> Evm<'a, T> {
     /// Returns the running frame's memory, or an empty slice if no frame is running.
     #[inline]
     fn running_frame_memory(&self) -> &[u8] {
-        // SAFETY: As in `call_input`.
+        // SAFETY: `current_frame` points to the running frame, which outlives this borrow of the
+        // EVM, and it is cleared when the frame is. The slice borrows the EVM, so hooks, which need
+        // `&mut self` to be reached, cannot run while it is alive. Safe code that holds its own
+        // `&mut` to the frame (a runner, a hook) cannot invalidate a slice that does not escape
+        // this module: callers copy it or, in `run_interpreter`, rely on the contract of
+        // `Host::execute_shared_message`.
         self.current_frame.map_or(&[], |frame| unsafe { frame.as_ref() }.memory().as_slice())
     }
 
-    /// Replaces a shared-buffer input that is out of bounds of the running frame's memory with
-    /// owned bytes, so that resolving it cannot fail.
+    /// Makes the call input of a message about to execute safe to read until the message returns.
     ///
-    /// Hooks run between the call instruction and the execution of its message, and may edit the
-    /// message or shrink the caller's memory. Bytes the memory no longer holds read as zero, as
-    /// bytes past the end of memory do.
+    /// A shared-buffer range stays shared only if `keep_shared`, a frame is running and the range
+    /// is inside its memory. Otherwise it becomes owned bytes, zero-padded for what the memory does
+    /// not hold, so that resolving it later cannot fail. This runs after the last point where a
+    /// hook can run on the caller (the call hooks, the EIP-7708 transfer log) and before the
+    /// message is dispatched, with no hook in between.
     #[inline]
-    fn resolve_call_input(&self, message: &mut Message<T>) {
+    fn resolve_call_input(&self, message: &mut Message<T>, keep_shared: bool) {
         if let CallInput::SharedBuffer(range) = &message.input
-            && self.running_frame_memory().get(range.clone()).is_none()
+            && !(keep_shared
+                && self.current_frame.is_some()
+                && self.running_frame_memory().get(range.clone()).is_some())
         {
-            self.pad_call_input(message);
+            self.own_call_input(message);
         }
     }
 
     #[cold]
     #[inline(never)]
-    fn pad_call_input(&self, message: &mut Message<T>) {
+    fn own_call_input(&self, message: &mut Message<T>) {
         message.input = CallInput::Bytes(message.input.to_bytes_from(self.running_frame_memory()));
     }
 }
@@ -988,6 +986,33 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     }
 }
 
+/// Registers a frame as the running frame and restores the previous one when dropped, including
+/// on unwind, before the frame is destroyed.
+struct RunningFrame<T: EvmTypesHost> {
+    slot: *mut Option<NonNull<Interpreter<'static, 'static, T>>>,
+    prev: Option<NonNull<Interpreter<'static, 'static, T>>>,
+}
+
+impl<T: EvmTypesHost> RunningFrame<T> {
+    #[inline]
+    const fn new(
+        slot: *mut Option<NonNull<Interpreter<'static, 'static, T>>>,
+        frame: NonNull<Interpreter<'static, 'static, T>>,
+    ) -> Self {
+        // SAFETY: `slot` is `Evm::current_frame`, and the guard is dropped before the EVM is.
+        let prev = unsafe { slot.replace(Some(frame)) };
+        Self { slot, prev }
+    }
+}
+
+impl<T: EvmTypesHost> Drop for RunningFrame<T> {
+    #[inline]
+    fn drop(&mut self) {
+        // SAFETY: As in `new`.
+        unsafe { *self.slot = self.prev };
+    }
+}
+
 struct ExecutionGuard<'guard, 'evm, T: EvmTypesHost> {
     evm: &'guard mut Evm<'evm, T>,
     was_running: bool,
@@ -1150,12 +1175,31 @@ impl<'a, T: EvmTypes<Tx: Typed2718>> Evm<'a, T> {
 
 impl<'a, T: EvmTypes> Evm<'a, T> {
     #[inline]
+    fn execute_message_with(
+        &mut self,
+        tx_env: &TxEnv<T>,
+        message: &mut Message<T>,
+        shared: bool,
+    ) -> Result<MessageResult<T>, ExecutionError> {
+        let checkpoint = self.state.checkpoint();
+        let result = if self.inspector.is_some() {
+            self.execute_message_inspected(tx_env, message, shared)
+        } else {
+            self.execute_message_impl(tx_env, message, shared)
+        };
+        if result.is_err() {
+            self.state.rollback(checkpoint, self.features);
+        }
+        result
+    }
+
+    #[inline]
     fn execute_message_impl(
         &mut self,
         tx_env: &TxEnv<T>,
         message: &mut Message<T>,
+        shared: bool,
     ) -> Result<MessageResult<T>, ExecutionError> {
-        self.resolve_call_input(message);
         let mut result = match message.kind {
             MessageKind::Create | MessageKind::Create2 => {
                 self.execute_create_message(tx_env, message)
@@ -1163,7 +1207,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
             MessageKind::Call
             | MessageKind::CallCode
             | MessageKind::DelegateCall
-            | MessageKind::StaticCall => self.execute_call_message(tx_env, message),
+            | MessageKind::StaticCall => self.execute_call_message(tx_env, message, shared),
         }?;
         // Settle the returning frame's gas for its stop reason at this single exit,
         // rather than in each result builder, so every consumer (parent
@@ -1181,10 +1225,11 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         &mut self,
         tx_env: &'frame TxEnv<T>,
         message: &'frame mut Message<T>,
+        shared: bool,
     ) -> Result<MessageResult<T>, ExecutionError> {
         let guard = self.enter_execution();
         let Some(inspector) = guard.evm.inspector.as_deref_mut() else {
-            return guard.evm.execute_message_impl(tx_env, message);
+            return guard.evm.execute_message_impl(tx_env, message, shared);
         };
         // SAFETY: The inspector is stored in `self`; the execution guard prevents inspector
         // replacement while the hooks are running.
@@ -1230,7 +1275,9 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         let mut result = if let Some(error) = frame.take_error() {
             Err(error)
         } else {
-            inspected.map(Ok).unwrap_or_else(|| guard.evm.execute_message_impl(tx_env, message))
+            inspected
+                .map(Ok)
+                .unwrap_or_else(|| guard.evm.execute_message_impl(tx_env, message, shared))
         };
 
         if let Ok(result) = &mut result {
@@ -1425,6 +1472,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         &mut self,
         tx_env: &TxEnv<T>,
         message: &mut Message<T>,
+        shared: bool,
     ) -> Result<MessageResult<T>, ExecutionError> {
         if message.depth > CALL_DEPTH_LIMIT {
             return Ok(Self::error_message_result(
@@ -1448,7 +1496,9 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
             }
             self.log_eip7708_transfer(&message.caller, &message.destination, &message.value);
         }
-        if self.contains_precompile(message) {
+        let is_precompile = self.contains_precompile(message);
+        self.resolve_call_input(message, shared && !is_precompile);
+        if is_precompile {
             return self.execute_call_precompile(checkpoint, message);
         }
         let stop = self.run_interpreter(tx_env, message)?;
@@ -1539,22 +1589,31 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         message: &'frame Message<T>,
     ) -> Result<InstrStop, ExecutionError> {
         let guard = self.enter_execution();
-        let input = guard.evm.call_input(&message.input);
-        // SAFETY: The input lives in the message or in the caller frame's memory, and the frame
-        // keeps reading it until it is pooled below. Nothing can write or resize the caller's
-        // memory until then: the caller is suspended in the call instruction that created the
-        // message, and the new frame is registered as the running frame before any hook can run
-        // on its behalf, so hooks and nested messages reach the new frame rather than the caller.
-        // Hooks that ran on the caller before this point are done, and `resolve_call_input`
-        // checked the range after them.
+        let input = match &message.input {
+            CallInput::Bytes(bytes) => bytes.as_ref(),
+            CallInput::SharedBuffer(range) => guard
+                .evm
+                .running_frame_memory()
+                .get(range.clone())
+                .expect("`resolve_call_input` kept a range inside the running frame's memory"),
+        };
+        // SAFETY: The input lives in the message, which `&Message` keeps immutable, or in the
+        // memory of the running frame, which is the caller: `resolve_call_input` kept a shared
+        // range only for a message from `Host::execute_shared_message`, whose caller is suspended
+        // in the call instruction that created it, and checked the range after the last hook that
+        // can run on the caller, with no user code between that check and here. The frame keeps
+        // reading the input until it is pooled below, and until then nothing can write or resize
+        // the caller's memory: the new frame is registered as the running frame before any hook
+        // can run on its behalf, so hooks and nested messages reach the new frame rather than the
+        // caller, and a message sent through the safe `Host::execute_message` never keeps a range.
         let input = unsafe { trustme::decouple_lt(input) };
         let mut interp: Box<Interpreter<'frame, 'a, T>> =
             guard.evm.interpreter_pool.pop(tx_env, message, input);
         let interp_ref = interp.as_mut();
-        let prev_frame = guard
-            .evm
-            .current_frame
-            .replace(NonNull::from(&mut *interp_ref).cast::<Interpreter<'static, 'static, T>>());
+        let running = RunningFrame::new(
+            &raw mut guard.evm.current_frame,
+            NonNull::from(&mut *interp_ref).cast::<Interpreter<'static, 'static, T>>(),
+        );
         guard.evm.inspect_initialize_interp(interp_ref);
         let inspector = guard.evm.inspector.as_deref_mut().map(|inspector| {
             // SAFETY: The inspector is stored in `self` and remains alive for the duration of the
@@ -1571,7 +1630,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         } else {
             interp_ref.run(guard.evm)
         };
-        guard.evm.current_frame = prev_frame;
+        drop(running);
         guard.evm.interpreter_pool.push(interp);
         stop
     }
@@ -1735,16 +1794,16 @@ impl<'a, T: EvmTypes> Host<T> for Evm<'a, T> {
         tx_env: &TxEnv<T>,
         message: &mut Message<T>,
     ) -> Result<MessageResult<T>, ExecutionError> {
-        let checkpoint = self.state.checkpoint();
-        let result = if self.inspector.is_some() {
-            self.execute_message_inspected(tx_env, message)
-        } else {
-            self.execute_message_impl(tx_env, message)
-        };
-        if result.is_err() {
-            self.state.rollback(checkpoint, self.features);
-        }
-        result
+        self.execute_message_with(tx_env, message, false)
+    }
+
+    #[inline]
+    unsafe fn execute_shared_message(
+        &mut self,
+        tx_env: &TxEnv<T>,
+        message: &mut Message<T>,
+    ) -> Result<MessageResult<T>, ExecutionError> {
+        self.execute_message_with(tx_env, message, true)
     }
 
     fn selfdestruct(

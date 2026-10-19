@@ -249,8 +249,15 @@ fn call_inner<T: EvmTypesHost>(
         prepare_call(stack.reborrow(), gas, state, kind, &mut message, &mut return_memory_range)?;
 
     let tx_env = state.tx();
-    let mut result =
-        state.host().execute_message(tx_env, &mut message).map_err(|error| state.fail(error))?;
+    let shared = matches!(message.input, CallInput::SharedBuffer(_));
+    let result = if shared {
+        // SAFETY: `prepare_call` only makes a shared input if the host runs this frame. This frame
+        // is suspended here, and nothing else reaches its memory until the call returns.
+        unsafe { state.host().execute_shared_message(tx_env, &mut message) }
+    } else {
+        state.host().execute_message(tx_env, &mut message)
+    };
+    let mut result = result.map_err(|error| state.fail(error))?;
     if result.stop.is_fatal() {
         return Err(result.stop);
     }

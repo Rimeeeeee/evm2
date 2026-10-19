@@ -449,7 +449,7 @@ macro_rules! define_precompiles {
                     message: &$crate::interpreter::Message<T>,
                     gas: &mut $crate::interpreter::GasTracker,
                 ) -> $crate::precompiles::PrecompileResult {
-                    $f(evm.call_input(&message.input), gas)
+                    $f(&evm.call_input(&message.input), gas)
                 }
 
                 $crate::precompiles::Precompile::new(

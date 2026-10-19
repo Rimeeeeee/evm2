@@ -183,7 +183,33 @@ pub trait Host<T: EvmTypesHost> {
         false
     }
 
+    /// Executes a message whose call input may be a
+    /// [`CallInput::SharedBuffer`](super::CallInput::SharedBuffer) of the running frame's memory.
+    ///
+    /// The host reads the range in place for the duration of the message, so, unlike
+    /// [`Host::execute_message`], which copies any shared range it is given, nothing may reach
+    /// that memory meanwhile. The default implementation does not support shared input and runs
+    /// the message like [`Host::execute_message`].
+    ///
+    /// # Safety
+    ///
+    /// The caller must be the call instruction of the frame for which
+    /// [`Host::is_running_frame`] returned `true`, running with that frame suspended in it and
+    /// no other reference to the frame's memory alive until this method returns, and the message's
+    /// input must be a range of that memory or owned bytes.
+    #[inline]
+    unsafe fn execute_shared_message(
+        &mut self,
+        tx_env: &TxEnv<T>,
+        message: &mut Message<T>,
+    ) -> Result<MessageResult<T>, ExecutionError> {
+        self.execute_message(tx_env, message)
+    }
+
     /// Executes a message inside this host.
+    ///
+    /// A shared call input in `message` is copied out of the running frame's memory before the
+    /// message executes.
     fn execute_message(
         &mut self,
         tx_env: &TxEnv<T>,

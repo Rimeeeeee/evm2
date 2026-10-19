@@ -1727,6 +1727,181 @@ mod tests {
         assert_eq!(inspector.call_inputs, [const { Bytes::from_static(&[0; 8]) }; 2]);
     }
 
+    /// The EIP-7708 transfer log is emitted between the call hooks and the execution of the
+    /// message. A hook for it that shrinks the caller's memory through a nested message leaves the
+    /// child with zeros for the bytes the memory no longer holds.
+    #[test]
+    fn log_hook_shrinking_caller_memory_zero_pads_input() {
+        const SHRINK_DEPTH: u16 = 5;
+
+        #[derive(Default)]
+        struct LogShrinkInspector {
+            shrunk: bool,
+            child_outputs: Vec<Bytes>,
+        }
+        impl Inspector<BaseEvmTypes> for LogShrinkInspector {
+            fn log(&mut self, _log: &Log, host: &mut Evm<'_, BaseEvmTypes>) {
+                let identity = Address::with_last_byte(4);
+                let mut message = MessageExt {
+                    depth: SHRINK_DEPTH,
+                    gas_limit: 1_000,
+                    destination: identity,
+                    call_target: identity,
+                    code_address: identity,
+                    ..MessageExt::default()
+                };
+                Host::execute_message(host, &TxEnvExt::default(), &mut message).unwrap();
+            }
+
+            fn call(
+                &mut self,
+                interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+                message: &mut Message<BaseEvmTypes>,
+            ) -> Option<MessageResult<BaseEvmTypes>> {
+                if message.depth == SHRINK_DEPTH {
+                    interp.memory_mut().clear();
+                    self.shrunk = true;
+                }
+                None
+            }
+
+            fn call_end(
+                &mut self,
+                _interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+                message: &Message<BaseEvmTypes>,
+                result: &mut MessageResult<BaseEvmTypes>,
+            ) {
+                if message.depth == 1 {
+                    self.child_outputs.push(result.output.clone());
+                }
+            }
+        }
+
+        let parent = Address::ZERO;
+        let child = Address::with_last_byte(0xbb);
+        let mut parent_code = vec![op::PUSH32];
+        parent_code.extend(core::array::from_fn::<u8, 32, _>(|i| i as u8 + 1));
+        parent_code.extend([op::PUSH0, op::MSTORE]);
+        push_all(
+            &mut parent_code,
+            [
+                Word::ZERO,
+                Word::ZERO,
+                Word::from(8),
+                Word::from(4),
+                Word::from(1),
+                address_to_word(&child),
+                Word::from(100_000),
+            ],
+        );
+        parent_code.extend([op::CALL, op::STOP]);
+        let child_code = vec![
+            op::PUSH0,
+            op::CALLDATALOAD,
+            op::PUSH0,
+            op::MSTORE,
+            op::CALLDATASIZE,
+            op::PUSH1,
+            32,
+            op::MSTORE,
+            op::PUSH1,
+            64,
+            op::PUSH0,
+            op::RETURN,
+        ];
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(&parent, AccountInfo::default().with_balance(Word::from(10)));
+        db.insert_account_info(
+            &child,
+            AccountInfo::default().with_code(legacy_bytecode(child_code)),
+        );
+        let (result, inspector, _) = run_evm_with_inspector_db_spec(
+            SpecId::AMSTERDAM,
+            db,
+            parent_code,
+            &MessageExt::default(),
+            1_000_000,
+            LogShrinkInspector::default(),
+        );
+
+        assert_eq!(result.stop, InstrStop::Stop);
+        assert!(inspector.shrunk);
+        let mut child_output = [0; 64];
+        child_output[63] = 8;
+        assert_eq!(inspector.child_outputs, [Bytes::copy_from_slice(&child_output)]);
+    }
+
+    /// A panic that unwinds out of a nested frame and is caught leaves the caller registered as
+    /// the running frame again.
+    #[test]
+    fn caught_unwind_restores_the_running_frame() {
+        #[derive(Default)]
+        struct UnwindInspector {
+            restored: Option<bool>,
+        }
+        impl Inspector<BaseEvmTypes> for UnwindInspector {
+            fn initialize_interp(&mut self, interp: &mut Interpreter<'_, '_, BaseEvmTypes>) {
+                if interp.message().depth == 2 {
+                    panic!("nested frame");
+                }
+            }
+
+            fn call(
+                &mut self,
+                interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+                message: &mut Message<BaseEvmTypes>,
+            ) -> Option<MessageResult<BaseEvmTypes>> {
+                if message.depth == 1 {
+                    let mut nested = MessageExt {
+                        depth: 2,
+                        gas_limit: 1_000,
+                        code: legacy_bytecode([op::STOP]),
+                        ..MessageExt::default()
+                    };
+                    let tx_env = TxEnvExt::default();
+                    let host = interp.host();
+                    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        Host::execute_message(host, &tx_env, &mut nested)
+                    }));
+                    assert!(unwound.is_err());
+                    let frame = &raw const *interp;
+                    self.restored = Some(interp.host().is_running_frame(frame));
+                }
+                None
+            }
+        }
+
+        let child = Address::with_last_byte(0xbb);
+        let mut parent_code = Vec::new();
+        push_all(
+            &mut parent_code,
+            [
+                Word::ZERO,
+                Word::ZERO,
+                Word::ZERO,
+                Word::ZERO,
+                Word::ZERO,
+                address_to_word(&child),
+                Word::from(100_000),
+            ],
+        );
+        parent_code.extend([op::CALL, op::STOP]);
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            &child,
+            AccountInfo::default().with_code(legacy_bytecode([op::STOP])),
+        );
+        let (result, inspector, _) = run_evm_with_inspector_db(
+            db,
+            parent_code,
+            &MessageExt::default(),
+            1_000_000,
+            UnwindInspector::default(),
+        );
+        assert_eq!(result.stop, InstrStop::Stop);
+        assert_eq!(inspector.restored, Some(true));
+    }
+
     /// Messages sent from `initialize_interp` come from the frame being initialized, so hooks for
     /// them cannot reach the caller whose memory the frame reads its input from.
     #[test]

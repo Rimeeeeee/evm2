@@ -26,11 +26,13 @@ pub struct Interpreter<'frame, 'host, T: EvmTypesHost> {
     pub(in crate::interpreter) memory: Memory,
     pub(in crate::interpreter) return_data: Bytes,
     // Calldata of the active frame: borrows either `message.input`, which the frame's `&Message`
-    // keeps immutable, or the caller frame's memory. The caller is suspended in the call
-    // instruction until this frame is pooled, and `Evm::run_interpreter` registers this frame as
-    // the running frame before any hook can run for it, so no hook or nested message can reach
-    // the caller's memory meanwhile. Reset before pooling; accessors shorten the erased lifetime
-    // to the borrow of this interpreter.
+    // keeps immutable, or the caller frame's memory. The latter only happens for a message sent by
+    // the caller's call instruction through `Host::execute_shared_message`: safe code, which uses
+    // `Host::execute_message`, always gets a copy. The caller is suspended in that instruction
+    // until this frame is pooled, and `Evm::run_interpreter` registers this frame as the running
+    // frame before any hook can run for it, so no hook or nested message can reach the caller's
+    // memory meanwhile. Reset before pooling; accessors shorten the erased lifetime to the borrow
+    // of this interpreter.
     pub(in crate::interpreter) input: NonNull<[u8]>,
 
     pub(in crate::interpreter) pc: *const u8,

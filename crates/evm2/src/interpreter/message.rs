@@ -1,6 +1,6 @@
 use super::Memory;
 use crate::{BaseEvmTypes, EvmTypesHost, bytecode::Bytecode};
-use alloc::vec;
+use alloc::{borrow::Cow, vec, vec::Vec};
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use core::ops::Range;
 
@@ -35,9 +35,15 @@ impl MessageKind {
 ///
 /// `CALL`-family instructions do not copy their input out of the caller's memory when the host
 /// runs the caller frame: the message carries the [`SharedBuffer`](Self::SharedBuffer) range
-/// instead, which stays valid because the caller frame is suspended until the message returns.
-/// Otherwise, and for create and top-level transaction messages, it holds
-/// [`Bytes`](Self::Bytes).
+/// instead, and the callee reads the range in place, which is valid because the caller frame is
+/// suspended until the message returns. Otherwise, and for create and top-level transaction
+/// messages, it holds [`Bytes`](Self::Bytes).
+///
+/// Only the host's own call path reads a range in place. A range in a message that safe code sends
+/// with [`Host::execute_message`](super::Host::execute_message) is copied out first, and resolving
+/// one with [`CallInput::as_bytes`], [`CallInput::to_bytes`] or
+/// [`Evm::call_input`](crate::Evm::call_input) is total: a range that memory no longer covers, for
+/// example because a hook shrank it, reads as zeros.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CallInput {
     /// Owned input bytes.
@@ -92,18 +98,22 @@ impl CallInput {
 
     /// Returns the input bytes, resolving a shared-buffer range against `caller_memory`.
     ///
-    /// # Panics
-    ///
-    /// Panics if a shared-buffer range is out of bounds of `caller_memory`, which means it is not
-    /// the memory of the frame that created the message.
+    /// This never fails: bytes of the range that `caller_memory` does not hold read as zero, as
+    /// bytes past the end of memory do, which happens when a hook shrank the memory after the
+    /// range was made. Those are returned as owned bytes; a range inside the memory is borrowed.
     #[inline]
-    #[track_caller]
-    pub fn as_bytes<'a>(&'a self, caller_memory: &'a Memory) -> &'a [u8] {
+    pub fn as_bytes<'a>(&'a self, caller_memory: &'a Memory) -> Cow<'a, [u8]> {
+        self.as_bytes_from(caller_memory.as_slice())
+    }
+
+    /// Like [`CallInput::as_bytes`], for the bytes of the caller's memory.
+    #[inline]
+    pub(crate) fn as_bytes_from<'a>(&'a self, caller_memory: &'a [u8]) -> Cow<'a, [u8]> {
         match self {
-            Self::Bytes(bytes) => bytes,
-            Self::SharedBuffer(range) => match caller_memory.as_slice().get(range.clone()) {
-                Some(bytes) => bytes,
-                None => shared_buffer_out_of_bounds(range, caller_memory.len()),
+            Self::Bytes(bytes) => Cow::Borrowed(bytes),
+            Self::SharedBuffer(range) => match caller_memory.get(range.clone()) {
+                Some(bytes) => Cow::Borrowed(bytes),
+                None => Cow::Owned(pad_range(caller_memory, range)),
             },
         }
     }
@@ -120,23 +130,24 @@ impl CallInput {
     pub(crate) fn to_bytes_from(&self, caller_memory: &[u8]) -> Bytes {
         match self {
             Self::Bytes(bytes) => bytes.clone(),
-            Self::SharedBuffer(range) => {
-                let mut bytes = vec![0; range.len()];
-                let end = range.end.min(caller_memory.len());
-                if let Some(available) = caller_memory.get(range.start..end) {
-                    bytes[..available.len()].copy_from_slice(available);
-                }
-                bytes.into()
-            }
+            Self::SharedBuffer(_) => match self.as_bytes_from(caller_memory) {
+                Cow::Borrowed(bytes) => Bytes::copy_from_slice(bytes),
+                Cow::Owned(bytes) => bytes.into(),
+            },
         }
     }
 }
 
+/// Copies `range` out of `memory`, reading zero for the bytes `memory` does not hold.
 #[cold]
 #[inline(never)]
-#[track_caller]
-fn shared_buffer_out_of_bounds(range: &Range<usize>, len: usize) -> ! {
-    panic!("shared call input {range:?} is out of bounds of the caller memory (len {len})")
+fn pad_range(memory: &[u8], range: &Range<usize>) -> Vec<u8> {
+    let mut bytes = vec![0; range.len()];
+    let end = range.end.min(memory.len());
+    if let Some(available) = memory.get(range.start..end) {
+        bytes[..available.len()].copy_from_slice(available);
+    }
+    bytes
 }
 
 /// Frame-local EVM call/create message executed by the interpreter for an EVM type family.
