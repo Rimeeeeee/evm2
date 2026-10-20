@@ -592,6 +592,19 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
 }
 
 /// Interpreter state exposed to instruction implementations.
+///
+/// Instructions cannot replace the memory or set an output range beyond it:
+///
+/// ```compile_fail,E0624
+/// use evm2::{
+///     BaseEvmTypes,
+///     interpreter::{InterpreterState, Memory},
+/// };
+///
+/// fn instruction(state: &mut InterpreterState<'_, '_, BaseEvmTypes>) {
+///     *state.memory() = Memory::new();
+/// }
+/// ```
 #[repr(transparent)]
 pub struct InterpreterState<'frame, 'host, T: EvmTypesHost>(
     pub(crate) Interpreter<'frame, 'host, T>,
@@ -727,13 +740,13 @@ impl<'frame, 'host, T: EvmTypesHost> InterpreterState<'frame, 'host, T> {
 
     /// Returns linear memory.
     #[inline]
-    pub const fn memory(&mut self) -> &mut Memory {
+    pub(crate) const fn memory(&mut self) -> &mut Memory {
         &mut self.0.memory
     }
 
     /// Resizes linear memory using the active runtime gas parameters.
     #[inline]
-    pub fn resize_memory(&mut self, gas: &mut Gas, offset: usize, len: usize) -> Result {
+    pub(crate) fn resize_memory(&mut self, gas: &mut Gas, offset: usize, len: usize) -> Result {
         // SAFETY: Resizing memory makes no host calls.
         let gas_params = unsafe { self.gas_params_detached() };
         self.0.memory.resize_evm(gas, gas_params, offset, len)
@@ -771,7 +784,7 @@ impl<'frame, 'host, T: EvmTypesHost> InterpreterState<'frame, 'host, T> {
 
     /// Sets the current frame output memory range.
     #[inline]
-    pub const fn set_output(&mut self, output: Range<u32>) {
+    pub(crate) const fn set_output(&mut self, output: Range<u32>) {
         self.0.output = output;
     }
 
