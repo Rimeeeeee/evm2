@@ -867,14 +867,17 @@ mod tests {
     struct TestRunner(EvmCompilerFn);
 
     impl InterpreterRunner<BaseEvmTypes> for TestRunner {
-        fn run<'frame, 'host>(
+        unsafe fn run<'frame, 'host>(
             &self,
             interpreter: &mut Interpreter<'frame, 'host, BaseEvmTypes>,
             host: &mut Evm<'host, BaseEvmTypes>,
         ) -> Option<InstrStop> {
-            interpreter.prepare_run(host);
-            // SAFETY: The test functions only access this initialized interpreter's context.
-            Some(unsafe { self.0.call_with_interpreter(interpreter) })
+            // SAFETY: The caller passes a frame that is not running, and the test functions only
+            // access this initialized interpreter's context.
+            unsafe {
+                interpreter.prepare_run(host);
+                Some(self.0.call_with_interpreter(interpreter))
+            }
         }
     }
 

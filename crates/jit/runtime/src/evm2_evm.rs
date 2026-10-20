@@ -28,12 +28,13 @@ impl JitInterpreterRunner {
 
 impl InterpreterRunner<BaseEvmTypes> for JitInterpreterRunner {
     #[inline]
-    fn run<'frame, 'host>(
+    unsafe fn run<'frame, 'host>(
         &self,
         interpreter: &mut Interpreter<'frame, 'host, BaseEvmTypes>,
         host: &mut Evm<'host, BaseEvmTypes>,
     ) -> Option<InstrStop> {
-        run_interpreter(&self.backend, interpreter, host)
+        // SAFETY: Forwarded to the caller.
+        unsafe { run_interpreter(&self.backend, interpreter, host) }
     }
 }
 
@@ -41,8 +42,13 @@ impl InterpreterRunner<BaseEvmTypes> for JitInterpreterRunner {
 ///
 /// Returns `None` when no compiled program is available, leaving the caller to
 /// run the same frame through the evm2 interpreter.
+///
+/// # Safety
+///
+/// `interpreter` must be a frame that is not running, and `host` must be the EVM that executes
+/// it, as [`InterpreterRunner::run`] requires.
 #[inline]
-pub fn run_interpreter<'frame, 'host>(
+pub unsafe fn run_interpreter<'frame, 'host>(
     backend: &JitBackend,
     interpreter: &mut Interpreter<'frame, 'host, BaseEvmTypes>,
     host: &mut Evm<'host, BaseEvmTypes>,
@@ -63,8 +69,11 @@ pub fn run_interpreter<'frame, 'host>(
         LookupDecision::Unavailable(_) => return None,
     };
 
-    interpreter.prepare_run(host);
-    Some(unsafe { program.func.call_with_interpreter(interpreter) })
+    // SAFETY: The caller guarantees the frame is not running and `host` executes it.
+    unsafe {
+        interpreter.prepare_run(host);
+        Some(program.func.call_with_interpreter(interpreter))
+    }
 }
 
 #[cfg(test)]
@@ -88,6 +97,15 @@ mod tests {
         evm::{AccountInfo, InMemoryDB},
         interpreter::Word,
     };
+
+    fn run_fresh<'frame, 'host>(
+        backend: &JitBackend,
+        interpreter: &mut Interpreter<'frame, 'host, BaseEvmTypes>,
+        host: &mut Evm<'host, BaseEvmTypes>,
+    ) -> Option<InstrStop> {
+        // SAFETY: The tests create the interpreter right before this call, so it is not running.
+        unsafe { run_interpreter(backend, interpreter, host) }
+    }
 
     #[cfg(feature = "llvm")]
     const BYTECODE_RET42: &[u8] =
@@ -222,7 +240,7 @@ mod tests {
             Precompiles::base(SpecId::CANCUN),
         );
 
-        assert_eq!(run_interpreter(&JitBackend::disabled(), &mut interpreter, &mut host), None);
+        assert_eq!(run_fresh(&JitBackend::disabled(), &mut interpreter, &mut host), None);
     }
 
     #[test]
@@ -275,7 +293,7 @@ mod tests {
         let mut interpreter =
             unsafe { Interpreter::<BaseEvmTypes>::new_standalone(&tx_env, &message) };
 
-        assert_eq!(run_interpreter(&backend, &mut interpreter, &mut host), Some(InstrStop::Return));
+        assert_eq!(run_fresh(&backend, &mut interpreter, &mut host), Some(InstrStop::Return));
         assert_eq!(interpreter.output().len(), 32);
         assert_eq!(interpreter.output()[31], 0x42);
     }
@@ -335,7 +353,7 @@ mod tests {
         let mut interpreter =
             unsafe { Interpreter::<BaseEvmTypes>::new_standalone(&tx_env, &message) };
 
-        assert_eq!(run_interpreter(&backend, &mut interpreter, &mut host), Some(InstrStop::Return));
+        assert_eq!(run_fresh(&backend, &mut interpreter, &mut host), Some(InstrStop::Return));
         assert_eq!(interpreter.output().len(), 32);
         assert_eq!(interpreter.output()[31], 1);
     }
@@ -398,7 +416,7 @@ mod tests {
         let mut interpreter =
             unsafe { Interpreter::<BaseEvmTypes>::new_standalone(&tx_env, &message) };
 
-        assert_eq!(run_interpreter(&backend, &mut interpreter, &mut host), Some(InstrStop::Return));
+        assert_eq!(run_fresh(&backend, &mut interpreter, &mut host), Some(InstrStop::Return));
         assert_eq!(interpreter.output().len(), 32);
         assert_eq!(interpreter.output()[31], 0);
     }
@@ -470,7 +488,7 @@ mod tests {
         let mut interpreter =
             unsafe { Interpreter::<BaseEvmTypes>::new_standalone(&tx_env, &message) };
 
-        assert_eq!(run_interpreter(&backend, &mut interpreter, &mut host), Some(InstrStop::Stop));
+        assert_eq!(run_fresh(&backend, &mut interpreter, &mut host), Some(InstrStop::Stop));
         let beneficiary_balance = host.read_account_info(&beneficiary).unwrap().unwrap().balance;
         assert_eq!(beneficiary_balance, initial_beneficiary_balance);
     }
@@ -531,9 +549,10 @@ mod tests {
             let mut interpreter =
                 unsafe { Interpreter::<BaseEvmTypes>::new_standalone(&tx_env, &message) };
             let stop = if with_jit {
-                run_interpreter(&backend, &mut interpreter, &mut host).unwrap()
+                run_fresh(&backend, &mut interpreter, &mut host).unwrap()
             } else {
-                interpreter.run(&mut host).unwrap()
+                // SAFETY: The interpreter was just created and is not running.
+                unsafe { interpreter.run(&mut host) }.unwrap()
             };
             (stop, interpreter.gas().spent(), interpreter.gas().refunded())
         };

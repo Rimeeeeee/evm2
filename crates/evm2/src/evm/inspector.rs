@@ -10,6 +10,24 @@ use alloy_primitives::{Address, Log, U256};
 use auto_impl::auto_impl;
 
 /// EVM execution inspector.
+///
+/// Hooks receive the frame that is running, which they cannot run again:
+///
+/// ```compile_fail,E0624
+/// # use evm2::{BaseEvmTypes, Evm, Inspector, interpreter::Interpreter};
+/// # struct Noop;
+/// # impl Inspector<BaseEvmTypes> for Noop {}
+/// # fn new_host<'a>() -> Evm<'a, BaseEvmTypes> {
+/// #     unimplemented!()
+/// # }
+/// # struct Hook;
+/// impl Inspector<BaseEvmTypes> for Hook {
+///     fn step(&mut self, interp: &mut Interpreter<'_, '_, BaseEvmTypes>) {
+///         let mut host = new_host();
+///         let _ = interp.run_inspect(&mut host, &mut Noop);
+///     }
+/// }
+/// ```
 #[auto_impl(&mut, Box)]
 pub trait Inspector<T: EvmTypesHost>: NonStaticAny {
     /// Called after a frame interpreter has been initialized.
@@ -1641,5 +1659,65 @@ mod tests {
             assert_eq!(stop, Ok(expected));
             assert_eq!(interp.gas().remaining(), 1000);
         }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn caught_hook_panic_leaves_no_dangling_running_frame() {
+        struct PanicOnce {
+            armed: bool,
+            frame_code: Vec<Bytes>,
+        }
+
+        impl Inspector<BaseEvmTypes> for PanicOnce {
+            fn call(
+                &mut self,
+                interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+                _message: &mut Message<BaseEvmTypes>,
+            ) -> Option<MessageResult<BaseEvmTypes>> {
+                self.frame_code.push(interp.original_bytecode());
+                None
+            }
+
+            fn step(&mut self, _interp: &mut Interpreter<'_, '_, BaseEvmTypes>) {
+                if core::mem::take(&mut self.armed) {
+                    panic!("hook panicked while the frame was running");
+                }
+            }
+        }
+
+        let spec_id = SpecId::OSAKA;
+        let mut evm = Evm::<BaseEvmTypes>::new(
+            spec_id,
+            BlockEnvExt::default(),
+            TxRegistry::new(),
+            InMemoryDB::default(),
+            Precompiles::base(spec_id),
+        );
+        evm.set_inspector(PanicOnce { armed: true, frame_code: Vec::new() });
+        let tx_env = TxEnvExt::default();
+
+        let first_code = Vec::from([op::PUSH1, 1, op::POP, op::STOP]);
+        let mut message = MessageExt {
+            gas_limit: 100_000,
+            code: legacy_bytecode(first_code.clone()),
+            ..Default::default()
+        };
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Host::execute_message(&mut evm, &tx_env, &mut message)
+        }));
+        assert!(panicked.is_err());
+
+        let next_code = Vec::from([op::PUSH1, 2, op::POP, op::STOP]);
+        let mut message = MessageExt {
+            gas_limit: 100_000,
+            code: legacy_bytecode(next_code.clone()),
+            ..Default::default()
+        };
+        let result = Host::execute_message(&mut evm, &tx_env, &mut message).unwrap();
+
+        assert_eq!(result.stop, InstrStop::Stop);
+        let inspector = evm.clear_inspector_as::<PanicOnce>().unwrap();
+        assert_eq!(inspector.frame_code, [Bytes::from(first_code), Bytes::from(next_code)]);
     }
 }

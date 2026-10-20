@@ -348,7 +348,8 @@ pub(crate) fn run(config: RunConfig<'_>) -> TestInterpreter {
     let host = host.unwrap_or(&mut default_host);
     host.spec_id = spec_id;
     host.execution_config = ExecutionConfig::for_base_spec::<BaseEvmConfigSelector>(spec_id);
-    let (err, execution_error) = match inner.run(host) {
+    // SAFETY: The interpreter was just created and is not running.
+    let (err, execution_error) = match unsafe { inner.run(host) } {
         Ok(stop) => (stop, None),
         Err(error) => (InstrStop::FatalExternalError, Some(error)),
     };

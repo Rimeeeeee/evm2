@@ -154,7 +154,9 @@ fn interrupt_before_step_end_skips_callback_and_preserves_error() {
             EmptyDB::default(),
             Precompiles::base(SpecId::CANCUN),
         );
-        assert_eq!(interp.run(&mut evm).unwrap_err().to_string(), error.to_string());
+        // SAFETY: The interpreter is not running; the test drives its hooks by hand.
+        let run = unsafe { interp.run(&mut evm) };
+        assert_eq!(run.unwrap_err().to_string(), error.to_string());
     }
 }
 

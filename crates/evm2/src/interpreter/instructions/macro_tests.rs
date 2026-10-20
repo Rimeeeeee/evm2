@@ -86,7 +86,8 @@ fn run(config: RunConfig<'_>) -> TestInterpreter {
     let host = host.unwrap_or(&mut default_host);
     host.spec_id = spec_id;
     host.execution_config = execution_config;
-    let err = inner.run(host).unwrap();
+    // SAFETY: The interpreter was just created and is not running.
+    let err = unsafe { inner.run(host) }.unwrap();
     let (stack, stack_len, gas, memory, output) = inner.into_parts();
     TestInterpreter { stack, stack_len, gas, memory, output, err, execution_error: None }
 }

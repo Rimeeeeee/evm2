@@ -498,25 +498,55 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     }
 
     /// Runs the interpreter until it stops.
+    ///
+    /// # Safety
+    ///
+    /// The frame must not be running, as [`Self::prepare_run`] requires.
+    ///
+    /// ```compile_fail,E0133
+    /// # use evm2::{BaseEvmTypes, Evm, interpreter::Interpreter};
+    /// fn run<'h>(interp: &mut Interpreter<'_, 'h, BaseEvmTypes>, host: &mut Evm<'h, BaseEvmTypes>) {
+    ///     let _ = interp.run(host);
+    /// }
+    /// ```
     #[inline]
-    pub fn run(&mut self, host: &mut T::Host<'host>) -> Result<InstrStop, ExecutionError> {
-        self.run_inner(host, None)
+    #[doc(hidden)]
+    pub unsafe fn run(&mut self, host: &mut T::Host<'host>) -> Result<InstrStop, ExecutionError> {
+        // SAFETY: Forwarded to the caller.
+        unsafe { self.run_inner(host, None) }
     }
 
     /// Runs the interpreter until it stops with an execution inspector.
     #[inline]
-    pub fn run_inspect(
+    pub(crate) fn run_inspect(
         &mut self,
         host: &mut T::Host<'host>,
         inspector: &mut (dyn Inspector<T> + 'host),
     ) -> Result<InstrStop, ExecutionError> {
-        self.run_inner(host, Some(NonNull::from(inspector)))
+        // SAFETY: Crate callers only start frames that are not running.
+        unsafe { self.run_inner(host, Some(NonNull::from(inspector))) }
     }
 
     /// Prepares this interpreter for external execution.
+    ///
+    /// # Safety
+    ///
+    /// This frame must not be running: no run of it, and no instruction or inspector hook of it,
+    /// may be active up the call stack. Preparing it replaces the host and inspector that running
+    /// code reads, and running code assumes both stay set until it finishes.
+    ///
+    /// `host` must outlive every use of this interpreter that reads the host, up to the next
+    /// preparation or the end of the run.
+    ///
+    /// ```compile_fail,E0133
+    /// # use evm2::{BaseEvmTypes, Evm, interpreter::Interpreter};
+    /// fn prepare<'h>(interp: &mut Interpreter<'_, 'h, BaseEvmTypes>, host: &mut Evm<'h, BaseEvmTypes>) {
+    ///     interp.prepare_run(host);
+    /// }
+    /// ```
     #[inline]
     #[doc(hidden)]
-    pub fn prepare_run(&mut self, host: &mut T::Host<'host>) {
+    pub unsafe fn prepare_run(&mut self, host: &mut T::Host<'host>) {
         if self.bytecode_ref.is_none() {
             // SAFETY: The view borrows immutable allocations retained by our owned `Bytecode`,
             // so moving the interpreter does not invalidate it. `init` clears the view before
@@ -533,13 +563,18 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
         self.inspector = None;
     }
 
+    /// # Safety
+    ///
+    /// The frame must not be running, as [`Self::prepare_run`] requires.
     #[inline(never)]
-    fn run_inner(
+    unsafe fn run_inner(
         &mut self,
         host: &mut T::Host<'host>,
         inspector: Option<NonNull<dyn Inspector<T> + 'host>>,
     ) -> Result<InstrStop, ExecutionError> {
-        self.prepare_run(host);
+        // SAFETY: The caller guarantees the frame is not running. `host` is borrowed for this
+        // whole call, and `finish_run` clears the pointer before it returns.
+        unsafe { self.prepare_run(host) };
         self.inspector = inspector;
 
         let stop = if self.error.is_some() {

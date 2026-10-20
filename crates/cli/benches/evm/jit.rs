@@ -203,14 +203,18 @@ struct FixedJitRunner {
 }
 
 impl InterpreterRunner<BaseEvmTypes> for FixedJitRunner {
-    fn run<'frame, 'host>(
+    unsafe fn run<'frame, 'host>(
         &self,
         interpreter: &mut Interpreter<'frame, 'host, BaseEvmTypes>,
         host: &mut Evm<'host, BaseEvmTypes>,
     ) -> Option<InstrStop> {
         let func = *self.functions.get(&interpreter.original_bytecode_hash())?;
-        interpreter.prepare_run(host);
-        Some(unsafe { func.call_with_interpreter(interpreter) })
+        // SAFETY: The caller passes a frame that is not running and the EVM that executes it, so
+        // the compiled function only accesses an initialized interpreter.
+        unsafe {
+            interpreter.prepare_run(host);
+            Some(func.call_with_interpreter(interpreter))
+        }
     }
 }
 
