@@ -97,7 +97,7 @@ pub(crate) fn ensure_memory(
     offset: usize,
     len: usize,
 ) -> BuiltinResult {
-    // SAFETY: Builtins run on a context whose creator upheld `EvmContext::from_interpreter`.
+    // SAFETY: Builtins hold no references into memory across `ensure_memory`.
     unsafe { ecx.resize_memory(offset, len)? };
     Ok(())
 }

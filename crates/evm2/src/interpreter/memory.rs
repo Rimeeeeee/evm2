@@ -5,14 +5,11 @@ use core::{cmp::min, fmt, hint::cold_path, ops::Range};
 
 /// Linear EVM memory.
 ///
-/// Memory owns its expansion accounting, and grows only through
-/// [`resize_evm`](Self::resize_evm), so its length is always the whole number of words charged
-/// for.
+/// Memory grows only through [`resize_evm`](Self::resize_evm), so its length is always the whole
+/// number of words that were charged for.
 pub struct Memory {
     data: Vec<u8>,
     memory_limit: u64,
-    /// Total expansion cost charged for the current length.
-    expansion_cost: u64,
 }
 
 impl Default for Memory {
@@ -38,7 +35,7 @@ impl Memory {
     /// Creates memory with the requested capacity.
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
-        Self { data: Vec::with_capacity(capacity), memory_limit: u64::MAX, expansion_cost: 0 }
+        Self { data: Vec::with_capacity(capacity), memory_limit: u64::MAX }
     }
 
     /// Returns the memory byte limit.
@@ -83,20 +80,12 @@ impl Memory {
     #[inline]
     pub(crate) fn clear(&mut self) {
         self.data.clear();
-        self.expansion_cost = 0;
-    }
-
-    #[inline]
-    fn grow_to(&mut self, new_size: usize) {
-        if new_size > self.data.len() {
-            self.data.resize(new_size, 0);
-        }
     }
 
     /// Resizes memory to cover `offset..offset + len` and charges EVM expansion gas.
     ///
-    /// On failure, neither the memory nor `gas` changes, except that `gas` is left spent when it
-    /// runs out.
+    /// On failure, the memory does not change. When `gas` runs out it is left in an out-of-gas
+    /// state and must not be reused.
     #[inline]
     pub fn resize_evm(
         &mut self,
@@ -131,15 +120,13 @@ impl Memory {
             return Err(InstrStop::MemoryLimitOOG);
         }
 
-        let expansion_cost = gas_params.memory_cost(new_num_words);
-        let Some(cost) = expansion_cost.checked_sub(self.expansion_cost) else {
-            cold_path();
-            return Err(InstrStop::MemoryOOG);
-        };
+        // The memory length is the whole number of words already charged for.
+        let cost = gas_params
+            .memory_cost(new_num_words)
+            .saturating_sub(gas_params.memory_cost(self.data.len() / 32));
 
         gas.spend(cost).map_err(|_| InstrStop::MemoryOOG)?;
-        self.grow_to(new_size);
-        self.expansion_cost = expansion_cost;
+        self.data.resize(new_size, 0);
         Ok(())
     }
 
@@ -335,11 +322,10 @@ mod tests {
         let mut gas = GasTracker::new(2);
         assert_matches!(memory.resize_evm(&mut gas, &gas_params, 0, 32), Err(InstrStop::MemoryOOG));
         assert_eq!(memory.len(), 0);
-        assert_eq!(memory.expansion_cost, 0);
 
         let mut gas = GasTracker::new(3);
         memory.resize_evm(&mut gas, &gas_params, 0, 32).unwrap();
         assert_eq!(memory.len(), 32);
-        assert_eq!(memory.expansion_cost, 3);
+        assert_eq!(gas.remaining(), 0);
     }
 }

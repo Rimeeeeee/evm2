@@ -323,8 +323,8 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     ///
     /// # Safety
     ///
-    /// Growing memory may reallocate it. The caller must refresh any cached pointer to the
-    /// memory afterwards.
+    /// The interpreter must be prepared with [`Self::prepare_run`]. Growing memory may
+    /// reallocate it, so the caller must refresh any cached pointer to the memory afterwards.
     #[doc(hidden)]
     #[inline]
     pub unsafe fn resize_memory_with_gas(
@@ -564,7 +564,7 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
 
 /// Interpreter state exposed to instruction implementations.
 ///
-/// Instructions cannot replace the memory or set an output range beyond it:
+/// Instructions cannot replace the memory:
 ///
 /// ```compile_fail,E0624
 /// use evm2::{
@@ -725,9 +725,8 @@ impl<'frame, 'host, T: EvmTypesHost> InterpreterState<'frame, 'host, T> {
         offset: usize,
         len: usize,
     ) -> Result {
-        // SAFETY: Resizing memory makes no host calls.
-        let gas_params = unsafe { self.gas_params_detached() };
-        self.0.memory.resize_evm(gas, gas_params, offset, len)
+        // SAFETY: The interpreter caches no pointer to its memory.
+        unsafe { self.0.resize_memory_with_gas(gas, offset, len) }
     }
 
     /// Returns return data from the last call-like operation.

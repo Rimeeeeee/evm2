@@ -77,8 +77,24 @@ impl fmt::Debug for EvmContext<'_, '_, '_> {
 
 impl<'ctx, 'frame, 'host> EvmContext<'ctx, 'frame, 'host> {
     /// Creates a new context from an interpreter.
+    ///
+    /// ```compile_fail,E0133
+    /// use evm2::{BaseEvmTypes, interpreter::Interpreter};
+    /// use evm2_jit_context::EvmContext;
+    ///
+    /// fn hook(interp: &mut Interpreter<'_, '_, BaseEvmTypes>) {
+    ///     let _ecx = EvmContext::from_interpreter(interp);
+    /// }
+    /// ```
+    ///
+    /// # Safety
+    ///
+    /// The context exposes its raw pointer fields, which its safe accessors dereference, and
+    /// caches the memory base pointer and length for compiled code. The caller must not change
+    /// those fields except through the context's methods, and must not resize or reallocate the
+    /// interpreter's memory while the context is in use.
     #[inline]
-    pub fn from_interpreter(
+    pub unsafe fn from_interpreter(
         interpreter: &'ctx mut Interpreter<'frame, 'host, BaseEvmTypes>,
     ) -> Self {
         unsafe { Self::from_interpreter_with_stack(interpreter).0 }
@@ -89,7 +105,8 @@ impl<'ctx, 'frame, 'host> EvmContext<'ctx, 'frame, 'host> {
     /// # Safety
     ///
     /// The caller must keep the returned stack length at or below the stack capacity and ensure
-    /// the first `stack_len` words are initialized before accessing the interpreter stack.
+    /// the first `stack_len` words are initialized before accessing the interpreter stack. The
+    /// caller must also uphold the contract of [`from_interpreter`](Self::from_interpreter).
     #[inline]
     pub unsafe fn from_interpreter_with_stack(
         interpreter: &'ctx mut Interpreter<'frame, 'host, BaseEvmTypes>,
