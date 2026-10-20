@@ -406,7 +406,8 @@ fn with_evm_context_and_host_mut<
         ..message
     };
     let mut interpreter = Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
-    interpreter.prepare_run(host);
+    // SAFETY: The interpreter was just created and is not running, and `host` outlives it.
+    unsafe { interpreter.prepare_run(host) };
 
     let (mut ecx, stack, stack_len) =
         unsafe { EvmContext::from_interpreter_with_stack(&mut interpreter) };
@@ -524,7 +525,8 @@ fn run_compiled_test_case_with_context(
     };
     let mut interpreter = Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
     let mut int_host = prepare_host(spec_id);
-    let int_stop = interpreter.run(&mut int_host).unwrap();
+    // SAFETY: The interpreter was just created and is not running.
+    let int_stop = unsafe { interpreter.run(&mut int_host) }.unwrap();
     let int_result = int_stop;
     let interpreter_output = interpreter.output();
 

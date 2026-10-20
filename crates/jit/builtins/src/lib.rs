@@ -1061,7 +1061,8 @@ mod tests {
         interpreter: &'ctx mut evm2::interpreter::Interpreter<'frame, 'host, BaseEvmTypes>,
         host: &'ctx mut Evm<'host, BaseEvmTypes>,
     ) -> PreparedJitFrame<'ctx, 'frame, 'host> {
-        interpreter.prepare_run(host);
+        // SAFETY: The interpreter is not running, and `host` outlives the returned frame.
+        unsafe { interpreter.prepare_run(host) };
         let (ecx, stack, _stack_len) =
             unsafe { EvmContext::from_interpreter_with_stack(interpreter) };
         PreparedJitFrame { ecx, stack }

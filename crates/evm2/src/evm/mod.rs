@@ -190,12 +190,32 @@ pub use prewarm_set::PrewarmSet;
 ///
 /// Returning `Some(stop)` means the runner executed the frame. Returning `None` makes the EVM run
 /// the regular interpreter for the same frame.
+///
+/// Running a frame is unsafe, so an inspector hook cannot hand its running frame to a runner:
+///
+/// ```compile_fail,E0133
+/// use evm2::{BaseEvmTypes, Evm, InterpreterRunner, interpreter::Interpreter};
+///
+/// fn rerun<'frame, 'host>(
+///     runner: &impl InterpreterRunner<BaseEvmTypes>,
+///     interpreter: &mut Interpreter<'frame, 'host, BaseEvmTypes>,
+///     host: &mut Evm<'host, BaseEvmTypes>,
+/// ) {
+///     runner.run(interpreter, host);
+/// }
+/// ```
 pub trait InterpreterRunner<T: EvmTypesHost>: core::fmt::Debug + Send + Sync + 'static {
     /// Attempts to execute `interpreter` with an external backend.
     ///
     /// Record execution errors with [`Interpreter::fail`]; the EVM extracts them after this
     /// method returns.
-    fn run<'frame, 'host>(
+    ///
+    /// # Safety
+    ///
+    /// `interpreter` must be a frame that is not running, and `host` must be the EVM that
+    /// executes it. Implementations may call [`Interpreter::prepare_run`], which replaces the
+    /// host and inspector that a running frame reads.
+    unsafe fn run<'frame, 'host>(
         &self,
         interpreter: &mut Interpreter<'frame, 'host, T>,
         host: &mut T::Host<'host>,
@@ -409,7 +429,8 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     const fn enter_execution(&mut self) -> ExecutionGuard<'_, 'a, T> {
         let was_running = self.running;
         self.running = true;
-        ExecutionGuard { evm: self, was_running }
+        let prev_frame = self.current_frame;
+        ExecutionGuard { evm: self, was_running, prev_frame }
     }
 
     /// Returns the transaction handler registry.
@@ -931,15 +952,20 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     }
 }
 
+/// Marks the EVM as executing for a scope. The running frame, if the scope changes it, is
+/// restored when the scope ends, including on unwind: a caught panic must not leave
+/// `current_frame` pointing at a frame that unwinding dropped.
 struct ExecutionGuard<'guard, 'evm, T: EvmTypesHost> {
     evm: &'guard mut Evm<'evm, T>,
     was_running: bool,
+    prev_frame: Option<NonNull<Interpreter<'static, 'static, T>>>,
 }
 
 impl<'guard, 'evm, T: EvmTypesHost> Drop for ExecutionGuard<'guard, 'evm, T> {
     #[inline]
     fn drop(&mut self) {
         self.evm.running = self.was_running;
+        self.evm.current_frame = self.prev_frame;
     }
 }
 
@@ -1146,7 +1172,9 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
                 // SAFETY: The message outlives the frame, which is returned to the pool below.
                 let frame_message = unsafe { trustme::decouple_lt(&*message) };
                 let frame = top_frame.insert(guard.evm.interpreter_pool.pop(tx_env, frame_message));
-                frame.prepare_run(guard.evm);
+                // SAFETY: The frame was just popped from the pool, so it is not running, and the
+                // EVM outlives it: it returns to the pool before this function returns.
+                unsafe { frame.prepare_run(guard.evm) };
                 frame
             }
         };
@@ -1480,21 +1508,21 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
             // interpreter run.
             unsafe { trustme::decouple_lt_mut(inspector) }
         });
-        let prev_frame = guard
-            .evm
-            .current_frame
-            .replace(NonNull::from(&mut *interp_ref).cast::<Interpreter<'static, 'static, T>>());
+        guard.evm.current_frame =
+            Some(NonNull::from(&mut *interp_ref).cast::<Interpreter<'static, 'static, T>>());
         let interpreter_runner = guard.evm.interpreter_runner.clone();
         let stop = if let Some(inspector) = inspector {
             interp_ref.run_inspect(guard.evm, inspector)
         } else if let Some(runner) = interpreter_runner
-            && let Some(stop) = runner.run(interp_ref, guard.evm)
+            // SAFETY: The frame was just popped from the pool and is not running, and the host
+            // is the EVM that executes it.
+            && let Some(stop) = unsafe { runner.run(interp_ref, guard.evm) }
         {
             interp_ref.finish_run(stop)
         } else {
-            interp_ref.run(guard.evm)
+            // SAFETY: The frame was just popped from the pool and is not running.
+            unsafe { interp_ref.run(guard.evm) }
         };
-        guard.evm.current_frame = prev_frame;
         guard.evm.interpreter_pool.push(interp);
         stop
     }
@@ -1506,7 +1534,9 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
             let inspector = unsafe { trustme::decouple_lt_mut(inspector) };
             // The host and spec are normally wired up by the interpreter run; set them up early so
             // that the hook can access them.
-            interp.prepare_run(self);
+            // SAFETY: The caller passes a frame that is not running yet, and `self` outlives the
+            // frame, which returns to the pool before the EVM execution ends.
+            unsafe { interp.prepare_run(self) };
             inspector.initialize_interp(interp);
         }
     }
@@ -1923,7 +1953,7 @@ mod tests {
     }
 
     impl InterpreterRunner<BaseEvmTypes> for TestInterpreterRunner {
-        fn run<'frame, 'host>(
+        unsafe fn run<'frame, 'host>(
             &self,
             _interpreter: &mut Interpreter<'frame, 'host, BaseEvmTypes>,
             _host: &mut Evm<'host, BaseEvmTypes>,
