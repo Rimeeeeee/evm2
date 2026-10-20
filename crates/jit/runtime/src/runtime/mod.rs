@@ -33,7 +33,9 @@ pub use api::{
 };
 
 mod config;
-pub use config::{CompilationEvent, CompilationKind, JitMode, RuntimeConfig, RuntimeTuning};
+pub use config::{
+    CompilationEvent, CompilationKind, HostConfig, JitMode, RuntimeConfig, RuntimeTuning,
+};
 
 mod backend;
 
@@ -107,6 +109,8 @@ pub(crate) struct BackendInner {
     started: AtomicBool,
     /// Blocking mode: every lookup synchronously compiles and never falls back.
     blocking: bool,
+    host: config::HostConfig,
+    gas_params: Option<evm2::version::GasParams>,
     /// Tuning knobs (Copy). Cached for hot-path eligibility checks.
     tuning: crate::runtime::config::RuntimeTuning,
     /// Bounded channel for control commands (compile_jit, prepare_aot, clears,
@@ -183,6 +187,11 @@ impl JitBackend {
             eyre::bail!("AOT mode does not support out-of-process compilation");
         }
 
+        if !config.host.is_default()
+            && (config.aot || config.store.is_some() || config.jit_mode == JitMode::OutOfProcess)
+        {
+            eyre::bail!("custom hosts require in-process JIT without an artifact store");
+        }
         let enabled = config.enabled;
         let (tx, rx) = chan::bounded::<Command>(config.tuning.channel_capacity);
         let events = ArrayQueue::new(config.tuning.channel_capacity);
@@ -199,6 +208,8 @@ impl JitBackend {
                 enabled: AtomicBool::new(false),
                 started: AtomicBool::new(false),
                 blocking: config.blocking,
+                host: config.host,
+                gas_params: config.gas_params,
                 tx,
                 thread: std::sync::Mutex::new(None),
                 shutdown_timeout: config.tuning.shutdown_timeout,
@@ -208,6 +219,16 @@ impl JitBackend {
         };
         this.set_enabled(enabled)?;
         Ok(this)
+    }
+
+    /// Checks that generated code matches the interpreter type and gas schedule.
+    pub fn supports_host<T: evm2::EvmTypesHost>(
+        &self,
+        gas: &evm2::version::GasParams,
+        spec: evm2::SpecId,
+    ) -> bool {
+        self.inner.host.type_id == std::any::TypeId::of::<T>()
+            && *gas == self.inner.gas_params.unwrap_or_else(|| evm2::Version::new(spec).gas_params)
     }
 
     /// Looks up a compiled function for the given request.

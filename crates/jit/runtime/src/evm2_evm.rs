@@ -2,7 +2,7 @@
 
 use crate::runtime::{JitBackend, LookupDecision, LookupRequest, RuntimeCacheKey};
 use evm2::{
-    BaseEvmTypes, Evm, InterpreterRunner,
+    EvmTypesHost, InterpreterRunner,
     interpreter::{Host, InstrStop, Interpreter},
 };
 
@@ -26,12 +26,12 @@ impl JitInterpreterRunner {
     }
 }
 
-impl InterpreterRunner<BaseEvmTypes> for JitInterpreterRunner {
+impl<T: EvmTypesHost> InterpreterRunner<T> for JitInterpreterRunner {
     #[inline]
     fn run<'frame, 'host>(
         &self,
-        interpreter: &mut Interpreter<'frame, 'host, BaseEvmTypes>,
-        host: &mut Evm<'host, BaseEvmTypes>,
+        interpreter: &mut Interpreter<'frame, 'host, T>,
+        host: &mut T::Host<'host>,
     ) -> Option<InstrStop> {
         run_interpreter(&self.backend, interpreter, host)
     }
@@ -42,13 +42,18 @@ impl InterpreterRunner<BaseEvmTypes> for JitInterpreterRunner {
 /// Returns `None` when no compiled program is available, leaving the caller to
 /// run the same frame through the evm2 interpreter.
 #[inline]
-pub fn run_interpreter<'frame, 'host>(
+pub fn run_interpreter<'frame, 'host, T: EvmTypesHost>(
     backend: &JitBackend,
-    interpreter: &mut Interpreter<'frame, 'host, BaseEvmTypes>,
-    host: &mut Evm<'host, BaseEvmTypes>,
+    interpreter: &mut Interpreter<'frame, 'host, T>,
+    host: &mut T::Host<'host>,
 ) -> Option<InstrStop> {
     // Disabled runners must not hash code merely to discover that lookup is unavailable.
-    if !backend.enabled() {
+    if !backend.enabled()
+        || !backend.supports_host::<T>(
+            &host.execution_config().version().gas_params,
+            host.execution_config().base_spec_id(),
+        )
+    {
         return None;
     }
     let code_hash = interpreter.original_bytecode_hash();
@@ -527,5 +532,119 @@ mod tests {
         let interpreter = run(false);
         let jit = run(true);
         assert_eq!(jit, interpreter);
+    }
+}
+
+#[cfg(all(test, feature = "llvm"))]
+mod custom_host_tests {
+    use super::*;
+    use crate::runtime::{HostConfig, RuntimeConfig};
+    use alloy_primitives::{Address, Bytes, U256};
+    use evm2::{
+        Evm, SpecId,
+        bytecode::Bytecode,
+        config::BaseEvmConfigSelector,
+        env::{BlockEnvExt, TxEnvExt},
+        evm::{EmptyDB, precompile::NoPrecompiles},
+        interpreter::{MessageExt, op},
+        registry::TxRegistry,
+    };
+
+    #[derive(Debug)]
+    struct CustomTypes;
+
+    impl EvmTypesHost for CustomTypes {
+        type ConfigSelector = BaseEvmConfigSelector;
+        type SpecId = SpecId;
+        type Tx = evm2::ethereum::TxEnvelope;
+        type EvmExt = ();
+        type MessageExt = [u64; 17];
+        type MessageResultExt = ();
+        type TxEnvExt = [u64; 9];
+        type TxResultExt = ();
+        type BlockEnvExt = [u64; 13];
+        type Host<'a> = Evm<'a, Self>;
+    }
+
+    #[test]
+    fn custom_layout_matches_interpreter_and_rejects_wrong_backend() {
+        let backend = JitBackend::new(RuntimeConfig {
+            blocking: true,
+            single_error: false,
+            host: HostConfig::for_types::<CustomTypes>(),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut host = Evm::<CustomTypes>::new(
+            SpecId::OSAKA,
+            BlockEnvExt::default(),
+            TxRegistry::new(),
+            EmptyDB::default(),
+            NoPrecompiles::default(),
+        );
+        let tx = TxEnvExt::default();
+        // Exercise all direct message-field loads plus host and memory builtins.
+        let message = MessageExt {
+            gas_limit: 100_000,
+            destination: Address::repeat_byte(0x11),
+            caller: Address::repeat_byte(0x22),
+            value: U256::from(0x33),
+            input: Bytes::from_static(&[0x44; 32]),
+            code: Bytecode::new_legacy(Bytes::from_static(&[
+                op::ADDRESS,
+                op::PUSH0,
+                op::MSTORE,
+                op::CALLER,
+                op::PUSH1,
+                32,
+                op::MSTORE,
+                op::CALLVALUE,
+                op::PUSH1,
+                64,
+                op::MSTORE,
+                op::PUSH0,
+                op::CALLDATALOAD,
+                op::PUSH1,
+                96,
+                op::MSTORE,
+                op::TIMESTAMP,
+                op::PUSH1,
+                128,
+                op::MSTORE,
+                op::PUSH1,
+                160,
+                op::PUSH0,
+                op::RETURN,
+            ])),
+            ..Default::default()
+        };
+        let mut interpreted = Interpreter::<CustomTypes>::new(&tx, &message);
+        assert_eq!(interpreted.run(&mut host).unwrap(), InstrStop::Return);
+        let expected_output = interpreted.output().to_vec();
+        let expected_gas = interpreted.gas();
+        let mut compiled = Interpreter::<CustomTypes>::new(&tx, &message);
+        assert_eq!(run_interpreter(&backend, &mut compiled, &mut host), Some(InstrStop::Return));
+        assert_eq!(compiled.output(), expected_output);
+        assert_eq!(compiled.gas(), expected_gas);
+        let wrong =
+            JitBackend::new(RuntimeConfig { blocking: true, ..Default::default() }).unwrap();
+        let mut fresh = Interpreter::<CustomTypes>::new(&tx, &message);
+        assert_eq!(run_interpreter(&wrong, &mut fresh, &mut host), None);
+        assert_eq!(fresh.run(&mut host).unwrap(), InstrStop::Return);
+        assert_eq!(fresh.output(), expected_output);
+    }
+
+    #[test]
+    fn custom_host_rejects_out_of_process_compilation() {
+        let error = JitBackend::new(RuntimeConfig {
+            host: HostConfig::for_types::<CustomTypes>(),
+            jit_mode: crate::runtime::JitMode::OutOfProcess,
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "custom hosts require in-process JIT without an artifact store"
+        );
     }
 }

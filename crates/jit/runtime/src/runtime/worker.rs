@@ -479,6 +479,12 @@ pub(super) fn compile_with_state(
     };
     let t0 = Instant::now();
 
+    if state_slot
+        .as_ref()
+        .is_some_and(|state| state.profile != CompilerProfile::new(config, target))
+    {
+        *state_slot = None;
+    }
     if state_slot.is_none() {
         match CompilerState::new(config, target) {
             Ok(s) => *state_slot = Some(s),
@@ -552,6 +558,7 @@ pub(super) fn compile_with_state(
 pub(super) struct CompilerState {
     compiler: EvmCompiler<EvmLlvmBackend>,
     compilations_since_recycle: usize,
+    profile: CompilerProfile,
 }
 
 #[cfg(feature = "llvm")]
@@ -560,6 +567,7 @@ impl CompilerState {
         Ok(Self {
             compiler: create_compiler(config, target.is_aot_backend())?,
             compilations_since_recycle: 0,
+            profile: CompilerProfile::new(config, target),
         })
     }
 }
@@ -588,6 +596,10 @@ pub(super) fn create_compiler(
     compiler.set_dse(!config.no_dse);
     if let Some(gas_params) = &config.gas_params {
         compiler.set_gas_params(*gas_params);
+    }
+    if !config.host.is_default() {
+        // SAFETY: HostConfig construction establishes the resolver and layout contract.
+        unsafe { compiler.set_host(config.host.layout, config.host.resolver) };
     }
     Ok(compiler)
 }
@@ -825,5 +837,37 @@ mod lifecycle_tests {
         });
         release.send(()).unwrap();
         owner.join().unwrap();
+    }
+}
+
+/// Worker threads can serve different backends; never reuse a compiler across ABI/gas profiles.
+#[cfg(feature = "llvm")]
+#[derive(PartialEq, Eq)]
+struct CompilerProfile {
+    host_type: std::any::TypeId,
+    layout: evm2_jit_codegen::HostLayout,
+    resolver: usize,
+    gas_params: Option<evm2::version::GasParams>,
+    debug_assertions: bool,
+    single_error: bool,
+    no_dedup: bool,
+    no_dse: bool,
+    target: CompilerTarget,
+}
+
+#[cfg(feature = "llvm")]
+impl CompilerProfile {
+    fn new(config: &RuntimeConfig, target: CompilerTarget) -> Self {
+        Self {
+            host_type: config.host.type_id,
+            layout: config.host.layout,
+            resolver: config.host.resolver as usize,
+            gas_params: config.gas_params,
+            debug_assertions: config.debug_assertions,
+            single_error: config.single_error,
+            no_dedup: config.no_dedup,
+            no_dse: config.no_dse,
+            target,
+        }
     }
 }

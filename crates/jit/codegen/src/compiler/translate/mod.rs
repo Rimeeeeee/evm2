@@ -7,7 +7,7 @@ use crate::{
 };
 use alloy_primitives::U256;
 use evm2::{
-    BaseEvmTypes,
+    BaseEvmTypes, EvmTypesHost,
     interpreter::{InstrStop, Interpreter, Message, op},
 };
 use evm2_jit_backend::{Attribute, BackendTypes, FunctionAttributeLocation, Pointer, TypeMethods};
@@ -35,6 +35,7 @@ pub(super) struct FcxConfig {
     pub(super) stack_bound_checks: bool,
     pub(super) gas_metering: bool,
     pub(super) single_error: bool,
+    pub(super) layout: HostLayout,
 }
 
 impl Default for FcxConfig {
@@ -49,6 +50,28 @@ impl Default for FcxConfig {
             stack_bound_checks: true,
             gas_metering: true,
             single_error: true,
+            layout: HostLayout::for_types::<BaseEvmTypes>(),
+        }
+    }
+}
+
+/// Offsets read directly by generated code for a concrete interpreter host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostLayout {
+    interpreter_message: usize,
+    destination: usize,
+    caller: usize,
+    value: usize,
+}
+
+impl HostLayout {
+    /// Computes offsets without assuming that custom message extensions preserve Rust layout.
+    pub const fn for_types<T: EvmTypesHost>() -> Self {
+        Self {
+            interpreter_message: Interpreter::<T>::message_field_offset_for_jit(),
+            destination: mem::offset_of!(Message<T>, destination),
+            caller: mem::offset_of!(Message<T>, caller),
+            value: mem::offset_of!(Message<T>, value),
         }
     }
 }
@@ -714,7 +737,14 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
 
             op::ADDRESS => {
                 let message = self.load_message_ptr();
-                field!(@push @[endian = "big"] self.address_type, message, Message<BaseEvmTypes>; destination);
+                let ptr =
+                    self.get_field(message, self.config.layout.destination, "message.destination");
+                let mut value = self.bcx.load_aligned(self.address_type, ptr, 1, "destination");
+                if cfg!(target_endian = "little") {
+                    value = self.bcx.bswap(value);
+                }
+                value = self.bcx.zext(self.word_type, value);
+                self.push(value);
             }
             op::BALANCE => {
                 let sp = self.sp_after_inputs();
@@ -727,11 +757,19 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
             }
             op::CALLER => {
                 let message = self.load_message_ptr();
-                field!(@push @[endian = "big"] self.address_type, message, Message<BaseEvmTypes>; caller);
+                let ptr = self.get_field(message, self.config.layout.caller, "message.caller");
+                let mut value = self.bcx.load_aligned(self.address_type, ptr, 1, "caller");
+                if cfg!(target_endian = "little") {
+                    value = self.bcx.bswap(value);
+                }
+                value = self.bcx.zext(self.word_type, value);
+                self.push(value);
             }
             op::CALLVALUE => {
                 let message = self.load_message_ptr();
-                field!(@push self.word_type, message, Message<BaseEvmTypes>; value);
+                let ptr = self.get_field(message, self.config.layout.value, "message.value");
+                let value = self.bcx.load_aligned(self.word_type, ptr, 1, "value");
+                self.push(value);
             }
             op::CALLDATALOAD => {
                 let sp = self.sp_after_inputs();
@@ -1301,7 +1339,7 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
         let interpreter = self.load_interpreter_ptr();
         let field = self.get_field(
             interpreter,
-            Interpreter::<BaseEvmTypes>::message_field_offset_for_jit(),
+            self.config.layout.interpreter_message,
             "interpreter.message.addr",
         );
         self.bcx.load(ptr_type, field, "interpreter.message")

@@ -7,7 +7,10 @@ const MANGLE_PREFIX: &str = "__revmc_builtin_";
 
 /// Builtin cache.
 #[derive(Debug)]
-pub struct Builtins<B: Backend>([Option<B::Function>; Builtin::COUNT]);
+pub struct Builtins<B: Backend>(
+    [Option<B::Function>; Builtin::COUNT],
+    Option<fn(Builtin) -> usize>,
+);
 
 unsafe impl<B: Backend> Send for Builtins<B> {}
 
@@ -20,22 +23,35 @@ impl<B: Backend> Default for Builtins<B> {
 impl<B: Backend> Builtins<B> {
     /// Create a new cache.
     pub const fn new() -> Self {
-        Self([None; Builtin::COUNT])
+        Self([None; Builtin::COUNT], None)
+    }
+
+    /// Selects host-specific builtin addresses.
+    pub fn set_resolver(&mut self, resolver: fn(Builtin) -> usize) {
+        self.clear();
+        self.1 = Some(resolver);
     }
 
     /// Clear the cache.
     pub const fn clear(&mut self) {
-        *self = Self::new();
+        self.0 = [None; Builtin::COUNT];
     }
 
     /// Get the function for the given builtin.
     pub fn get(&mut self, builtin: Builtin, bcx: &mut B::Builder<'_>) -> B::Function {
-        *self.0[builtin as usize].get_or_insert_with(|| Self::init(builtin, bcx))
+        let resolver = self.1;
+        *self.0[builtin as usize].get_or_insert_with(|| Self::init(builtin, bcx, resolver))
     }
 
     #[cold]
-    fn init(builtin: Builtin, bcx: &mut B::Builder<'_>) -> B::Function {
-        let name = builtin.name();
+    fn init(
+        builtin: Builtin,
+        bcx: &mut B::Builder<'_>,
+        resolver: Option<fn(Builtin) -> usize>,
+    ) -> B::Function {
+        let address = resolver.map_or_else(|| builtin.addr(), |resolve| resolve(builtin));
+        let resolved_name = resolver.map(|_| alloc::format!("{}_{address:x}", builtin.name()));
+        let name = resolved_name.as_deref().unwrap_or_else(|| builtin.name());
         debug_assert!(name.starts_with(MANGLE_PREFIX), "{name:?}");
         if builtin.call_conv() == CallConv::Default
             && let Some(r) = bcx.get_function(name)
@@ -44,15 +60,19 @@ impl<B: Backend> Builtins<B> {
             return r;
         }
 
-        let r = Self::build(name, builtin, bcx);
+        let r = Self::build(name, builtin, address, bcx);
         trace!(name, ?r, "built");
         r
     }
 
-    fn build(name: &str, builtin: Builtin, bcx: &mut B::Builder<'_>) -> B::Function {
+    fn build(
+        name: &str,
+        builtin: Builtin,
+        address: usize,
+        bcx: &mut B::Builder<'_>,
+    ) -> B::Function {
         let ret = builtin.ret(bcx);
         let params = builtin.params(bcx);
-        let address = builtin.addr();
         let linkage = evm2_jit_backend::Linkage::Import;
         let f = bcx.add_function(name, &params, ret, Some(address), linkage, CallConv::Default);
         Self::add_attrs(builtin, f, bcx);
@@ -324,6 +344,82 @@ impl Builtin {
         match self {
             Self::Mresize => CallConv::Cold,
             _ => CallConv::Default,
+        }
+    }
+}
+
+impl Builtin {
+    /// Resolves builtins for a concrete host type.
+    pub fn addr_for<T: evm2::EvmTypesHost>(self) -> usize {
+        match self {
+            Self::AssertSpecId => {
+                crate::__revmc_builtin_assert_spec_id_typed::<T> as *const () as usize
+            }
+            Self::Exp => crate::__revmc_builtin_exp_typed::<T> as *const () as usize,
+            Self::ExpGas => crate::__revmc_builtin_exp_gas_typed::<T> as *const () as usize,
+            Self::Keccak256 => crate::__revmc_builtin_keccak256_typed::<T> as *const () as usize,
+            Self::Keccak256CC => {
+                crate::__revmc_builtin_keccak256_cc_typed::<T> as *const () as usize
+            }
+            Self::Balance => crate::__revmc_builtin_balance_typed::<T> as *const () as usize,
+            Self::Origin => crate::__revmc_builtin_origin_typed::<T> as *const () as usize,
+            Self::CallDataLoad => {
+                crate::__revmc_builtin_calldataload_typed::<T> as *const () as usize
+            }
+            Self::CallDataLoadC => {
+                crate::__revmc_builtin_calldataload_c_typed::<T> as *const () as usize
+            }
+            Self::CallDataCopy => {
+                crate::__revmc_builtin_calldatacopy_typed::<T> as *const () as usize
+            }
+            Self::CodeCopy => crate::__revmc_builtin_codecopy_typed::<T> as *const () as usize,
+            Self::GasPrice => crate::__revmc_builtin_gas_price_typed::<T> as *const () as usize,
+            Self::ExtCodeSize => {
+                crate::__revmc_builtin_extcodesize_typed::<T> as *const () as usize
+            }
+            Self::ExtCodeCopy => {
+                crate::__revmc_builtin_extcodecopy_typed::<T> as *const () as usize
+            }
+            Self::ReturnDataCopy => {
+                crate::__revmc_builtin_returndatacopy_typed::<T> as *const () as usize
+            }
+            Self::ExtCodeHash => {
+                crate::__revmc_builtin_extcodehash_typed::<T> as *const () as usize
+            }
+            Self::BlockHash => crate::__revmc_builtin_blockhash_typed::<T> as *const () as usize,
+            Self::Coinbase => crate::__revmc_builtin_coinbase_typed::<T> as *const () as usize,
+            Self::Timestamp => crate::__revmc_builtin_timestamp_typed::<T> as *const () as usize,
+            Self::Number => crate::__revmc_builtin_number_typed::<T> as *const () as usize,
+            Self::Difficulty => crate::__revmc_builtin_difficulty_typed::<T> as *const () as usize,
+            Self::GasLimit => crate::__revmc_builtin_gaslimit_typed::<T> as *const () as usize,
+            Self::ChainId => crate::__revmc_builtin_chainid_typed::<T> as *const () as usize,
+            Self::SelfBalance => {
+                crate::__revmc_builtin_self_balance_typed::<T> as *const () as usize
+            }
+            Self::Basefee => crate::__revmc_builtin_basefee_typed::<T> as *const () as usize,
+            Self::BlobHash => crate::__revmc_builtin_blob_hash_typed::<T> as *const () as usize,
+            Self::BlobBaseFee => {
+                crate::__revmc_builtin_blob_base_fee_typed::<T> as *const () as usize
+            }
+            Self::Mresize => crate::__revmc_builtin_mresize_typed::<T> as *const () as usize,
+            Self::SlotNum => crate::__revmc_builtin_slot_num_typed::<T> as *const () as usize,
+            Self::Sload => crate::__revmc_builtin_sload_typed::<T> as *const () as usize,
+            Self::SloadC => crate::__revmc_builtin_sload_c_typed::<T> as *const () as usize,
+            Self::Sstore => crate::__revmc_builtin_sstore_typed::<T> as *const () as usize,
+            Self::Tload => crate::__revmc_builtin_tload_typed::<T> as *const () as usize,
+            Self::Tstore => crate::__revmc_builtin_tstore_typed::<T> as *const () as usize,
+            Self::Mcopy => crate::__revmc_builtin_mcopy_typed::<T> as *const () as usize,
+            Self::Log => crate::__revmc_builtin_log_typed::<T> as *const () as usize,
+            Self::Create => crate::__revmc_builtin_create_typed::<T> as *const () as usize,
+            Self::Call => crate::__revmc_builtin_call_typed::<T> as *const () as usize,
+            Self::DoReturn => crate::__revmc_builtin_do_return_typed::<T> as *const () as usize,
+            Self::DoReturnCC => {
+                crate::__revmc_builtin_do_return_cc_typed::<T> as *const () as usize
+            }
+            Self::SelfDestruct => {
+                crate::__revmc_builtin_selfdestruct_typed::<T> as *const () as usize
+            }
+            _ => self.addr(),
         }
     }
 }
