@@ -191,8 +191,6 @@ pub use prewarm_set::PrewarmSet;
 /// Returning `Some(stop)` means the runner executed the frame. Returning `None` makes the EVM run
 /// the regular interpreter for the same frame.
 ///
-/// Running a frame is unsafe, so an inspector hook cannot hand its running frame to a runner:
-///
 /// ```compile_fail,E0133
 /// use evm2::{BaseEvmTypes, Evm, InterpreterRunner, interpreter::Interpreter};
 ///
@@ -952,9 +950,8 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     }
 }
 
-/// Marks the EVM as executing for a scope. The running frame, if the scope changes it, is
-/// restored when the scope ends, including on unwind: a caught panic must not leave
-/// `current_frame` pointing at a frame that unwinding dropped.
+/// Marks the EVM as executing until dropped, then restores `running` and `current_frame`, also on
+/// unwind: a caught panic must not leave `current_frame` pointing at a dropped frame.
 struct ExecutionGuard<'guard, 'evm, T: EvmTypesHost> {
     evm: &'guard mut Evm<'evm, T>,
     was_running: bool,

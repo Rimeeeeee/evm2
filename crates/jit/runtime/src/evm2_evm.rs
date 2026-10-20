@@ -98,7 +98,6 @@ mod tests {
         interpreter::Word,
     };
 
-    /// Runs a frame that the test has just created.
     fn run_fresh<'frame, 'host>(
         backend: &JitBackend,
         interpreter: &mut Interpreter<'frame, 'host, BaseEvmTypes>,

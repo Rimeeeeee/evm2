@@ -11,74 +11,14 @@ use auto_impl::auto_impl;
 
 /// EVM execution inspector.
 ///
-/// Hooks receive the frame that is running. A hook cannot start, restart, or re-prepare it:
-/// doing so would replace the host and inspector that the running frame reads.
-///
-/// ```compile_fail,E0133
-/// # use evm2::{
-/// #     BaseEvmTypes, Evm, Inspector, Precompiles, SpecId, env::BlockEnvExt,
-/// #     ethereum::ethereum_tx_registry, evm::EmptyDB, interpreter::Interpreter,
-/// # };
-/// # struct Noop;
-/// # impl Inspector<BaseEvmTypes> for Noop {}
-/// # fn new_host<'a>() -> Evm<'a, BaseEvmTypes> {
-/// #     Evm::new(
-/// #         SpecId::OSAKA,
-/// #         BlockEnvExt::default(),
-/// #         ethereum_tx_registry(SpecId::OSAKA),
-/// #         EmptyDB::default(),
-/// #         Precompiles::base(SpecId::OSAKA),
-/// #     )
-/// # }
-/// # struct Hook;
-/// impl Inspector<BaseEvmTypes> for Hook {
-///     fn step(&mut self, interp: &mut Interpreter<'_, '_, BaseEvmTypes>) {
-///         let mut host = new_host();
-///         interp.prepare_run(&mut host);
-///     }
-/// }
-/// ```
-///
-/// ```compile_fail,E0133
-/// # use evm2::{
-/// #     BaseEvmTypes, Evm, Inspector, Precompiles, SpecId, env::BlockEnvExt,
-/// #     ethereum::ethereum_tx_registry, evm::EmptyDB, interpreter::Interpreter,
-/// # };
-/// # struct Noop;
-/// # impl Inspector<BaseEvmTypes> for Noop {}
-/// # fn new_host<'a>() -> Evm<'a, BaseEvmTypes> {
-/// #     Evm::new(
-/// #         SpecId::OSAKA,
-/// #         BlockEnvExt::default(),
-/// #         ethereum_tx_registry(SpecId::OSAKA),
-/// #         EmptyDB::default(),
-/// #         Precompiles::base(SpecId::OSAKA),
-/// #     )
-/// # }
-/// # struct Hook;
-/// impl Inspector<BaseEvmTypes> for Hook {
-///     fn step(&mut self, interp: &mut Interpreter<'_, '_, BaseEvmTypes>) {
-///         let mut host = new_host();
-///         let _ = interp.run(&mut host);
-///     }
-/// }
-/// ```
+/// Hooks receive the frame that is running, which they cannot run again:
 ///
 /// ```compile_fail,E0624
-/// # use evm2::{
-/// #     BaseEvmTypes, Evm, Inspector, Precompiles, SpecId, env::BlockEnvExt,
-/// #     ethereum::ethereum_tx_registry, evm::EmptyDB, interpreter::Interpreter,
-/// # };
+/// # use evm2::{BaseEvmTypes, Evm, Inspector, interpreter::Interpreter};
 /// # struct Noop;
 /// # impl Inspector<BaseEvmTypes> for Noop {}
 /// # fn new_host<'a>() -> Evm<'a, BaseEvmTypes> {
-/// #     Evm::new(
-/// #         SpecId::OSAKA,
-/// #         BlockEnvExt::default(),
-/// #         ethereum_tx_registry(SpecId::OSAKA),
-/// #         EmptyDB::default(),
-/// #         Precompiles::base(SpecId::OSAKA),
-/// #     )
+/// #     unimplemented!()
 /// # }
 /// # struct Hook;
 /// impl Inspector<BaseEvmTypes> for Hook {

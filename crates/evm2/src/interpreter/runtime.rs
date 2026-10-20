@@ -410,6 +410,13 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     /// # Safety
     ///
     /// The frame must not be running, as [`Self::prepare_run`] requires.
+    ///
+    /// ```compile_fail,E0133
+    /// # use evm2::{BaseEvmTypes, Evm, interpreter::Interpreter};
+    /// fn run<'h>(interp: &mut Interpreter<'_, 'h, BaseEvmTypes>, host: &mut Evm<'h, BaseEvmTypes>) {
+    ///     let _ = interp.run(host);
+    /// }
+    /// ```
     #[inline]
     #[doc(hidden)]
     pub unsafe fn run(&mut self, host: &mut T::Host<'host>) -> Result<InstrStop, ExecutionError> {
@@ -437,9 +444,14 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     /// code reads, and running code assumes both stay set until it finishes.
     ///
     /// `host` must outlive every use of this interpreter that reads the host, up to the next
-    /// preparation or the end of the run. This is a pointer, not a borrow.
+    /// preparation or the end of the run.
     ///
-    /// An inspector hook receives a running frame, so it must not call this.
+    /// ```compile_fail,E0133
+    /// # use evm2::{BaseEvmTypes, Evm, interpreter::Interpreter};
+    /// fn prepare<'h>(interp: &mut Interpreter<'_, 'h, BaseEvmTypes>, host: &mut Evm<'h, BaseEvmTypes>) {
+    ///     interp.prepare_run(host);
+    /// }
+    /// ```
     #[inline]
     #[doc(hidden)]
     pub unsafe fn prepare_run(&mut self, host: &mut T::Host<'host>) {
