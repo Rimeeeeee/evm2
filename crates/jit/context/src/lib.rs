@@ -89,8 +89,9 @@ impl<'ctx, 'frame, 'host> EvmContext<'ctx, 'frame, 'host> {
     ///
     /// # Safety
     ///
-    /// The context exposes its raw pointer fields, which its safe accessors dereference, and
-    /// caches the memory base pointer and length for compiled code. The caller must not change
+    /// The interpreter must have been prepared with [`Interpreter::prepare_run`]. The context
+    /// exposes its raw pointer fields, which its safe accessors dereference, and caches the
+    /// memory base pointer and length for compiled code. The caller must not change
     /// those fields except through the context's methods, and must not resize or reallocate the
     /// interpreter's memory while the context is in use.
     #[inline]
