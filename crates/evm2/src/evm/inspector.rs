@@ -143,7 +143,7 @@ pub(crate) fn boxed_inspector<'a, T: EvmTypesHost>(
 ///
 /// A hook gets the host, and through it any EVM method that fires hooks. Running every hook through
 /// [`Self::with`] makes such a re-entrant hook not run, instead of aliasing the `&mut self` of the
-/// hook that is still active. Work that a hook starts, such as a nested message, is not inspected.
+/// hook that is still active.
 ///
 /// Access goes through shared references only: the frames of a running interpreter and the EVM both
 /// point at the slot while hooks run.
@@ -183,17 +183,7 @@ impl<'a, T: EvmTypesHost> InspectorSlot<'a, T> {
     /// Runs `f` with the inspector off: no hook runs until `f` returns or unwinds.
     #[inline]
     pub(crate) fn suspended<R>(&self, f: impl FnOnce() -> R) -> R {
-        /// Restores the busy flag when `f` returns or unwinds.
-        struct Restore<'slot>(&'slot Cell<bool>, bool);
-
-        impl Drop for Restore<'_> {
-            #[inline]
-            fn drop(&mut self) {
-                self.0.set(self.1);
-            }
-        }
-
-        let _restore = Restore(&self.busy, self.busy.replace(true));
+        let _restore = RestoreBusy(&self.busy, self.busy.replace(true));
         f()
     }
 
@@ -203,23 +193,23 @@ impl<'a, T: EvmTypesHost> InspectorSlot<'a, T> {
         &self,
         hook: impl FnOnce(&mut (dyn Inspector<T> + 'a)) -> R,
     ) -> Option<R> {
-        /// Marks the slot idle again when the hook returns or unwinds.
-        struct Idle<'slot>(&'slot Cell<bool>);
-
-        impl Drop for Idle<'_> {
-            #[inline]
-            fn drop(&mut self) {
-                self.0.set(false);
-            }
-        }
-
         if self.busy.replace(true) {
             return None;
         }
-        let _idle = Idle(&self.busy);
+        let _idle = RestoreBusy(&self.busy, false);
         // SAFETY: The slot was idle, so no other `&mut` to the inspector exists, and the busy flag
         // keeps it that way until `_idle` drops.
         Some(hook(unsafe { &mut **self.inspector.get() }))
+    }
+}
+
+/// Sets the busy flag of an [`InspectorSlot`] back when a hook or suspension returns or unwinds.
+struct RestoreBusy<'slot>(&'slot Cell<bool>, bool);
+
+impl Drop for RestoreBusy<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.0.set(self.1);
     }
 }
 
@@ -248,7 +238,7 @@ impl<'a, T: EvmTypesHost> core::ops::DerefMut for dyn Inspector<T> + 'a {
 
 #[cfg(test)]
 mod tests {
-    use super::{Inspector, InspectorSlot, boxed_inspector};
+    use super::*;
     use crate::{
         BaseEvmTypes, DatabaseError, Evm, EvmTypesHost, Precompiles, SpecId,
         bytecode::Bytecode,

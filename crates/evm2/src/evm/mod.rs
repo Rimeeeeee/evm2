@@ -211,8 +211,9 @@ pub trait InterpreterRunner<T: EvmTypesHost>: core::fmt::Debug + Send + Sync + '
     /// # Safety
     ///
     /// `interpreter` must be a frame that is not running, and `host` must be the EVM that
-    /// executes it. Implementations may call [`Interpreter::prepare_run`], which replaces the
-    /// host and inspector that a running frame reads.
+    /// executes it. The EVM has not prepared `interpreter`: implementations call
+    /// [`Interpreter::prepare_run`], which replaces the host and inspector that a running frame
+    /// reads, before they use anything that reads the host.
     unsafe fn run<'frame, 'host>(
         &self,
         interpreter: &mut Interpreter<'frame, 'host, T>,
@@ -835,7 +836,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     #[inline]
     fn inspect_log(&mut self, log: &Log) {
         let guard = self.enter_execution();
-        if let Some(slot) = guard.evm.idle_inspector() {
+        if let Some(slot) = guard.evm.inspector_slot() {
             slot.with(|inspector| inspector.log(log, guard.evm));
         }
     }

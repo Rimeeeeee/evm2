@@ -75,9 +75,6 @@ where
 impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     /// Creates an interpreter from a transaction-global environment and a frame-local message,
     /// which carries the bytecode to run.
-    ///
-    /// Crate-private: safe code could otherwise swap a fresh interpreter in for the running one,
-    /// replacing its memory and gas accounting.
     pub(crate) fn new(tx_env: &'frame TxEnv<T>, message: &'frame Message<T>) -> Self {
         // SAFETY: Calling init right after.
         let mut interp = unsafe { Self::uninit() };
@@ -760,7 +757,7 @@ impl<'frame, 'host, T: EvmTypesHost> InterpreterState<'frame, 'host, T> {
         offset: usize,
         len: usize,
     ) -> Result {
-        // SAFETY: The interpreter caches no pointer to its memory.
+        // SAFETY: Instructions only run on a prepared interpreter.
         unsafe { self.0.resize_memory_with_gas(gas, offset, len) }
     }
 
