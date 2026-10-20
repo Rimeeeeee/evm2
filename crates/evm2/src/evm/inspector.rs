@@ -8,8 +8,13 @@ use crate::{
 use alloc::boxed::Box;
 use alloy_primitives::{Address, Log, U256};
 use auto_impl::auto_impl;
+use core::cell::{Cell, UnsafeCell};
 
 /// EVM execution inspector.
+///
+/// Hooks may use the host, for example to emit a log or run a message, but the inspector is not
+/// told about what a hook triggers: logs and messages sent from a hook are not inspected, because
+/// the hook still holds the inspector mutably.
 ///
 /// Hooks receive the frame that is running, which they cannot run again:
 ///
@@ -134,6 +139,73 @@ pub(crate) fn boxed_inspector<'a, T: EvmTypesHost>(
     Box::new(inspector)
 }
 
+/// An installed inspector and whether one of its hooks is running.
+///
+/// A hook gets the host, and through it any EVM method that fires hooks. Running every hook through
+/// [`Self::with`] makes such a re-entrant hook not run, instead of aliasing the `&mut self` of the
+/// hook that is still active. Work that a hook starts, such as a nested message, is not inspected.
+///
+/// Access goes through shared references only: the frames of a running interpreter and the EVM both
+/// point at the slot while hooks run.
+pub(crate) struct InspectorSlot<'a, T: EvmTypesHost> {
+    inspector: UnsafeCell<Box<dyn Inspector<T> + 'a>>,
+    busy: Cell<bool>,
+}
+
+impl<'a, T: EvmTypesHost> InspectorSlot<'a, T> {
+    #[inline]
+    pub(crate) const fn new(inspector: Box<dyn Inspector<T> + 'a>) -> Self {
+        Self { inspector: UnsafeCell::new(inspector), busy: Cell::new(false) }
+    }
+
+    #[inline]
+    pub(crate) fn into_inner(self) -> Box<dyn Inspector<T> + 'a> {
+        self.inspector.into_inner()
+    }
+
+    #[inline]
+    pub(crate) const fn is_busy(&self) -> bool {
+        self.busy.get()
+    }
+
+    /// Returns the inspector unless one of its hooks is running.
+    #[inline]
+    pub(crate) fn get(&self) -> Option<&(dyn Inspector<T> + 'a)> {
+        // SAFETY: No `&mut` to the inspector exists while no hook runs.
+        (!self.is_busy()).then(|| unsafe { &**self.inspector.get() })
+    }
+
+    #[inline]
+    pub(crate) fn get_mut(&mut self) -> &mut (dyn Inspector<T> + 'a) {
+        self.inspector.get_mut().as_mut()
+    }
+
+    /// Runs `hook` on the inspector, unless a hook of it is already running.
+    #[inline]
+    pub(crate) fn with<R>(
+        &self,
+        hook: impl FnOnce(&mut (dyn Inspector<T> + 'a)) -> R,
+    ) -> Option<R> {
+        /// Marks the slot idle again when the hook returns or unwinds.
+        struct Idle<'slot>(&'slot Cell<bool>);
+
+        impl Drop for Idle<'_> {
+            #[inline]
+            fn drop(&mut self) {
+                self.0.set(false);
+            }
+        }
+
+        if self.busy.replace(true) {
+            return None;
+        }
+        let _idle = Idle(&self.busy);
+        // SAFETY: The slot was idle, so no other `&mut` to the inspector exists, and the busy flag
+        // keeps it that way until `_idle` drops.
+        Some(hook(unsafe { &mut **self.inspector.get() }))
+    }
+}
+
 /// Inspector that does nothing.
 #[allow(missing_copy_implementations)]
 #[derive(Clone, Debug, Default)]
@@ -159,7 +231,7 @@ impl<'a, T: EvmTypesHost> core::ops::DerefMut for dyn Inspector<T> + 'a {
 
 #[cfg(test)]
 mod tests {
-    use super::Inspector;
+    use super::{Inspector, InspectorSlot, boxed_inspector};
     use crate::{
         BaseEvmTypes, DatabaseError, Evm, EvmTypesHost, Precompiles, SpecId,
         bytecode::Bytecode,
@@ -1196,7 +1268,7 @@ mod tests {
             ),
             ..Default::default()
         };
-        let mut inspector = SelfdestructInspector::default();
+        let mut inspector = InspectorSlot::new(boxed_inspector(SelfdestructInspector::default()));
         let mut code = Vec::new();
         push(&mut code, address_to_word(&target));
         code.push(op::SELFDESTRUCT);
@@ -1208,9 +1280,10 @@ mod tests {
             ..Default::default()
         };
         let mut interp = Interpreter::<TestTypes>::new(&tx_env, &message);
-        let stop = interp.run_inspect(&mut host, &mut inspector);
+        let stop = interp.run_inspect(&mut host, &inspector);
 
         assert_matches!(stop, Err(crate::ExecutionError::Database(error)) if error.is_fatal());
+        let inspector = inspector.get_mut().downcast_ref::<SelfdestructInspector>().unwrap();
         assert_eq!(inspector.selfdestruct, None);
     }
 
@@ -1654,7 +1727,8 @@ mod tests {
                 ..Default::default()
             };
             let mut interp = Interpreter::<TestTypes>::new(&tx_env, &message);
-            let stop = interp.run_inspect(&mut TestHost::default(), &mut GasEdit);
+            let inspector = InspectorSlot::new(boxed_inspector(GasEdit));
+            let stop = interp.run_inspect(&mut TestHost::default(), &inspector);
 
             assert_eq!(stop, Ok(expected));
             assert_eq!(interp.gas().remaining(), 1000);
@@ -1719,5 +1793,77 @@ mod tests {
         assert_eq!(result.stop, InstrStop::Stop);
         let inspector = evm.clear_inspector_as::<PanicOnce>().unwrap();
         assert_eq!(inspector.frame_code, [Bytes::from(first_code), Bytes::from(next_code)]);
+    }
+
+    #[test]
+    fn hook_log_does_not_alias_its_inspector() {
+        #[derive(Default)]
+        struct LogsFromStep {
+            count: u32,
+            logs_seen: u32,
+        }
+
+        impl Inspector<BaseEvmTypes> for LogsFromStep {
+            fn step(&mut self, interp: &mut Interpreter<'_, '_, BaseEvmTypes>) {
+                self.count += 1;
+                interp.host().log(Log::default());
+                self.count += 1;
+            }
+
+            fn log(&mut self, _log: &Log, _host: &mut Evm<'_, BaseEvmTypes>) {
+                self.logs_seen += 1;
+            }
+        }
+
+        let (result, inspector, _) = run_evm_with_inspector(
+            Vec::from([op::PUSH1, 1, op::POP, op::STOP]),
+            &MessageExt::default(),
+            100_000,
+            LogsFromStep::default(),
+        );
+
+        assert_eq!(result.stop, InstrStop::Stop);
+        assert_eq!(inspector.logs_seen, 0);
+        assert_eq!(inspector.count, 6);
+    }
+
+    #[test]
+    fn hook_message_is_not_inspected() {
+        #[derive(Default)]
+        struct MessageFromCall {
+            call_depths: Vec<u16>,
+        }
+
+        impl Inspector<BaseEvmTypes> for MessageFromCall {
+            fn call(
+                &mut self,
+                interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+                message: &mut Message<BaseEvmTypes>,
+            ) -> Option<MessageResult<BaseEvmTypes>> {
+                self.call_depths.push(message.depth);
+                if message.depth == 0 {
+                    let tx_env = TxEnvExt::default();
+                    let mut nested = MessageExt {
+                        gas_limit: 10_000,
+                        depth: 1,
+                        code: legacy_bytecode(Vec::from([op::STOP])),
+                        ..Default::default()
+                    };
+                    let result = interp.host().execute_message(&tx_env, &mut nested).unwrap();
+                    assert_eq!(result.stop, InstrStop::Stop);
+                }
+                None
+            }
+        }
+
+        let (result, inspector, _) = run_evm_with_inspector(
+            Vec::from([op::STOP]),
+            &MessageExt::default(),
+            100_000,
+            MessageFromCall::default(),
+        );
+
+        assert_eq!(result.stop, InstrStop::Stop);
+        assert_eq!(inspector.call_depths, [0]);
     }
 }

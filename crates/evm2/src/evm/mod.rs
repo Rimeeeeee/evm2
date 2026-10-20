@@ -113,7 +113,7 @@
 //! ```
 
 use self::{
-    inspector::{Inspector, boxed_inspector},
+    inspector::{Inspector, InspectorSlot, boxed_inspector},
     precompile::{PrecompileOutput, PrecompileProvider, boxed_precompile_provider},
 };
 use crate::{
@@ -239,7 +239,7 @@ pub struct Evm<'a, T: EvmTypesHost> {
     #[derive_where(skip)]
     interpreter_pool: InterpreterPool<T>,
     #[derive_where(skip)]
-    inspector: Option<Box<dyn Inspector<T> + 'a>>,
+    inspector: Option<Box<InspectorSlot<'a, T>>>,
     #[derive_where(skip)]
     interpreter_runner: Option<Arc<dyn InterpreterRunner<T>>>,
     /// The currently running interpreter frame, if any.
@@ -804,26 +804,36 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     }
 
     /// Returns the active execution inspector.
+    ///
+    /// Returns `None` while one of its hooks runs, because the hook holds the inspector mutably.
     #[inline]
     pub fn inspector(&self) -> Option<&(dyn Inspector<T> + 'a)> {
-        self.inspector.as_deref()
+        self.inspector.as_deref().and_then(InspectorSlot::get)
     }
 
     /// Returns the active execution inspector mutably.
     #[inline]
     pub fn inspector_mut(&mut self) -> Option<&mut (dyn Inspector<T> + 'a)> {
         self.assert_inspector_mutable();
-        self.inspector.as_deref_mut()
+        self.inspector.as_deref_mut().map(InspectorSlot::get_mut)
+    }
+
+    /// Returns the inspector slot unless one of its hooks is running.
+    #[inline]
+    fn idle_inspector(&self) -> Option<&'a InspectorSlot<'a, T>> {
+        // SAFETY: The slot is boxed, and replacing or removing it asserts that the EVM is not
+        // running, so it outlives every hook that the returned reference runs.
+        self.inspector
+            .as_deref()
+            .filter(|slot| !slot.is_busy())
+            .map(|slot| unsafe { trustme::decouple_lt(slot) })
     }
 
     #[inline]
     fn inspect_log(&mut self, log: &Log) {
         let guard = self.enter_execution();
-        if let Some(inspector) = guard.evm.inspector.as_deref_mut() {
-            // SAFETY: The inspector is stored in `self`; the execution guard prevents inspector
-            // replacement while the hook is running.
-            let inspector = unsafe { trustme::decouple_lt_mut(inspector) };
-            inspector.log(log, guard.evm);
+        if let Some(slot) = guard.evm.idle_inspector() {
+            slot.with(|inspector| inspector.log(log, guard.evm));
         }
     }
 
@@ -873,7 +883,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     #[inline]
     pub fn set_inspector<I: Inspector<T> + 'a>(&mut self, inspector: I) {
         self.assert_inspector_mutable();
-        self.inspector = Some(boxed_inspector(inspector));
+        self.inspector = Some(Box::new(InspectorSlot::new(boxed_inspector(inspector))));
         self.evm_send = false;
     }
 
@@ -881,7 +891,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     #[inline]
     pub fn set_boxed_inspector(&mut self, inspector: Box<dyn Inspector<T> + 'a>) {
         self.assert_inspector_mutable();
-        self.inspector = Some(inspector);
+        self.inspector = Some(Box::new(InspectorSlot::new(inspector)));
         self.evm_send = false;
     }
 
@@ -890,7 +900,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     pub fn clear_inspector(&mut self) -> Option<Box<dyn Inspector<T> + 'a>> {
         self.assert_inspector_mutable();
         self.evm_send = false;
-        self.inspector.take()
+        self.inspector.take().map(|slot| slot.into_inner())
     }
 
     /// Removes the active execution inspector if it has type `I`.
@@ -900,7 +910,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         'a: 'static,
     {
         self.assert_inspector_mutable();
-        let i = self.inspector.take_if(|i| i.is::<I>())?;
+        let i = self.inspector.take_if(|slot| slot.get_mut().is::<I>())?.into_inner();
         Some(unsafe { Box::from_raw(Box::into_raw(i).cast::<I>()) })
     }
 
@@ -1135,21 +1145,16 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
 
     /// Fires the inspector call/create hooks around message execution.
     ///
-    /// This is invoked for every message when an inspector is installed; hook overrides skip
-    /// execution entirely, including the call depth check.
+    /// This is invoked for every message when an inspector is installed and idle; hook overrides
+    /// skip execution entirely, including the call depth check.
     #[inline(never)]
     fn execute_message_inspected<'frame>(
         &mut self,
+        inspector: &InspectorSlot<'a, T>,
         tx_env: &'frame TxEnv<T>,
         message: &'frame mut Message<T>,
     ) -> Result<MessageResult<T>, ExecutionError> {
         let guard = self.enter_execution();
-        let Some(inspector) = guard.evm.inspector.as_deref_mut() else {
-            return guard.evm.execute_message_impl(tx_env, message);
-        };
-        // SAFETY: The inspector is stored in `self`; the execution guard prevents inspector
-        // replacement while the hooks are running.
-        let inspector = unsafe { trustme::decouple_lt_mut(inspector) };
 
         // `destination` already holds the create's contract address (set when the message was
         // constructed), so the create hook observes it directly.
@@ -1178,11 +1183,15 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         // SAFETY: The frame outlives the hook invocations below.
         let frame = unsafe { trustme::decouple_lt_mut(frame) };
 
-        let inspected = if is_create {
-            inspector.create(frame, message)
-        } else {
-            inspector.call(frame, message)
-        };
+        let inspected = inspector
+            .with(|inspector| {
+                if is_create {
+                    inspector.create(frame, message)
+                } else {
+                    inspector.call(frame, message)
+                }
+            })
+            .flatten();
 
         let mut result = if let Some(error) = frame.take_error() {
             Err(error)
@@ -1191,11 +1200,13 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         };
 
         if let Ok(result) = &mut result {
-            if is_create {
-                inspector.create_end(frame, message, result);
-            } else {
-                inspector.call_end(frame, message, result);
-            }
+            inspector.with(|inspector| {
+                if is_create {
+                    inspector.create_end(frame, message, result);
+                } else {
+                    inspector.call_end(frame, message, result);
+                }
+            });
         }
 
         if let Some(error) = frame.take_error() {
@@ -1504,11 +1515,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
             guard.evm.interpreter_pool.pop(tx_env, message);
         let interp_ref = interp.as_mut();
         guard.evm.inspect_initialize_interp(interp_ref);
-        let inspector = guard.evm.inspector.as_deref_mut().map(|inspector| {
-            // SAFETY: The inspector is stored in `self` and remains alive for the duration of the
-            // interpreter run.
-            unsafe { trustme::decouple_lt_mut(inspector) }
-        });
+        let inspector = guard.evm.idle_inspector();
         guard.evm.current_frame =
             Some(NonNull::from(&mut *interp_ref).cast::<Interpreter<'static, 'static, T>>());
         let interpreter_runner = guard.evm.interpreter_runner.clone();
@@ -1529,16 +1536,13 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     }
 
     fn inspect_initialize_interp(&mut self, interp: &mut Interpreter<'_, 'a, T>) {
-        if let Some(inspector) = self.inspector.as_deref_mut() {
-            // SAFETY: The inspector is stored in `self` and remains alive for the duration of the
-            // hook.
-            let inspector = unsafe { trustme::decouple_lt_mut(inspector) };
+        if let Some(slot) = self.idle_inspector() {
             // The host and spec are normally wired up by the interpreter run; set them up early so
             // that the hook can access them.
             // SAFETY: The caller passes a frame that is not running yet, and `self` outlives the
             // frame, which returns to the pool before the EVM execution ends.
             unsafe { interp.prepare_run(self) };
-            inspector.initialize_interp(interp);
+            slot.with(|inspector| inspector.initialize_interp(interp));
         }
     }
 }
@@ -1685,8 +1689,8 @@ impl<'a, T: EvmTypes> Host<T> for Evm<'a, T> {
         message: &mut Message<T>,
     ) -> Result<MessageResult<T>, ExecutionError> {
         let checkpoint = self.state.checkpoint();
-        let result = if self.inspector.is_some() {
-            self.execute_message_inspected(tx_env, message)
+        let result = if let Some(slot) = self.idle_inspector() {
+            self.execute_message_inspected(slot, tx_env, message)
         } else {
             self.execute_message_impl(tx_env, message)
         };
