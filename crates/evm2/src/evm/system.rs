@@ -119,9 +119,10 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     /// deploy protocol system contracts or synthesize their bytecode.
     pub fn system_call(&mut self, tx: SystemTx) -> HandlerResult<ExecutedTx<'_, 'a, T>> {
         // System calls are not inspected.
-        let inspector = self.inspector.take();
-        let result = self.execute_system_call(tx);
-        self.inspector = inspector;
+        let result = match self.inspector_slot() {
+            Some(slot) => slot.suspended(|| self.execute_system_call(tx)),
+            None => self.execute_system_call(tx),
+        };
         match result {
             Ok(outcome) => self.finish_executed_tx(outcome),
             Err(error) => {

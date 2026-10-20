@@ -818,15 +818,18 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         self.inspector.as_deref_mut().map(InspectorSlot::get_mut)
     }
 
+    /// Returns the inspector slot.
+    #[inline]
+    pub(crate) fn inspector_slot(&self) -> Option<&'a InspectorSlot<'a, T>> {
+        // SAFETY: The slot is boxed, and replacing or removing it asserts that the EVM is not
+        // running, so it outlives every hook that the returned reference runs.
+        self.inspector.as_deref().map(|slot| unsafe { trustme::decouple_lt(slot) })
+    }
+
     /// Returns the inspector slot unless one of its hooks is running.
     #[inline]
     fn idle_inspector(&self) -> Option<&'a InspectorSlot<'a, T>> {
-        // SAFETY: The slot is boxed, and replacing or removing it asserts that the EVM is not
-        // running, so it outlives every hook that the returned reference runs.
-        self.inspector
-            .as_deref()
-            .filter(|slot| !slot.is_busy())
-            .map(|slot| unsafe { trustme::decouple_lt(slot) })
+        self.inspector_slot().filter(|slot| !slot.is_busy())
     }
 
     #[inline]

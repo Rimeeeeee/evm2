@@ -180,6 +180,23 @@ impl<'a, T: EvmTypesHost> InspectorSlot<'a, T> {
         self.inspector.get_mut().as_mut()
     }
 
+    /// Runs `f` with the inspector off: no hook runs until `f` returns or unwinds.
+    #[inline]
+    pub(crate) fn suspended<R>(&self, f: impl FnOnce() -> R) -> R {
+        /// Restores the busy flag when `f` returns or unwinds.
+        struct Restore<'slot>(&'slot Cell<bool>, bool);
+
+        impl Drop for Restore<'_> {
+            #[inline]
+            fn drop(&mut self) {
+                self.0.set(self.1);
+            }
+        }
+
+        let _restore = Restore(&self.busy, self.busy.replace(true));
+        f()
+    }
+
     /// Runs `hook` on the inspector, unless a hook of it is already running.
     #[inline]
     pub(crate) fn with<R>(
