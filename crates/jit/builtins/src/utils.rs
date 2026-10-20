@@ -97,7 +97,8 @@ pub(crate) fn ensure_memory(
     offset: usize,
     len: usize,
 ) -> BuiltinResult {
-    ecx.resize_memory(offset, len)?;
+    // SAFETY: Builtins hold no references into memory across `ensure_memory`.
+    unsafe { ecx.resize_memory(offset, len)? };
     Ok(())
 }
 
@@ -112,7 +113,8 @@ pub(crate) unsafe fn copy_operation(
         let memory_offset = word_to_usize(memory_offset.to_u256())?;
         ensure_memory(ecx, memory_offset, len)?;
         let data_offset = word_to_usize_saturated(data_offset.to_u256());
-        ecx.memory_mut().set_data(memory_offset, data_offset, len, data);
+        // SAFETY: `ensure_memory` grew memory to cover `memory_offset..memory_offset + len`.
+        unsafe { ecx.memory_mut().set_data(memory_offset, data_offset, len, data) };
     }
     Ok(())
 }

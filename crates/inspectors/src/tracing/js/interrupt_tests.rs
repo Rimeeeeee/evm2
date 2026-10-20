@@ -68,7 +68,8 @@ fn interrupt_stops_steps_without_js_step_callback() {
         .with_interrupt(interrupt.clone());
     let tx_env = TxEnv::<BaseEvmTypes>::default();
     let message = Message::<BaseEvmTypes>::default();
-    let mut interp = Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
+    // SAFETY: The interpreter stays standalone.
+    let mut interp = unsafe { Interpreter::<BaseEvmTypes>::new_standalone(&tx_env, &message) };
     // Signal from another thread after the inspector has been created.
     std::thread::spawn(move || interrupt.interrupt()).join().unwrap();
     inspector.step(&mut interp);
@@ -129,7 +130,8 @@ fn interrupt_before_step_end_skips_callback_and_preserves_error() {
         .with_interrupt(interrupt.clone());
         let tx_env = TxEnv::<BaseEvmTypes>::default();
         let message = Message::<BaseEvmTypes>::default();
-        let mut interp = Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
+        // SAFETY: The interpreter stays standalone.
+        let mut interp = unsafe { Interpreter::<BaseEvmTypes>::new_standalone(&tx_env, &message) };
         inspector.step(&mut interp);
         assert!(inspector.pending_steps[0].active);
         let error = if preserve_error {

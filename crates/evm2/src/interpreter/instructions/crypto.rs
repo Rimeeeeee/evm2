@@ -11,7 +11,8 @@ pub fn keccak256(cx: _, [offset, len]: [Word]) -> Result<out> {
     } else {
         let offset = offset.to_usize()?;
         cx.state.resize_memory(cx.gas, offset, len)?;
-        keccak256_hash(cx.state.memory().slice(offset, len))
+        // SAFETY: `resize_memory` grew memory to cover `offset..offset + len`.
+        keccak256_hash(unsafe { cx.state.memory().slice(offset, len) })
     };
     *out = b256_to_word(hash);
 }

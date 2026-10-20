@@ -5,21 +5,24 @@ use evm2_macros::instruction;
 pub fn mload(cx: _, [offset]: [Word]) -> Result<out> {
     let offset = offset.to_usize()?;
     cx.state.resize_memory(cx.gas, offset, 32)?;
-    *out = cx.state.memory().get_word(offset);
+    // SAFETY: `resize_memory` grew memory to cover `offset..offset + 32`.
+    *out = unsafe { cx.state.memory().get_word(offset) };
 }
 
 #[instruction(dynamic_gas)]
 pub fn mstore(cx: _, [offset, value]: [Word]) -> Result {
     let offset = offset.to_usize()?;
     cx.state.resize_memory(cx.gas, offset, 32)?;
-    cx.state.memory().set(offset, &value.to_be_bytes::<32>());
+    // SAFETY: `resize_memory` grew memory to cover `offset..offset + 32`.
+    unsafe { cx.state.memory().set(offset, &value.to_be_bytes::<32>()) };
 }
 
 #[instruction(dynamic_gas)]
 pub fn mstore8(cx: _, [offset, value]: [Word]) -> Result {
     let offset = offset.to_usize()?;
     cx.state.resize_memory(cx.gas, offset, 1)?;
-    cx.state.memory().set(offset, &[value.byte(0)]);
+    // SAFETY: `resize_memory` grew memory to cover `offset..offset + 1`.
+    unsafe { cx.state.memory().set(offset, &[value.byte(0)]) };
 }
 
 #[instruction]

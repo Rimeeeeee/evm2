@@ -5,7 +5,7 @@ use evm2::{
     env::{BlockEnv, BlockEnvExt, TxEnv},
     ethereum::ethereum_tx_registry,
     evm::{AccountInfo, InMemoryDB},
-    interpreter::{Gas, InstrStop, Interpreter, Message},
+    interpreter::{GasTracker, InstrStop, Interpreter, Message},
 };
 use evm2_jit_context::EvmContext;
 use similar_asserts::assert_eq;
@@ -405,7 +405,8 @@ fn with_evm_context_and_host_mut<
         code: Bytecode::new_legacy(Bytes::copy_from_slice(bytecode)),
         ..message
     };
-    let mut interpreter = Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
+    // SAFETY: The interpreter stays standalone.
+    let mut interpreter = unsafe { Interpreter::<BaseEvmTypes>::new_standalone(&tx_env, &message) };
     interpreter.prepare_run(host);
 
     let (mut ecx, stack, stack_len) =
@@ -504,7 +505,7 @@ fn run_compiled_test_case_with_context(
         ecx.set_static(true);
     }
     if gas_limit != DEF_GAS_LIMIT {
-        ecx.gas = Gas::new(gas_limit);
+        ecx.gas = GasTracker::new(gas_limit);
     }
     if let Some(modify_ecx) = modify_ecx {
         modify_ecx(ecx);
@@ -522,7 +523,8 @@ fn run_compiled_test_case_with_context(
         code: Bytecode::new_legacy(Bytes::copy_from_slice(bytecode)),
         ..message
     };
-    let mut interpreter = Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
+    // SAFETY: The interpreter stays standalone.
+    let mut interpreter = unsafe { Interpreter::<BaseEvmTypes>::new_standalone(&tx_env, &message) };
     let mut int_host = prepare_host(spec_id);
     let int_stop = interpreter.run(&mut int_host).unwrap();
     let int_result = int_stop;

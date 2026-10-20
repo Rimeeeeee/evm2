@@ -123,7 +123,7 @@ use crate::{
     constants::{CALL_DEPTH_LIMIT, EIP7708_TRANSFER_TOPIC},
     env::{BlockEnv, TxEnv},
     interpreter::{
-        Gas, GasTracker, Host, InstrStop, Interpreter, InterpreterPool, Message, MessageKind,
+        GasTracker, Host, InstrStop, Interpreter, InterpreterPool, Message, MessageKind,
         MessageResult, MessageResultExt, Word,
     },
     registry::{HandlerResult, TxRegistry},
@@ -1280,7 +1280,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
                 self.state.rollback(checkpoint, self.features);
                 return Ok(MessageResultExt {
                     stop,
-                    gas: *gas.tracker(),
+                    gas,
                     output: Bytes::new(),
                     created_address: None,
                     ext: T::MessageResultExt::default(),
@@ -1305,7 +1305,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
 
         Ok(MessageResultExt {
             stop,
-            gas: *gas.tracker(),
+            gas,
             output,
             created_address: stop.is_success().then_some(*address),
             ext: T::MessageResultExt::default(),
@@ -1313,7 +1313,11 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         })
     }
 
-    fn validate_create_output(&self, gas: &mut Gas, output: &mut Bytes) -> Result<(), InstrStop> {
+    fn validate_create_output(
+        &self,
+        gas: &mut GasTracker,
+        output: &mut Bytes,
+    ) -> Result<(), InstrStop> {
         if self.feature(EvmFeatures::CODE_SIZE_CHECK) && output.len() > self.version().max_code_size
         {
             return Err(InstrStop::CreateContractSizeLimit);
@@ -1443,7 +1447,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
 
         MessageResultExt {
             stop,
-            gas: *child_gas.tracker(),
+            gas: child_gas,
             output,
             created_address: None,
             ext: T::MessageResultExt::default(),

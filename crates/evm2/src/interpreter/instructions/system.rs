@@ -5,8 +5,8 @@ use crate::{
     bytecode::Bytecode,
     constants::CALL_DEPTH_LIMIT,
     interpreter::{
-        Gas, Host, InstrStop, InterpreterState, Message, MessageExt, MessageKind, Result, StackMut,
-        Word, derive_create_destination,
+        GasTracker, Host, InstrStop, InterpreterState, Message, MessageExt, MessageKind, Result,
+        StackMut, Word, derive_create_destination,
     },
     utils::WordExt,
     version::GasId,
@@ -33,7 +33,7 @@ const fn should_charge_new_account_gas(
 }
 
 fn resize_memory_range<T: EvmTypesHost>(
-    gas: &mut Gas,
+    gas: &mut GasTracker,
     state: &mut InterpreterState<'_, '_, T>,
     offset: Word,
     len: Word,
@@ -50,7 +50,7 @@ fn resize_memory_range<T: EvmTypesHost>(
 }
 
 fn get_memory_input_and_out_ranges<T: EvmTypesHost>(
-    gas: &mut Gas,
+    gas: &mut GasTracker,
     state: &mut InterpreterState<'_, '_, T>,
     input_offset: Word,
     input_len: Word,
@@ -69,11 +69,12 @@ fn memory_range_bytes<T: EvmTypesHost>(
     if range.is_empty() {
         return Ok(Bytes::new());
     }
-    Ok(Bytes::copy_from_slice(state.memory().slice(range.start, range.len())))
+    // SAFETY: Callers resize memory to cover `range` first, and memory never shrinks.
+    Ok(Bytes::copy_from_slice(unsafe { state.memory().slice(range.start, range.len()) }))
 }
 
 fn load_acc_and_calc_gas<T: EvmTypesHost>(
-    gas: &mut Gas,
+    gas: &mut GasTracker,
     state: &mut InterpreterState<'_, '_, T>,
     to: Address,
     transfers_value: bool,
@@ -153,7 +154,7 @@ fn load_acc_and_calc_gas<T: EvmTypesHost>(
 #[inline(never)]
 fn prepare_call<T: EvmTypesHost>(
     mut stack: StackMut<'_>,
-    gas: &mut Gas,
+    gas: &mut GasTracker,
     state: &mut InterpreterState<'_, '_, T>,
     kind: MessageKind,
     message: &mut Message<T>,
@@ -231,7 +232,7 @@ fn prepare_call<T: EvmTypesHost>(
 #[inline(never)]
 fn call_inner<T: EvmTypesHost>(
     mut stack: StackMut<'_>,
-    gas: &mut Gas,
+    gas: &mut GasTracker,
     state: &mut InterpreterState<'_, '_, T>,
     kind: MessageKind,
 ) -> Result {
@@ -291,7 +292,7 @@ pub fn create<const IS_CREATE2: bool>(cx: _) -> Result {
 #[inline(never)]
 fn create_inner<T: EvmTypesHost>(
     mut stack: StackMut<'_>,
-    gas: &mut Gas,
+    gas: &mut GasTracker,
     state: &mut InterpreterState<'_, '_, T>,
     is_create2: bool,
 ) -> Result {

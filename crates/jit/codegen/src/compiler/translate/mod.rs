@@ -1595,7 +1595,7 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
             return;
         }
 
-        // Modified from `Gas::record_cost`.
+        // Modified from `GasTracker::spend`.
         // This can overflow the gas counters, which has to be adjusted for after the call.
         let addr = self.gas_remaining_addr();
         let i64_type = self.bcx.type_int(64);
