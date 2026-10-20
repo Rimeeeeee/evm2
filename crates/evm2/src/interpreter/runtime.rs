@@ -1,5 +1,5 @@
 use super::{
-    BytecodeRef, Gas, GasTracker, Host, InstrStop, Memory, Message, MessageKind, Pc, Result,
+    BytecodeRef, GasTracker, Host, InstrStop, Memory, Message, MessageKind, Pc, Result,
     StackBacking, StackMut, StackRef, Word,
 };
 use crate::{
@@ -49,7 +49,7 @@ pub struct Interpreter<'frame, 'host, T: EvmTypesHost> {
     #[derive_where(skip)]
     pub(in crate::interpreter) stack: Box<StackBacking>,
 
-    pub(in crate::interpreter) gas: Gas,
+    pub(in crate::interpreter) gas: GasTracker,
     pub(in crate::interpreter) result: Result,
     error: Option<ExecutionError>,
     step_gas_before: u64,
@@ -95,7 +95,7 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
             bytecode,
             bytecode_ref: None,
             stack_len: 0,
-            gas: Gas::new(0),
+            gas: GasTracker::new(0),
             memory: Memory::new(),
             result: Ok(()),
             error: None,
@@ -136,7 +136,7 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
         self.bytecode_ref = None;
         self.bytecode = bytecode;
         self.stack_len = 0;
-        self.gas = Gas::new_with_execution_gas_and_reservoir(gas_limit, message.reservoir);
+        self.gas = GasTracker::new_with_execution_gas_and_reservoir(gas_limit, message.reservoir);
         self.memory.clear();
         self.result = Ok(());
         self.error = None;
@@ -157,7 +157,7 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     }
 
     #[cfg(test)]
-    pub(crate) fn into_parts(self) -> (Box<StackBacking>, usize, Gas, Memory, Range<u32>) {
+    pub(crate) fn into_parts(self) -> (Box<StackBacking>, usize, GasTracker, Memory, Range<u32>) {
         (self.stack, self.stack_len, self.gas, self.memory, self.output)
     }
 
@@ -250,48 +250,19 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
 
     /// Returns the current gas state.
     #[inline]
-    pub const fn gas(&self) -> Gas {
+    pub const fn gas(&self) -> GasTracker {
         self.gas
     }
 
-    /// Returns a mutable reference to the current gas tracker.
-    ///
-    /// The memory gas accounting is not reachable: it changes only with memory expansion.
-    ///
-    /// ```compile_fail,E0308
-    /// use evm2::{
-    ///     BaseEvmTypes,
-    ///     interpreter::{Gas, Interpreter},
-    /// };
-    ///
-    /// fn hook(interp: &mut Interpreter<'_, '_, BaseEvmTypes>) {
-    ///     *interp.gas_mut() = Gas::new(100);
-    /// }
-    /// ```
+    /// Returns a mutable reference to the current gas state.
     #[inline]
     pub const fn gas_mut(&mut self) -> &mut GasTracker {
-        self.gas.tracker_mut()
+        &mut self.gas
     }
 
-    /// Sets the current interpreter gas tracker from `gas`.
-    ///
-    /// Only the tracker is copied. The frame keeps its own memory gas accounting, which must
-    /// match its memory, so the memory gas of `gas` is ignored.
+    /// Sets the current interpreter gas state.
     #[inline]
-    pub const fn set_gas(&mut self, gas: Gas) {
-        *self.gas.tracker_mut() = *gas.tracker();
-    }
-
-    /// Sets the current interpreter gas state, including memory gas accounting.
-    ///
-    /// # Safety
-    ///
-    /// `gas` must carry the memory gas accounting of this frame's memory: its accounted size
-    /// must not exceed the memory length. This holds for a copy of this interpreter's gas that
-    /// was only changed by [`Memory::resize_evm`] on this interpreter's memory.
-    #[doc(hidden)]
-    #[inline]
-    pub const unsafe fn set_gas_with_memory(&mut self, gas: Gas) {
+    pub const fn set_gas(&mut self, gas: GasTracker) {
         self.gas = gas;
     }
 
@@ -352,13 +323,13 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     ///
     /// # Safety
     ///
-    /// `gas` must be this interpreter's gas or a copy of it, restored later with
-    /// [`Self::set_gas_with_memory`], so that its memory accounting matches this memory.
+    /// Growing memory may reallocate it. The caller must refresh any cached pointer to the
+    /// memory afterwards.
     #[doc(hidden)]
     #[inline]
     pub unsafe fn resize_memory_with_gas(
         &mut self,
-        gas: &mut Gas,
+        gas: &mut GasTracker,
         offset: usize,
         len: usize,
     ) -> Result {
@@ -633,13 +604,15 @@ impl<'frame, 'host, T: EvmTypesHost> InterpreterState<'frame, 'host, T> {
     }
 
     #[inline]
-    pub(in crate::interpreter) const unsafe fn gas_from_state_ptr(state: *mut Self) -> *mut Gas {
+    pub(in crate::interpreter) const unsafe fn gas_from_state_ptr(
+        state: *mut Self,
+    ) -> *mut GasTracker {
         // SAFETY: The caller upholds that `state` points to a valid interpreter state.
         unsafe { &raw mut (*state).0.gas }
     }
 
     #[inline]
-    pub(crate) const fn gas_mut(&mut self) -> &mut Gas {
+    pub(crate) const fn gas_mut(&mut self) -> &mut GasTracker {
         &mut self.0.gas
     }
 
@@ -746,7 +719,12 @@ impl<'frame, 'host, T: EvmTypesHost> InterpreterState<'frame, 'host, T> {
 
     /// Resizes linear memory using the active runtime gas parameters.
     #[inline]
-    pub(crate) fn resize_memory(&mut self, gas: &mut Gas, offset: usize, len: usize) -> Result {
+    pub(crate) fn resize_memory(
+        &mut self,
+        gas: &mut GasTracker,
+        offset: usize,
+        len: usize,
+    ) -> Result {
         // SAFETY: Resizing memory makes no host calls.
         let gas_params = unsafe { self.gas_params_detached() };
         self.0.memory.resize_evm(gas, gas_params, offset, len)
@@ -899,33 +877,6 @@ mod owned_error_tests {
         assert_eq!(result, Err(ExecutionError::Database(error)));
         assert!(interpreter.error.is_none());
         assert_eq!(interpreter.finish_run(InstrStop::Stop), Ok(InstrStop::Stop));
-    }
-}
-
-#[cfg(test)]
-mod set_gas_tests {
-    use super::*;
-    use crate::{env::TxEnvExt, interpreter::MessageExt, test_utils::TestTypes};
-
-    #[test]
-    fn set_gas_keeps_memory_accounting() {
-        let tx = TxEnvExt::default();
-        let message = MessageExt::default();
-        let params = Version::new(SpecId::FRONTIER).gas_params;
-        let mut interpreter = Interpreter::<TestTypes>::new(&tx, &message);
-        interpreter.set_gas(Gas::new(100));
-        interpreter.memory.resize_evm(&mut interpreter.gas, &params, 0, 32).unwrap();
-        interpreter.memory.as_mut_slice().fill(0xaa);
-        let memory_gas = *interpreter.gas.memory();
-
-        let mut larger = Gas::new(500);
-        Memory::new().resize_evm(&mut larger, &params, 0, 320).unwrap();
-        for gas in [Gas::new(1000), larger] {
-            interpreter.set_gas(gas);
-            assert_eq!(interpreter.gas.tracker(), gas.tracker());
-            assert_eq!(*interpreter.gas.memory(), memory_gas);
-            assert_eq!(interpreter.memory.as_slice(), [0xaa; 32]);
-        }
     }
 }
 

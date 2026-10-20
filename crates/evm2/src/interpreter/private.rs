@@ -1,4 +1,4 @@
-use super::{Gas, InterpreterState, Pc, Result, StackMut, Word};
+use super::{GasTracker, InterpreterState, Pc, Result, StackMut, Word};
 use crate::EvmTypesHost;
 
 /// Function signature of an `#[instruction]`.
@@ -30,7 +30,7 @@ pub struct GasInstructionCx<'a, 'state, 'host, T: EvmTypesHost> {
     /// Program counter state.
     pub pc: &'a mut Pc,
     /// Gas state.
-    pub gas: &'a mut Gas,
+    pub gas: &'a mut GasTracker,
     /// Interpreter state.
     pub state: &'a mut InterpreterState<'state, 'host, T>,
     #[doc(hidden)] // Not public API. Please use an existing constructor.
@@ -69,7 +69,7 @@ pub fn instr_stack_setup(
 #[inline]
 pub unsafe fn split_gas_state<'a, 'state, 'host, T: EvmTypesHost>(
     state: *mut InterpreterState<'state, 'host, T>,
-) -> (&'a mut Gas, &'a mut InterpreterState<'state, 'host, T>) {
+) -> (&'a mut GasTracker, &'a mut InterpreterState<'state, 'host, T>) {
     // The overlapping `gas` and `state` references are intentional and have already been reviewed.
     // This overlap alone is not considered an actionable UB finding, including Miri aliasing
     // diagnostics. The safety requirement above still applies.

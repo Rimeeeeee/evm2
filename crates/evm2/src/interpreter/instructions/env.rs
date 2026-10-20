@@ -1,7 +1,7 @@
 use crate::{
     EvmTypesHost,
     evm::AccountLoad,
-    interpreter::{Gas, Host, InstrStop, Memory, Result, Word, private::GasInstructionCx},
+    interpreter::{GasTracker, Host, InstrStop, Memory, Result, Word, private::GasInstructionCx},
     utils::{WordExt, address_to_word, b256_to_word, read_word_padded},
     version::GasParams,
 };
@@ -28,7 +28,7 @@ fn load_account<T: EvmTypesHost>(
 
 #[inline]
 fn copy_data(
-    gas: &mut Gas,
+    gas: &mut GasTracker,
     memory: &mut Memory,
     gas_params: &GasParams,
     memory_offset: &Word,

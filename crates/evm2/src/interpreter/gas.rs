@@ -133,6 +133,7 @@ pub(crate) const EIP2780_TX_VALUE_COST: u32 = 6_000;
 
 /// Tracks execution, state, and refunded gas.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(C)] // Puts `remaining` first.
 pub struct GasTracker {
     remaining: u64,
     gas_limit: u64,
@@ -492,268 +493,6 @@ impl RemainingGas {
     }
 }
 
-/// Interpreter gas state.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-#[repr(C)] // Puts `tracker`, and so `.remaining`, first.
-pub struct Gas {
-    tracker: GasTracker,
-    memory: MemoryGas,
-}
-
-impl Gas {
-    /// Creates gas with `limit` execution gas.
-    #[inline]
-    pub const fn new(limit: u64) -> Self {
-        Self { tracker: GasTracker::new(limit), memory: MemoryGas::new() }
-    }
-
-    /// Creates gas with execution gas and a state gas reservoir.
-    #[inline]
-    pub const fn new_with_execution_gas_and_reservoir(limit: u64, reservoir: u64) -> Self {
-        Self {
-            tracker: GasTracker::new_with_execution_gas_and_reservoir(limit, reservoir),
-            memory: MemoryGas::new(),
-        }
-    }
-
-    /// Creates spent gas with a state gas reservoir.
-    #[inline]
-    pub const fn new_spent_with_reservoir(limit: u64, reservoir: u64) -> Self {
-        Self {
-            tracker: GasTracker::new_spent_with_reservoir(limit, reservoir),
-            memory: MemoryGas::new(),
-        }
-    }
-
-    /// Returns the gas tracker.
-    #[inline]
-    pub const fn tracker(&self) -> &GasTracker {
-        &self.tracker
-    }
-
-    /// Returns the mutable gas tracker.
-    #[inline]
-    pub const fn tracker_mut(&mut self) -> &mut GasTracker {
-        &mut self.tracker
-    }
-
-    /// Returns memory gas state.
-    #[inline]
-    pub const fn memory(&self) -> &MemoryGas {
-        &self.memory
-    }
-
-    /// Returns mutable memory gas state.
-    ///
-    /// Crate-private: the accounted size must never exceed the memory buffer.
-    #[inline]
-    pub(crate) const fn memory_mut(&mut self) -> &mut MemoryGas {
-        &mut self.memory
-    }
-
-    /// Returns remaining execution gas.
-    #[inline]
-    pub const fn remaining(&self) -> u64 {
-        self.tracker.remaining()
-    }
-
-    /// Sets remaining execution gas.
-    #[inline]
-    pub const fn set_remaining(&mut self, remaining: u64) {
-        self.tracker.set_remaining(remaining);
-    }
-
-    /// Returns the gas limit.
-    #[inline]
-    pub const fn limit(&self) -> u64 {
-        self.tracker.limit()
-    }
-
-    /// Sets the gas limit.
-    #[inline]
-    pub const fn set_limit(&mut self, val: u64) {
-        self.tracker.set_limit(val);
-    }
-
-    /// Returns available state gas reservoir.
-    #[inline]
-    pub const fn reservoir(&self) -> u64 {
-        self.tracker.reservoir()
-    }
-
-    /// Sets available state gas reservoir.
-    #[inline]
-    pub const fn set_reservoir(&mut self, val: u64) {
-        self.tracker.set_reservoir(val);
-    }
-
-    /// Returns spent state gas. May be negative within a frame (see field docs).
-    #[inline]
-    pub const fn state_gas_spent(&self) -> i64 {
-        self.tracker.state_gas_spent()
-    }
-
-    /// Adds `delta` to spent state gas, saturating. May leave the total negative (see field docs).
-    #[inline]
-    pub const fn add_state_gas_spent(&mut self, delta: i64) {
-        self.tracker.add_state_gas_spent(delta);
-    }
-
-    /// Returns state gas drawn from execution gas because the reservoir was empty
-    /// (EIP-8037). See [`GasTracker::state_gas_spilled`].
-    #[inline]
-    pub const fn state_gas_spilled(&self) -> u64 {
-        self.tracker.state_gas_spilled()
-    }
-
-    /// Adds `delta` to the spilled state gas, saturating.
-    /// See [`GasTracker::add_state_gas_spilled`].
-    #[inline]
-    pub const fn add_state_gas_spilled(&mut self, delta: u64) {
-        self.tracker.add_state_gas_spilled(delta);
-    }
-
-    /// Returns gas refund.
-    #[inline]
-    pub const fn refunded(&self) -> i64 {
-        self.tracker.refunded()
-    }
-
-    /// Sets gas refund.
-    #[inline]
-    pub const fn set_refunded(&mut self, val: i64) {
-        self.tracker.set_refunded(val);
-    }
-
-    /// Sets gas refund.
-    #[inline]
-    pub const fn set_refund(&mut self, refund: i64) {
-        self.set_refunded(refund);
-    }
-
-    /// Returns spent execution gas.
-    #[inline]
-    pub const fn spent(&self) -> u64 {
-        self.tracker.spent()
-    }
-
-    /// Returns used gas after refund.
-    #[inline]
-    pub const fn used(&self) -> u64 {
-        self.tracker.used()
-    }
-
-    /// Sets spent execution gas.
-    #[inline]
-    pub const fn set_spent(&mut self, spent: u64) {
-        self.tracker.set_spent(spent);
-    }
-
-    /// Spends execution gas or returns out of gas.
-    #[doc(alias = "record_cost")]
-    #[doc(alias = "record_regular_cost")]
-    #[doc(alias = "record_cost_unsafe")]
-    #[doc(alias = "spend_unsafe")]
-    #[inline(always)]
-    pub const fn spend(&mut self, amount: u64) -> Result {
-        self.tracker.spend(amount)
-    }
-
-    /// Spends state gas.
-    #[doc(alias = "record_state_cost")]
-    #[inline]
-    pub fn spend_state(&mut self, cost: u64) -> Result {
-        self.tracker.spend_state(cost)
-    }
-
-    /// Refills the reservoir with state gas returned by 0→x→0 storage
-    /// restoration (EIP-8037). See [`GasTracker::refill_reservoir`].
-    #[inline]
-    pub const fn refill_reservoir(&mut self, amount: u64) {
-        self.tracker.refill_reservoir(amount);
-    }
-
-    /// Adds gas refund.
-    #[inline]
-    pub const fn record_refund(&mut self, refund: i64) {
-        self.tracker.record_refund(refund);
-    }
-
-    /// Returns gas to the remaining counter.
-    #[inline]
-    pub const fn erase_cost(&mut self, returned: u64) {
-        self.tracker.erase_cost(returned);
-    }
-
-    /// Merges a returning child frame's gas into this frame.
-    /// See [`GasTracker::merge_child_gas`].
-    #[inline]
-    pub const fn merge_child_gas(&mut self, child: GasTracker, stop: InstrStop) {
-        self.tracker.merge_child_gas(child, stop);
-    }
-
-    /// Spends all remaining execution gas.
-    #[inline]
-    pub const fn spend_all(&mut self) {
-        self.tracker.spend_all();
-    }
-}
-
-/// Memory gas accounting state.
-///
-/// The accounted size never exceeds the memory buffer it describes, so only memory expansion
-/// ([`Memory::resize_evm`](super::Memory::resize_evm)) changes it.
-///
-/// ```compile_fail,E0624
-/// use evm2::interpreter::Gas;
-///
-/// let mut gas = Gas::new(100);
-/// gas.memory_mut().words_num = 1_000_000;
-/// gas.memory_mut().expansion_cost = u64::MAX;
-/// ```
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Hash)]
-pub struct MemoryGas {
-    words_num: usize,
-    expansion_cost: u64,
-}
-
-impl MemoryGas {
-    /// Creates empty memory gas state.
-    #[inline]
-    pub const fn new() -> Self {
-        Self { words_num: 0, expansion_cost: 0 }
-    }
-
-    /// Returns the current memory size in EVM words.
-    #[inline]
-    pub const fn words_num(&self) -> usize {
-        self.words_num
-    }
-
-    /// Returns the current total expansion cost.
-    #[inline]
-    pub const fn expansion_cost(&self) -> u64 {
-        self.expansion_cost
-    }
-
-    /// Sets memory word count and total expansion cost, and returns the expansion cost delta.
-    ///
-    /// Returns `None` without changing the state if `expansion_cost` is below the current cost.
-    #[inline]
-    pub(crate) const fn set_words_num(
-        &mut self,
-        words_num: usize,
-        expansion_cost: u64,
-    ) -> Option<u64> {
-        let Some(delta) = expansion_cost.checked_sub(self.expansion_cost) else {
-            return None;
-        };
-        self.words_num = words_num;
-        self.expansion_cost = expansion_cost;
-        Some(delta)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -767,36 +506,36 @@ mod tests {
 
     #[test]
     fn test_spend_state() {
-        let mut gas = Gas::new_with_execution_gas_and_reservoir(1000, 500);
+        let mut gas = GasTracker::new_with_execution_gas_and_reservoir(1000, 500);
         assert!(gas.spend_state(200).is_ok());
         assert_eq!((gas.reservoir(), gas.remaining(), gas.state_gas_spent()), (300, 1000, 200));
 
-        let mut gas = Gas::new_with_execution_gas_and_reservoir(1000, 500);
+        let mut gas = GasTracker::new_with_execution_gas_and_reservoir(1000, 500);
         assert!(gas.spend_state(500).is_ok());
         assert_eq!((gas.reservoir(), gas.remaining(), gas.state_gas_spent()), (0, 1000, 500));
 
-        let mut gas = Gas::new_with_execution_gas_and_reservoir(1000, 300);
+        let mut gas = GasTracker::new_with_execution_gas_and_reservoir(1000, 300);
         assert!(gas.spend_state(500).is_ok());
         assert_eq!((gas.reservoir(), gas.remaining(), gas.state_gas_spent()), (0, 800, 500));
 
-        let mut gas = Gas::new(1000);
+        let mut gas = GasTracker::new(1000);
         assert!(gas.spend_state(200).is_ok());
         assert_eq!((gas.reservoir(), gas.remaining(), gas.state_gas_spent()), (0, 800, 200));
 
-        let mut gas = Gas::new_with_execution_gas_and_reservoir(100, 50);
+        let mut gas = GasTracker::new_with_execution_gas_and_reservoir(100, 50);
         assert!(gas.spend_state(0).is_ok());
         assert_eq!((gas.reservoir(), gas.remaining(), gas.state_gas_spent()), (50, 100, 0));
 
-        let mut gas = Gas::new_with_execution_gas_and_reservoir(100, 50);
+        let mut gas = GasTracker::new_with_execution_gas_and_reservoir(100, 50);
         assert_matches!(gas.spend_state(200), Err(InstrStop::OutOfGas));
 
-        let mut gas = Gas::new_with_execution_gas_and_reservoir(2000, 1000);
+        let mut gas = GasTracker::new_with_execution_gas_and_reservoir(2000, 1000);
         assert!(gas.spend_state(100).is_ok());
         assert!(gas.spend_state(200).is_ok());
         assert!(gas.spend_state(150).is_ok());
         assert_eq!(gas.state_gas_spent(), 450);
 
-        let mut gas = Gas::new_with_execution_gas_and_reservoir(500, 300);
+        let mut gas = GasTracker::new_with_execution_gas_and_reservoir(500, 300);
         assert!(gas.spend_state(150).is_ok());
         assert_eq!((gas.reservoir(), gas.remaining()), (150, 500));
         assert!(gas.spend_state(200).is_ok());
@@ -807,11 +546,11 @@ mod tests {
 
     #[test]
     fn test_spend_state_oog_does_not_inflate_state_gas_spent() {
-        let mut gas = Gas::new(30);
+        let mut gas = GasTracker::new(30);
         assert_matches!(gas.spend_state(100), Err(InstrStop::OutOfGas));
         assert_eq!(gas.state_gas_spent(), 0);
 
-        let mut gas = Gas::new_with_execution_gas_and_reservoir(30, 20);
+        let mut gas = GasTracker::new_with_execution_gas_and_reservoir(30, 20);
         assert_matches!(gas.spend_state(100), Err(InstrStop::OutOfGas));
         assert_eq!(gas.state_gas_spent(), 0);
         assert_eq!(gas.reservoir(), 20);
@@ -820,7 +559,7 @@ mod tests {
     #[test]
     fn test_spend_state_tracks_spilled() {
         // No spill while the reservoir covers the charge.
-        let mut gas = Gas::new_with_execution_gas_and_reservoir(1000, 500);
+        let mut gas = GasTracker::new_with_execution_gas_and_reservoir(1000, 500);
         assert!(gas.spend_state(300).is_ok());
         assert_eq!((gas.state_gas_spilled(), gas.reservoir()), (0, 200));
 
@@ -836,9 +575,9 @@ mod tests {
     #[test]
     fn test_rollback_state_gas_no_spill() {
         // Pure-reservoir spend: unwind restores the reservoir, leaving execution gas alone.
-        let mut gas = Gas::new_with_execution_gas_and_reservoir(1000, 500);
+        let mut gas = GasTracker::new_with_execution_gas_and_reservoir(1000, 500);
         assert!(gas.spend_state(300).is_ok());
-        gas.tracker_mut().rollback_state_gas();
+        gas.rollback_state_gas();
         assert_eq!(
             (gas.reservoir(), gas.remaining(), gas.state_gas_spent(), gas.state_gas_spilled()),
             (500, 1000, 0, 0)
@@ -849,10 +588,10 @@ mod tests {
     fn test_rollback_state_gas_with_spill() {
         // Reservoir exhausted then spilled: unwind returns the spill to execution gas
         // and restores the reservoir to its frame-start value.
-        let mut gas = Gas::new_with_execution_gas_and_reservoir(1000, 200);
+        let mut gas = GasTracker::new_with_execution_gas_and_reservoir(1000, 200);
         assert!(gas.spend_state(500).is_ok());
         assert_eq!((gas.reservoir(), gas.remaining(), gas.state_gas_spilled()), (0, 700, 300));
-        gas.tracker_mut().rollback_state_gas();
+        gas.rollback_state_gas();
         assert_eq!(
             (gas.reservoir(), gas.remaining(), gas.state_gas_spent(), gas.state_gas_spilled()),
             (200, 1000, 0, 0)
@@ -862,7 +601,7 @@ mod tests {
     #[test]
     fn test_refill_reservoir_lifo() {
         // Refill credits the spilled (execution-gas) portion first, remainder to reservoir.
-        let mut gas = Gas::new_with_execution_gas_and_reservoir(1000, 200);
+        let mut gas = GasTracker::new_with_execution_gas_and_reservoir(1000, 200);
         assert!(gas.spend_state(500).is_ok()); // spill 300, reservoir 0, remaining 700
         assert_eq!((gas.reservoir(), gas.remaining(), gas.state_gas_spilled()), (0, 700, 300));
         // Refund 200: less than the 300 spilled, so it all returns to execution gas.
@@ -880,7 +619,7 @@ mod tests {
 
         // With no spill recorded, the refill lands entirely in the reservoir and may
         // drive `state_gas_spent` negative (charge made by a parent frame).
-        let mut gas = Gas::new_with_execution_gas_and_reservoir(1000, 100);
+        let mut gas = GasTracker::new_with_execution_gas_and_reservoir(1000, 100);
         gas.refill_reservoir(300);
         assert_eq!(
             (gas.reservoir(), gas.remaining(), gas.state_gas_spent(), gas.state_gas_spilled()),
@@ -892,11 +631,11 @@ mod tests {
     fn test_rollback_state_gas_after_refill() {
         // A partial refill returns part of the spill to execution gas; unwind still
         // restores the original split.
-        let mut gas = Gas::new_with_execution_gas_and_reservoir(1000, 200);
+        let mut gas = GasTracker::new_with_execution_gas_and_reservoir(1000, 200);
         assert!(gas.spend_state(500).is_ok()); // spill 300, reservoir 0, remaining 700
         gas.refill_reservoir(100); // LIFO: remaining 800, spilled 200, reservoir 0
         assert_eq!((gas.reservoir(), gas.remaining(), gas.state_gas_spilled()), (0, 800, 200));
-        gas.tracker_mut().rollback_state_gas();
+        gas.rollback_state_gas();
         assert_eq!(
             (gas.reservoir(), gas.remaining(), gas.state_gas_spent(), gas.state_gas_spilled()),
             (200, 1000, 0, 0)
@@ -956,7 +695,7 @@ mod tests {
 
     #[test]
     fn test_spend_state_zero_remaining_with_reservoir() {
-        let mut gas = Gas::new_with_execution_gas_and_reservoir(0, 500);
+        let mut gas = GasTracker::new_with_execution_gas_and_reservoir(0, 500);
         assert!(gas.spend_state(200).is_ok());
         assert_eq!((gas.reservoir(), gas.remaining(), gas.state_gas_spent()), (300, 0, 200));
 
@@ -964,14 +703,5 @@ mod tests {
         assert_eq!((gas.reservoir(), gas.remaining(), gas.state_gas_spent()), (0, 0, 500));
 
         assert_matches!(gas.spend_state(1), Err(InstrStop::OutOfGas));
-    }
-
-    #[test]
-    fn set_words_num_rejects_cost_decrease_without_mutating() {
-        let mut memory = MemoryGas::new();
-        assert_eq!(memory.set_words_num(1, 3), Some(3));
-
-        assert_eq!(memory.set_words_num(2, 1), None);
-        assert_eq!((memory.words_num(), memory.expansion_cost()), (1, 3));
     }
 }

@@ -4,7 +4,7 @@ use crate::{
     constants::STACK_LIMIT,
     interpreter::{
         InterpreterState, Pc, Result, Stack, StackBacking,
-        gas::{Gas, RemainingGas},
+        gas::{GasTracker, RemainingGas},
     },
 };
 
@@ -39,12 +39,12 @@ pub(super) fn dispatch_loop_call<T: EvmTypesHost>(
 }
 
 #[inline(always)]
-pub(super) const fn loop_state(gas: &Gas) -> LoopState {
+pub(super) const fn loop_state(gas: &GasTracker) -> LoopState {
     RemainingGas::new(gas.remaining())
 }
 
 #[inline(always)]
-pub(super) const fn finish_loop(gas: &mut Gas, remaining_gas: LoopState) {
+pub(super) const fn finish_loop(gas: &mut GasTracker, remaining_gas: LoopState) {
     gas.set_remaining(remaining_gas.get());
 }
 

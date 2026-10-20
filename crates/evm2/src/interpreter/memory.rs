@@ -1,12 +1,18 @@
-use super::{Gas, InstrStop, Result, Word};
+use super::{GasTracker, InstrStop, Result, Word};
 use crate::{utils::num_words, version::GasParams};
 use alloc::vec::Vec;
 use core::{cmp::min, fmt, hint::cold_path, ops::Range};
 
 /// Linear EVM memory.
+///
+/// Memory owns its expansion accounting, and grows only through
+/// [`resize_evm`](Self::resize_evm), so its length is always the whole number of words charged
+/// for.
 pub struct Memory {
     data: Vec<u8>,
     memory_limit: u64,
+    /// Total expansion cost charged for the current length.
+    expansion_cost: u64,
 }
 
 impl Default for Memory {
@@ -32,7 +38,7 @@ impl Memory {
     /// Creates memory with the requested capacity.
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
-        Self { data: Vec::with_capacity(capacity), memory_limit: u64::MAX }
+        Self { data: Vec::with_capacity(capacity), memory_limit: u64::MAX, expansion_cost: 0 }
     }
 
     /// Returns the memory byte limit.
@@ -77,6 +83,7 @@ impl Memory {
     #[inline]
     pub(crate) fn clear(&mut self) {
         self.data.clear();
+        self.expansion_cost = 0;
     }
 
     #[inline]
@@ -88,18 +95,19 @@ impl Memory {
 
     /// Resizes memory to cover `offset..offset + len` and charges EVM expansion gas.
     ///
-    /// On failure, neither the memory nor the memory accounting in `gas` changes.
+    /// On failure, neither the memory nor `gas` changes, except that `gas` is left spent when it
+    /// runs out.
     #[inline]
     pub fn resize_evm(
         &mut self,
-        gas: &mut Gas,
+        gas: &mut GasTracker,
         gas_params: &GasParams,
         offset: usize,
         len: usize,
     ) -> Result {
-        let new_num_words = num_words(offset.saturating_add(len));
-        if new_num_words > gas.memory().words_num() {
-            return self.resize_evm_cold(gas, gas_params, new_num_words);
+        let end = offset.saturating_add(len);
+        if end > self.data.len() {
+            return self.resize_evm_cold(gas, gas_params, num_words(end));
         }
 
         Ok(())
@@ -109,7 +117,7 @@ impl Memory {
     #[inline(never)]
     fn resize_evm_cold(
         &mut self,
-        gas: &mut Gas,
+        gas: &mut GasTracker,
         gas_params: &GasParams,
         new_num_words: usize,
     ) -> Result {
@@ -123,16 +131,15 @@ impl Memory {
             return Err(InstrStop::MemoryLimitOOG);
         }
 
-        let mut memory_gas = *gas.memory();
-        let cost = gas_params.memory_cost(new_num_words);
-        let Some(cost) = memory_gas.set_words_num(new_num_words, cost) else {
+        let expansion_cost = gas_params.memory_cost(new_num_words);
+        let Some(cost) = expansion_cost.checked_sub(self.expansion_cost) else {
             cold_path();
             return Err(InstrStop::MemoryOOG);
         };
 
         gas.spend(cost).map_err(|_| InstrStop::MemoryOOG)?;
         self.grow_to(new_size);
-        *gas.memory_mut() = memory_gas;
+        self.expansion_cost = expansion_cost;
         Ok(())
     }
 
@@ -281,13 +288,12 @@ mod tests {
 
     #[test]
     fn resize_evm_accounts_expansion_gas() {
-        let mut gas = Gas::new(100);
+        let mut gas = GasTracker::new(100);
         let mut memory = Memory::new();
 
         let gas_params = Version::new(SpecId::FRONTIER).gas_params;
         memory.resize_evm(&mut gas, &gas_params, 0, 32).unwrap();
         assert_eq!(gas.remaining(), 97);
-        assert_eq!(gas.memory().words_num(), 1);
         assert_eq!(memory.len(), 32);
 
         let gas_params = Version::new(SpecId::FRONTIER).gas_params;
@@ -298,13 +304,12 @@ mod tests {
         let gas_params = Version::new(SpecId::FRONTIER).gas_params;
         memory.resize_evm(&mut gas, &gas_params, 0, 64).unwrap();
         assert_eq!(gas.remaining(), 94);
-        assert_eq!(gas.memory().words_num(), 2);
         assert_eq!(memory.len(), 64);
     }
 
     #[test]
     fn resize_evm_respects_memory_limit() {
-        let mut gas = Gas::new(100_000);
+        let mut gas = GasTracker::new(100_000);
         let mut memory = Memory::new();
         memory.set_memory_limit(64);
 
@@ -320,7 +325,6 @@ mod tests {
             Err(InstrStop::MemoryLimitOOG)
         );
         assert_eq!(memory.len(), 64);
-        assert_eq!(gas.memory().words_num(), 2);
     }
 
     #[test]
@@ -328,14 +332,14 @@ mod tests {
         let gas_params = Version::new(SpecId::FRONTIER).gas_params;
         let mut memory = Memory::new();
 
-        let mut gas = Gas::new(2);
+        let mut gas = GasTracker::new(2);
         assert_matches!(memory.resize_evm(&mut gas, &gas_params, 0, 32), Err(InstrStop::MemoryOOG));
         assert_eq!(memory.len(), 0);
-        assert_eq!((gas.memory().words_num(), gas.memory().expansion_cost()), (0, 0));
+        assert_eq!(memory.expansion_cost, 0);
 
-        let mut gas = Gas::new(3);
+        let mut gas = GasTracker::new(3);
         memory.resize_evm(&mut gas, &gas_params, 0, 32).unwrap();
         assert_eq!(memory.len(), 32);
-        assert_eq!((gas.memory().words_num(), gas.memory().expansion_cost()), (1, 3));
+        assert_eq!(memory.expansion_cost, 3);
     }
 }

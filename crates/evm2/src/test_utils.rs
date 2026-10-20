@@ -5,7 +5,7 @@ use crate::{
     env::{BlockEnv, BlockEnvExt, TxEnv, TxEnvExt},
     evm::{AccountLoad, SLoad, SStore, SelfDestructResult},
     interpreter::{
-        Gas, GasTracker, Host, InstrStop, Interpreter, Memory, Message, MessageExt, MessageKind,
+        GasTracker, Host, InstrStop, Interpreter, Memory, Message, MessageExt, MessageKind,
         MessageResult, MessageResultExt, StackBacking, Word, op,
     },
     storage_key::{StorageKey, StorageKeyMap},
@@ -241,7 +241,7 @@ impl Host<TestTypes> for TestHost {
 pub(crate) struct TestInterpreter {
     pub(crate) stack: Box<StackBacking>,
     pub(crate) stack_len: usize,
-    pub(crate) gas: Gas,
+    pub(crate) gas: GasTracker,
     pub(crate) memory: Memory,
     pub(crate) output: Range<u32>,
     pub(crate) err: InstrStop,

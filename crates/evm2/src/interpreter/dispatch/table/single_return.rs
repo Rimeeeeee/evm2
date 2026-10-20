@@ -1,6 +1,6 @@
 use crate::{
     EvmConfig, EvmTypesHost,
-    interpreter::{InterpreterState, Pc, Stack, StackBacking, StackMut, gas::Gas},
+    interpreter::{InterpreterState, Pc, Stack, StackBacking, StackMut, gas::GasTracker},
 };
 
 pub(super) type LoopState = ();
@@ -25,10 +25,10 @@ pub(super) fn dispatch_loop_call<T: EvmTypesHost>(
 }
 
 #[inline(always)]
-pub(super) const fn loop_state(_gas: &Gas) -> LoopState {}
+pub(super) const fn loop_state(_gas: &GasTracker) -> LoopState {}
 
 #[inline(always)]
-pub(super) const fn finish_loop(_gas: &mut Gas, _loop_state: LoopState) {}
+pub(super) const fn finish_loop(_gas: &mut GasTracker, _loop_state: LoopState) {}
 
 #[inline(always)]
 pub(super) const fn sync_loop_state<T: EvmTypesHost>(
