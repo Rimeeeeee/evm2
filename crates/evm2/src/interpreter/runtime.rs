@@ -162,7 +162,8 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     #[inline]
     pub fn output(&self) -> &[u8] {
         let start = self.output.start as usize;
-        // SAFETY: `output` ends within memory, which never shrinks.
+        // SAFETY: `output` ends within memory: `set_output` checks it, and `init` resets it
+        // together with memory.
         unsafe { self.memory.slice(start, self.output.len()) }
     }
 

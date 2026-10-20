@@ -823,7 +823,8 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     #[inline]
     pub(crate) fn inspector_slot(&self) -> Option<&'a InspectorSlot<'a, T>> {
         // SAFETY: The slot is boxed, and replacing or removing it asserts that the EVM is not
-        // running, so it outlives every hook that the returned reference runs.
+        // running, so it outlives every hook that the returned reference runs. System calls
+        // clear `running` only around code that holds no user `&mut Evm`.
         self.inspector.as_deref().map(|slot| unsafe { trustme::decouple_lt(slot) })
     }
 
@@ -846,8 +847,8 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     ///
     /// Precompiles and handlers that emit logs should check this before building them.
     #[inline]
-    pub const fn logs_observed(&self) -> bool {
-        self.feature(EvmFeatures::LOG_COLLECTION) || self.inspector.is_some()
+    pub fn logs_observed(&self) -> bool {
+        self.feature(EvmFeatures::LOG_COLLECTION) || self.idle_inspector().is_some()
     }
 
     /// Notifies the inspector and records an emitted log if [`EvmFeatures::LOG_COLLECTION`] is
