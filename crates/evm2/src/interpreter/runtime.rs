@@ -1,6 +1,6 @@
 use super::{
-    BytecodeRef, Gas, Host, InstrStop, Memory, Message, MessageKind, Pc, Result, StackBacking,
-    StackMut, StackRef, Word,
+    BytecodeRef, Gas, GasTracker, Host, InstrStop, Memory, Message, MessageKind, Pc, Result,
+    StackBacking, StackMut, StackRef, Word,
 };
 use crate::{
     EvmTypesHost, ExecutionConfig, ExecutionError, HostError, SpecId, Version,
@@ -17,6 +17,17 @@ use core::{fmt, hint::cold_path, ops::Range, ptr::NonNull};
 use derive_where::derive_where;
 
 /// EVM interpreter.
+///
+/// Safe code cannot construct an interpreter, so it cannot swap a fresh one in for the running
+/// one and replace its memory and gas accounting:
+///
+/// ```compile_fail,E0624
+/// use evm2::{BaseEvmTypes, interpreter::Interpreter};
+///
+/// fn hook(interp: &mut Interpreter<'_, '_, BaseEvmTypes>) {
+///     *interp = Interpreter::new(interp.tx_env(), interp.message());
+/// }
+/// ```
 #[derive_where(Debug)]
 pub struct Interpreter<'frame, 'host, T: EvmTypesHost> {
     pub(in crate::interpreter) bytecode: Bytecode,
@@ -64,7 +75,10 @@ where
 impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     /// Creates an interpreter from a transaction-global environment and a frame-local message,
     /// which carries the bytecode to run.
-    pub fn new(tx_env: &'frame TxEnv<T>, message: &'frame Message<T>) -> Self {
+    ///
+    /// Crate-private: safe code could otherwise swap a fresh interpreter in for the running one,
+    /// replacing its memory and gas accounting.
+    pub(crate) fn new(tx_env: &'frame TxEnv<T>, message: &'frame Message<T>) -> Self {
         // SAFETY: Calling init right after.
         let mut interp = unsafe { Self::uninit() };
         interp.init(tx_env, message);
@@ -99,6 +113,18 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
             // SAFETY: `MaybeUninit<Word>` does not need initialization.
             stack: unsafe { Box::new_uninit().assume_init() },
         }
+    }
+
+    /// Creates an interpreter that is not part of any running execution, for tests and benches.
+    ///
+    /// # Safety
+    ///
+    /// The interpreter must stay standalone: it must not be assigned over, swapped with, or
+    /// otherwise moved into another interpreter that is running, as that would replace the
+    /// running interpreter's memory and gas accounting.
+    #[doc(hidden)]
+    pub unsafe fn new_standalone(tx_env: &'frame TxEnv<T>, message: &'frame Message<T>) -> Self {
+        Self::new(tx_env, message)
     }
 
     /// Initializes this interpreter for a new frame, retaining reusable allocations.
@@ -139,7 +165,8 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     #[inline]
     pub fn output(&self) -> &[u8] {
         let start = self.output.start as usize;
-        self.memory.slice(start, self.output.len())
+        // SAFETY: `output` ends within memory, which never shrinks.
+        unsafe { self.memory.slice(start, self.output.len()) }
     }
 
     /// Returns the current frame output memory range.
@@ -149,8 +176,13 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     }
 
     /// Sets the current frame output memory range.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the range ends beyond the current memory length.
     #[inline]
-    pub const fn set_output(&mut self, output: Range<u32>) {
+    pub fn set_output(&mut self, output: Range<u32>) {
+        assert!(output.end as usize <= self.memory.len(), "output range out of memory bounds");
         self.output = output;
     }
 
@@ -222,15 +254,44 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
         self.gas
     }
 
-    /// Returns a reference to the current gas state.
+    /// Returns a mutable reference to the current gas tracker.
+    ///
+    /// The memory gas accounting is not reachable: it changes only with memory expansion.
+    ///
+    /// ```compile_fail,E0308
+    /// use evm2::{
+    ///     BaseEvmTypes,
+    ///     interpreter::{Gas, Interpreter},
+    /// };
+    ///
+    /// fn hook(interp: &mut Interpreter<'_, '_, BaseEvmTypes>) {
+    ///     *interp.gas_mut() = Gas::new(100);
+    /// }
+    /// ```
     #[inline]
-    pub const fn gas_mut(&mut self) -> &mut Gas {
-        &mut self.gas
+    pub const fn gas_mut(&mut self) -> &mut GasTracker {
+        self.gas.tracker_mut()
     }
 
-    /// Sets the current interpreter gas state.
+    /// Sets the current interpreter gas tracker from `gas`.
+    ///
+    /// Only the tracker is copied. The frame keeps its own memory gas accounting, which must
+    /// match its memory, so the memory gas of `gas` is ignored.
     #[inline]
     pub const fn set_gas(&mut self, gas: Gas) {
+        *self.gas.tracker_mut() = *gas.tracker();
+    }
+
+    /// Sets the current interpreter gas state, including memory gas accounting.
+    ///
+    /// # Safety
+    ///
+    /// `gas` must carry the memory gas accounting of this frame's memory: its accounted size
+    /// must not exceed the memory length. This holds for a copy of this interpreter's gas that
+    /// was only changed by [`Memory::resize_evm`] on this interpreter's memory.
+    #[doc(hidden)]
+    #[inline]
+    pub const unsafe fn set_gas_with_memory(&mut self, gas: Gas) {
         self.gas = gas;
     }
 
@@ -240,10 +301,70 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
         &self.memory
     }
 
-    /// Returns the current mutable linear memory.
+    /// Returns the current mutable linear memory bytes.
+    ///
+    /// The length is fixed: memory grows only through EVM memory expansion.
+    ///
+    /// ```compile_fail,E0599
+    /// use evm2::{BaseEvmTypes, interpreter::Interpreter};
+    ///
+    /// fn hook(interp: &mut Interpreter<'_, '_, BaseEvmTypes>) {
+    ///     interp.memory_mut().clear();
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail,E0599
+    /// use evm2::{BaseEvmTypes, interpreter::Interpreter};
+    ///
+    /// fn hook(interp: &mut Interpreter<'_, '_, BaseEvmTypes>) {
+    ///     interp.memory_mut().resize(0, 8192);
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail,E0308
+    /// use evm2::{
+    ///     BaseEvmTypes,
+    ///     interpreter::{Interpreter, Memory},
+    /// };
+    ///
+    /// fn hook(interp: &mut Interpreter<'_, '_, BaseEvmTypes>) {
+    ///     *interp.memory_mut() = Memory::new();
+    /// }
+    /// ```
     #[inline]
-    pub const fn memory_mut(&mut self) -> &mut Memory {
+    pub const fn memory_mut(&mut self) -> &mut [u8] {
+        self.memory.as_mut_slice()
+    }
+
+    /// Returns the current mutable linear memory.
+    ///
+    /// # Safety
+    ///
+    /// The caller must only read and write bytes through it: it must not grow, shrink or
+    /// reallocate the memory, or change its limit. Use [`Self::resize_memory_with_gas`] to grow.
+    #[doc(hidden)]
+    #[inline]
+    pub const unsafe fn memory_mut_unchecked(&mut self) -> &mut Memory {
         &mut self.memory
+    }
+
+    /// Resizes memory to cover `offset..offset + len`, charging expansion gas to `gas`.
+    ///
+    /// # Safety
+    ///
+    /// `gas` must be this interpreter's gas or a copy of it, restored later with
+    /// [`Self::set_gas_with_memory`], so that its memory accounting matches this memory.
+    #[doc(hidden)]
+    #[inline]
+    pub unsafe fn resize_memory_with_gas(
+        &mut self,
+        gas: &mut Gas,
+        offset: usize,
+        len: usize,
+    ) -> Result {
+        // SAFETY: Resizing memory makes no host calls.
+        let gas_params = unsafe { &self.version_detached().gas_params };
+        self.memory.resize_evm(gas, gas_params, offset, len)
     }
 
     /// Returns the current interpreter result.
@@ -765,6 +886,33 @@ mod owned_error_tests {
         assert_eq!(result, Err(ExecutionError::Database(error)));
         assert!(interpreter.error.is_none());
         assert_eq!(interpreter.finish_run(InstrStop::Stop), Ok(InstrStop::Stop));
+    }
+}
+
+#[cfg(test)]
+mod set_gas_tests {
+    use super::*;
+    use crate::{env::TxEnvExt, interpreter::MessageExt, test_utils::TestTypes};
+
+    #[test]
+    fn set_gas_keeps_memory_accounting() {
+        let tx = TxEnvExt::default();
+        let message = MessageExt::default();
+        let params = Version::new(SpecId::FRONTIER).gas_params;
+        let mut interpreter = Interpreter::<TestTypes>::new(&tx, &message);
+        interpreter.set_gas(Gas::new(100));
+        interpreter.memory.resize_evm(&mut interpreter.gas, &params, 0, 32).unwrap();
+        interpreter.memory.as_mut_slice().fill(0xaa);
+        let memory_gas = *interpreter.gas.memory();
+
+        let mut larger = Gas::new(500);
+        Memory::new().resize_evm(&mut larger, &params, 0, 320).unwrap();
+        for gas in [Gas::new(1000), larger] {
+            interpreter.set_gas(gas);
+            assert_eq!(interpreter.gas.tracker(), gas.tracker());
+            assert_eq!(*interpreter.gas.memory(), memory_gas);
+            assert_eq!(interpreter.memory.as_slice(), [0xaa; 32]);
+        }
     }
 }
 

@@ -176,7 +176,8 @@ mod tests {
             code: Bytecode::new_legacy(Bytes::from(opcodes)),
             ..Message::<BaseEvmTypes>::default()
         };
-        let mut interp = Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
+        // SAFETY: The interpreter stays standalone.
+        let mut interp = unsafe { Interpreter::<BaseEvmTypes>::new_standalone(&tx_env, &message) };
 
         for _ in &opcodes {
             opcode_counter.step(&mut interp);
@@ -194,7 +195,8 @@ mod tests {
             code: Bytecode::new_legacy(Bytes::from(opcodes)),
             ..Message::<BaseEvmTypes>::default()
         };
-        let mut interp = Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
+        // SAFETY: The interpreter stays standalone.
+        let mut interp = unsafe { Interpreter::<BaseEvmTypes>::new_standalone(&tx_env, &message) };
 
         for _ in &opcodes {
             opcode_counter.step(&mut interp);

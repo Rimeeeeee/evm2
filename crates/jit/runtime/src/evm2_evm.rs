@@ -211,7 +211,9 @@ mod tests {
             code: Bytecode::new_legacy(Bytes::from_static(&[op::STOP])),
             ..Default::default()
         };
-        let mut interpreter = Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
+        // SAFETY: The interpreter stays standalone.
+        let mut interpreter =
+            unsafe { Interpreter::<BaseEvmTypes>::new_standalone(&tx_env, &message) };
         let mut host = Evm::<BaseEvmTypes>::new(
             SpecId::CANCUN,
             BlockEnvExt::default(),
@@ -269,7 +271,9 @@ mod tests {
             code: Bytecode::new_legacy(code.into()),
             ..MessageExt::default()
         };
-        let mut interpreter = Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
+        // SAFETY: The interpreter stays standalone.
+        let mut interpreter =
+            unsafe { Interpreter::<BaseEvmTypes>::new_standalone(&tx_env, &message) };
 
         assert_eq!(run_interpreter(&backend, &mut interpreter, &mut host), Some(InstrStop::Return));
         assert_eq!(interpreter.output().len(), 32);
@@ -327,7 +331,9 @@ mod tests {
             code: Bytecode::new_legacy(Bytes::copy_from_slice(&code)),
             ..MessageExt::default()
         };
-        let mut interpreter = Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
+        // SAFETY: The interpreter stays standalone.
+        let mut interpreter =
+            unsafe { Interpreter::<BaseEvmTypes>::new_standalone(&tx_env, &message) };
 
         assert_eq!(run_interpreter(&backend, &mut interpreter, &mut host), Some(InstrStop::Return));
         assert_eq!(interpreter.output().len(), 32);
@@ -388,7 +394,9 @@ mod tests {
             code: Bytecode::new_legacy(Bytes::copy_from_slice(&code)),
             ..MessageExt::default()
         };
-        let mut interpreter = Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
+        // SAFETY: The interpreter stays standalone.
+        let mut interpreter =
+            unsafe { Interpreter::<BaseEvmTypes>::new_standalone(&tx_env, &message) };
 
         assert_eq!(run_interpreter(&backend, &mut interpreter, &mut host), Some(InstrStop::Return));
         assert_eq!(interpreter.output().len(), 32);
@@ -458,7 +466,9 @@ mod tests {
             code: Bytecode::new_legacy(Bytes::copy_from_slice(&code)),
             ..MessageExt::default()
         };
-        let mut interpreter = Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
+        // SAFETY: The interpreter stays standalone.
+        let mut interpreter =
+            unsafe { Interpreter::<BaseEvmTypes>::new_standalone(&tx_env, &message) };
 
         assert_eq!(run_interpreter(&backend, &mut interpreter, &mut host), Some(InstrStop::Stop));
         let beneficiary_balance = host.read_account_info(&beneficiary).unwrap().unwrap().balance;
@@ -517,7 +527,9 @@ mod tests {
             if with_jit {
                 host.set_interpreter_runner(JitInterpreterRunner::new(backend.clone()));
             }
-            let mut interpreter = Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
+            // SAFETY: The interpreter stays standalone.
+            let mut interpreter =
+                unsafe { Interpreter::<BaseEvmTypes>::new_standalone(&tx_env, &message) };
             let stop = if with_jit {
                 run_interpreter(&backend, &mut interpreter, &mut host).unwrap()
             } else {

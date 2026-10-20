@@ -491,7 +491,7 @@ impl TracingInspector {
                 {
                     return Some(memory.clone());
                 }
-                let bytes = interp.memory().slice(0, interp.memory().len());
+                let bytes = interp.memory().as_slice();
                 self.budget.reserve(bytes.len()).then(|| RecordedMemory::new(bytes))
             })
             .flatten();
@@ -688,10 +688,7 @@ impl TracingInspector {
                 {
                     range.end = range.start + range.len().min(interp.return_data().len());
                 }
-                delta.record_memory_write(
-                    interp.memory().slice(0, interp.memory().len()),
-                    &mut self.budget,
-                );
+                delta.record_memory_write(interp.memory().as_slice(), &mut self.budget);
             }
         }
     }

@@ -202,7 +202,8 @@ fn do_keccak256(
         ecx.gas.spend(ecx.gas_params().keccak256_word_cost(len))?;
         let offset = word_to_usize(offset.to_u256())?;
         ensure_memory(ecx, offset, len)?;
-        keccak256(ecx.memory().slice(offset, len))
+        // SAFETY: `ensure_memory` grew memory to cover `offset..offset + len`.
+        keccak256(unsafe { ecx.memory().slice(offset, len) })
     });
     Ok(())
 }
@@ -252,7 +253,8 @@ pub unsafe extern "C" fn __revmc_builtin_calldatacopy(
         let data_offset = word_to_usize_saturated(data_offset.to_u256());
         let input = ecx.input().as_ref();
         let input = unsafe { core::slice::from_raw_parts(input.as_ptr(), input.len()) };
-        ecx.memory_mut().set_data(memory_offset, data_offset, len, input);
+        // SAFETY: `ensure_memory` grew memory to cover `memory_offset..memory_offset + len`.
+        unsafe { ecx.memory_mut().set_data(memory_offset, data_offset, len, input) };
     }
     Ok(())
 }
@@ -295,7 +297,9 @@ pub unsafe extern "C" fn __revmc_builtin_extcodecopy(
     let code = account.code.original_bytes();
 
     let code_offset_usize = core::cmp::min(word_to_usize_saturated(code_offset.to_u256()), code.len());
-    ecx.memory_mut().set_data(memory_offset_usize, code_offset_usize, len, &code);
+    // SAFETY: If `len` is non-zero, `ensure_memory` grew memory to cover
+    // `memory_offset_usize..memory_offset_usize + len`.
+    unsafe { ecx.memory_mut().set_data(memory_offset_usize, code_offset_usize, len, &code) };
     Ok(())
 }
 
@@ -321,7 +325,8 @@ pub unsafe extern "C" fn __revmc_builtin_returndatacopy(
         let return_data = ecx.return_data();
         let data =
             unsafe { core::slice::from_raw_parts(return_data.as_ptr().add(data_offset), len) };
-        ecx.memory_mut().set(memory_offset, data);
+        // SAFETY: `ensure_memory` grew memory to cover `memory_offset..memory_offset + len`.
+        unsafe { ecx.memory_mut().set(memory_offset, data) };
     }
     Ok(())
 }
@@ -503,7 +508,8 @@ pub unsafe extern "C" fn __revmc_builtin_mcopy(
         let dst = word_to_usize(dst.to_u256())?;
         let src = word_to_usize(src.to_u256())?;
         ensure_memory(ecx, dst.max(src), len)?;
-        ecx.memory_mut().copy(dst, src, len);
+        // SAFETY: The memory is only accessed through `copy`, which bounds-checks.
+        unsafe { ecx.memory_mut().copy(dst, src, len) };
     }
     Ok(())
 }
@@ -535,7 +541,9 @@ pub unsafe extern "C" fn __revmc_builtin_log(
 
     let address = &ecx.message().destination;
     let (memory, host) = ecx.interpreter_mut().memory_host();
-    Host::log(host, address, topics[..n as usize].into(), memory.slice(offset, len).into());
+    // SAFETY: If `len` is non-zero, `ensure_memory` grew memory to cover `offset..offset + len`.
+    let data = unsafe { memory.slice(offset, len) };
+    Host::log(host, address, topics[..n as usize].into(), data.into());
     Ok(())
 }
 
@@ -566,7 +574,8 @@ pub unsafe extern "C" fn __revmc_builtin_create(
 
         let code_offset = word_to_usize(code_offset.to_u256())?;
         ensure_memory(ecx, code_offset, len)?;
-        Bytes::copy_from_slice(ecx.memory().slice(code_offset, len))
+        // SAFETY: `ensure_memory` grew memory to cover `code_offset..code_offset + len`.
+        Bytes::copy_from_slice(unsafe { ecx.memory().slice(code_offset, len) })
     } else {
         Bytes::new()
     };
@@ -719,7 +728,8 @@ pub unsafe extern "C" fn __revmc_builtin_call(
     let input = if in_len != 0 {
         let in_offset = word_to_usize(in_offset.to_u256())?;
         ensure_memory(ecx, in_offset, in_len)?;
-        Bytes::copy_from_slice(ecx.memory().slice(in_offset, in_len))
+        // SAFETY: `ensure_memory` grew memory to cover `in_offset..in_offset + in_len`.
+        Bytes::copy_from_slice(unsafe { ecx.memory().slice(in_offset, in_len) })
     } else {
         Bytes::new()
     };
@@ -778,7 +788,9 @@ pub unsafe extern "C" fn __revmc_builtin_call(
 
     let copy_len = min(out_len, result.output.len());
     if copy_len != 0 {
-        ecx.memory_mut().set(out_offset, &result.output[..copy_len]);
+        // SAFETY: `ensure_memory` grew memory to cover `out_offset..out_offset + out_len`, and
+        // `copy_len <= out_len`.
+        unsafe { ecx.memory_mut().set(out_offset, &result.output[..copy_len]) };
     }
     let success = EvmWord::from(Word::from(u8::from(result.stop.is_success())));
     unsafe {
@@ -1089,13 +1101,17 @@ mod tests {
             code: Bytecode::new_legacy(Bytes::from_static(&[op::STOP])),
             ..MessageExt::default()
         };
-        let mut interpreter =
-            evm2::interpreter::Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
+        // SAFETY: The interpreter stays standalone.
+        let mut interpreter = unsafe {
+            evm2::interpreter::Interpreter::<BaseEvmTypes>::new_standalone(&tx_env, &message)
+        };
 
         {
             let mut frame = prepare_frame(&mut interpreter, &mut host);
-            frame.ecx.memory_mut().resize(0, 16).unwrap();
-            frame.ecx.memory_mut().set(4, b"in");
+            unsafe {
+                frame.ecx.resize_memory(0, 16).unwrap();
+                frame.ecx.memory_mut().set(4, b"in");
+            }
             frame.stack.set(0, EvmWord::from(Word::from(2)));
             frame.stack.set(1, EvmWord::from(Word::from(8)));
             frame.stack.set(2, EvmWord::from(Word::from(2)));
@@ -1109,11 +1125,12 @@ mod tests {
 
             assert_eq!(unsafe { frame.stack.get_unchecked(0) }.to_u256(), Word::from(1));
             assert_eq!(frame.ecx.return_data(), child_output.as_ref());
-            assert_eq!(frame.ecx.memory().slice(8, 2), &[0xaa, 0xbb]);
+            assert_eq!(&frame.ecx.memory().as_slice()[8..10], &[0xaa, 0xbb]);
             let output = b"frame-output";
-            frame.ecx.memory_mut().resize(0, output.len()).unwrap();
-            frame.ecx.memory_mut().set(0, output);
-            frame.ecx.refresh_memory_cache();
+            unsafe {
+                frame.ecx.resize_memory(0, output.len()).unwrap();
+                frame.ecx.memory_mut().set(0, output);
+            }
             frame.ecx.interpreter_mut().set_output(0..output.len() as u32);
             assert_eq!(frame.ecx.return_data(), child_output.as_ref());
         }
@@ -1144,8 +1161,10 @@ mod tests {
             code: Bytecode::new_legacy(Bytes::from_static(&[op::STOP])),
             ..MessageExt::default()
         };
-        let mut interpreter =
-            evm2::interpreter::Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
+        // SAFETY: The interpreter stays standalone.
+        let mut interpreter = unsafe {
+            evm2::interpreter::Interpreter::<BaseEvmTypes>::new_standalone(&tx_env, &message)
+        };
 
         {
             let mut frame = prepare_frame(&mut interpreter, &mut host);
@@ -1184,8 +1203,10 @@ mod tests {
             code: Bytecode::new_legacy(Bytes::from_static(&[op::STOP])),
             ..MessageExt::default()
         };
-        let mut interpreter =
-            evm2::interpreter::Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
+        // SAFETY: The interpreter stays standalone.
+        let mut interpreter = unsafe {
+            evm2::interpreter::Interpreter::<BaseEvmTypes>::new_standalone(&tx_env, &message)
+        };
 
         {
             let mut frame = prepare_frame(&mut interpreter, &mut host);
@@ -1223,8 +1244,10 @@ mod tests {
             code: Bytecode::new_legacy(Bytes::from_static(&[op::STOP])),
             ..MessageExt::default()
         };
-        let mut interpreter =
-            evm2::interpreter::Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
+        // SAFETY: The interpreter stays standalone.
+        let mut interpreter = unsafe {
+            evm2::interpreter::Interpreter::<BaseEvmTypes>::new_standalone(&tx_env, &message)
+        };
 
         {
             let mut frame = prepare_frame(&mut interpreter, &mut host);
@@ -1266,13 +1289,17 @@ mod tests {
             code: Bytecode::new_legacy(Bytes::from_static(&[op::STOP])),
             ..MessageExt::default()
         };
-        let mut interpreter =
-            evm2::interpreter::Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
+        // SAFETY: The interpreter stays standalone.
+        let mut interpreter = unsafe {
+            evm2::interpreter::Interpreter::<BaseEvmTypes>::new_standalone(&tx_env, &message)
+        };
 
         {
             let mut frame = prepare_frame(&mut interpreter, &mut host);
-            frame.ecx.memory_mut().resize(0, 1).unwrap();
-            frame.ecx.memory_mut().set(0, &initcode);
+            unsafe {
+                frame.ecx.resize_memory(0, 1).unwrap();
+                frame.ecx.memory_mut().set(0, &initcode);
+            }
             frame.stack.set(0, EvmWord::from(Word::from(initcode.len())));
             frame.stack.set(1, EvmWord::ZERO);
             frame.stack.set(2, EvmWord::ZERO);
@@ -1311,13 +1338,17 @@ mod tests {
             code: Bytecode::new_legacy(Bytes::from_static(&[op::STOP])),
             ..MessageExt::default()
         };
-        let mut interpreter =
-            evm2::interpreter::Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
+        // SAFETY: The interpreter stays standalone.
+        let mut interpreter = unsafe {
+            evm2::interpreter::Interpreter::<BaseEvmTypes>::new_standalone(&tx_env, &message)
+        };
 
         {
             let mut frame = prepare_frame(&mut interpreter, &mut host);
-            frame.ecx.memory_mut().resize(0, 1).unwrap();
-            frame.ecx.memory_mut().set(0, &initcode);
+            unsafe {
+                frame.ecx.resize_memory(0, 1).unwrap();
+                frame.ecx.memory_mut().set(0, &initcode);
+            }
             frame.stack.set(0, salt);
             frame.stack.set(1, EvmWord::from(Word::from(initcode.len())));
             frame.stack.set(2, EvmWord::ZERO);
@@ -1367,8 +1398,12 @@ mod tests {
                     code: Bytecode::new_legacy(Bytes::from_static(&[op::STOP])),
                     ..MessageExt::default()
                 };
-                let mut interpreter =
-                    evm2::interpreter::Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
+                // SAFETY: The interpreter stays standalone.
+                let mut interpreter = unsafe {
+                    evm2::interpreter::Interpreter::<BaseEvmTypes>::new_standalone(
+                        &tx_env, &message,
+                    )
+                };
 
                 {
                     let mut frame = prepare_frame(&mut interpreter, &mut host);

@@ -544,8 +544,10 @@ impl Gas {
     }
 
     /// Returns mutable memory gas state.
+    ///
+    /// Crate-private: the accounted size must never exceed the memory buffer.
     #[inline]
-    pub const fn memory_mut(&mut self) -> &mut MemoryGas {
+    pub(crate) const fn memory_mut(&mut self) -> &mut MemoryGas {
         &mut self.memory
     }
 
@@ -698,33 +700,57 @@ impl Gas {
 }
 
 /// Memory gas accounting state.
+///
+/// The accounted size never exceeds the memory buffer it describes, so only memory expansion
+/// ([`Memory::resize_evm`](super::Memory::resize_evm)) changes it.
+///
+/// ```compile_fail,E0624
+/// use evm2::interpreter::Gas;
+///
+/// let mut gas = Gas::new(100);
+/// gas.memory_mut().words_num = 1_000_000;
+/// gas.memory_mut().expansion_cost = u64::MAX;
+/// ```
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Hash)]
 pub struct MemoryGas {
-    /// Current memory size in EVM words.
-    pub words_num: usize,
-    /// Current total expansion cost.
-    pub expansion_cost: u64,
-    #[doc(hidden)] // Not public API. Please use an existing constructor.
-    pub _non_exhaustive: (),
+    words_num: usize,
+    expansion_cost: u64,
 }
 
 impl MemoryGas {
     /// Creates empty memory gas state.
     #[inline]
     pub const fn new() -> Self {
-        Self { words_num: 0, expansion_cost: 0, _non_exhaustive: () }
+        Self { words_num: 0, expansion_cost: 0 }
     }
 
-    /// Sets memory word count and returns the expansion cost delta.
+    /// Returns the current memory size in EVM words.
     #[inline]
-    pub const fn set_words_num(
+    pub const fn words_num(&self) -> usize {
+        self.words_num
+    }
+
+    /// Returns the current total expansion cost.
+    #[inline]
+    pub const fn expansion_cost(&self) -> u64 {
+        self.expansion_cost
+    }
+
+    /// Sets memory word count and total expansion cost, and returns the expansion cost delta.
+    ///
+    /// Returns `None` without changing the state if `expansion_cost` is below the current cost.
+    #[inline]
+    pub(crate) const fn set_words_num(
         &mut self,
         words_num: usize,
-        mut expansion_cost: u64,
+        expansion_cost: u64,
     ) -> Option<u64> {
+        let Some(delta) = expansion_cost.checked_sub(self.expansion_cost) else {
+            return None;
+        };
         self.words_num = words_num;
-        core::mem::swap(&mut self.expansion_cost, &mut expansion_cost);
-        self.expansion_cost.checked_sub(expansion_cost)
+        self.expansion_cost = expansion_cost;
+        Some(delta)
     }
 }
 
@@ -938,5 +964,14 @@ mod tests {
         assert_eq!((gas.reservoir(), gas.remaining(), gas.state_gas_spent()), (0, 0, 500));
 
         assert_matches!(gas.spend_state(1), Err(InstrStop::OutOfGas));
+    }
+
+    #[test]
+    fn set_words_num_rejects_cost_decrease_without_mutating() {
+        let mut memory = MemoryGas::new();
+        assert_eq!(memory.set_words_num(1, 3), Some(3));
+
+        assert_eq!(memory.set_words_num(2, 1), None);
+        assert_eq!((memory.words_num(), memory.expansion_cost()), (1, 3));
     }
 }

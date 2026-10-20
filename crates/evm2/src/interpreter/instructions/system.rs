@@ -69,7 +69,8 @@ fn memory_range_bytes<T: EvmTypesHost>(
     if range.is_empty() {
         return Ok(Bytes::new());
     }
-    Ok(Bytes::copy_from_slice(state.memory().slice(range.start, range.len())))
+    // SAFETY: Callers resize memory to cover `range` first, and memory never shrinks.
+    Ok(Bytes::copy_from_slice(unsafe { state.memory().slice(range.start, range.len()) }))
 }
 
 fn load_acc_and_calc_gas<T: EvmTypesHost>(

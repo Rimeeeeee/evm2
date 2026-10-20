@@ -39,7 +39,8 @@ fn copy_data(
     if len != 0 {
         let memory_offset = memory_offset.to_usize()?;
         memory.resize_evm(gas, gas_params, memory_offset, len)?;
-        memory.set_data(memory_offset, data_offset.to_usize_saturated(), len, data);
+        // SAFETY: `resize_evm` grew memory to cover `memory_offset..memory_offset + len`.
+        unsafe { memory.set_data(memory_offset, data_offset.to_usize_saturated(), len, data) };
     }
     Ok(())
 }
@@ -133,12 +134,16 @@ pub fn extcodecopy(cx: _, [addr, memory_offset, code_offset, len]: [Word]) -> Re
         0
     };
     let code = load_account(&mut cx, *addr, true)?.code;
-    cx.state.0.memory.set_data(
-        memory_offset,
-        code_offset.to_usize_saturated(),
-        len,
-        code.original_byte_slice(),
-    );
+    // SAFETY: If `len` is non-zero, `resize_memory` grew memory to cover
+    // `memory_offset..memory_offset + len`.
+    unsafe {
+        cx.state.0.memory.set_data(
+            memory_offset,
+            code_offset.to_usize_saturated(),
+            len,
+            code.original_byte_slice(),
+        );
+    }
     Ok(())
 }
 

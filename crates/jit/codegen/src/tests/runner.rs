@@ -405,7 +405,8 @@ fn with_evm_context_and_host_mut<
         code: Bytecode::new_legacy(Bytes::copy_from_slice(bytecode)),
         ..message
     };
-    let mut interpreter = Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
+    // SAFETY: The interpreter stays standalone.
+    let mut interpreter = unsafe { Interpreter::<BaseEvmTypes>::new_standalone(&tx_env, &message) };
     interpreter.prepare_run(host);
 
     let (mut ecx, stack, stack_len) =
@@ -522,7 +523,8 @@ fn run_compiled_test_case_with_context(
         code: Bytecode::new_legacy(Bytes::copy_from_slice(bytecode)),
         ..message
     };
-    let mut interpreter = Interpreter::<BaseEvmTypes>::new(&tx_env, &message);
+    // SAFETY: The interpreter stays standalone.
+    let mut interpreter = unsafe { Interpreter::<BaseEvmTypes>::new_standalone(&tx_env, &message) };
     let mut int_host = prepare_host(spec_id);
     let int_stop = interpreter.run(&mut int_host).unwrap();
     let int_result = int_stop;

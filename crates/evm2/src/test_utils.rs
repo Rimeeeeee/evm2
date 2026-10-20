@@ -254,7 +254,7 @@ impl TestInterpreter {
     }
 
     pub(crate) fn memory(&mut self, offset: usize, len: usize) -> &[u8] {
-        self.memory.slice(offset, len)
+        &self.memory.as_slice()[offset..offset + len]
     }
 
     pub(crate) fn gas_remaining(&self) -> u64 {
@@ -270,7 +270,7 @@ impl TestInterpreter {
     }
 
     pub(crate) fn output(&self) -> &[u8] {
-        self.memory.slice(self.output.start as usize, self.output.len())
+        &self.memory.as_slice()[self.output.start as usize..self.output.end as usize]
     }
 }
 

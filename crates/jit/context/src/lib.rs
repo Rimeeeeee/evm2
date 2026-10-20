@@ -77,8 +77,29 @@ impl fmt::Debug for EvmContext<'_, '_, '_> {
 
 impl<'ctx, 'frame, 'host> EvmContext<'ctx, 'frame, 'host> {
     /// Creates a new context from an interpreter.
+    ///
+    /// ```compile_fail,E0133
+    /// use evm2::{BaseEvmTypes, interpreter::Interpreter};
+    /// use evm2_jit_context::EvmContext;
+    ///
+    /// fn hook(interp: &mut Interpreter<'_, '_, BaseEvmTypes>) {
+    ///     let _ecx = EvmContext::from_interpreter(interp);
+    /// }
+    /// ```
+    ///
+    /// # Safety
+    ///
+    /// The context keeps its own copy of the gas, including the memory gas accounting, and caches
+    /// the memory base pointer and length. The caller must ensure that:
+    ///
+    /// - `gas` is changed only by the context's methods, and memory only by
+    ///   [`resize_memory`](Self::resize_memory), which keeps the accounted size within the memory
+    ///   length and refreshes the cache. Memory must not otherwise be resized, reallocated or
+    ///   replaced while the context is in use.
+    /// - The gas is written back with [`finish_interpreter_run`](Self::finish_interpreter_run)
+    ///   before the interpreter's own gas or memory is used again.
     #[inline]
-    pub fn from_interpreter(
+    pub unsafe fn from_interpreter(
         interpreter: &'ctx mut Interpreter<'frame, 'host, BaseEvmTypes>,
     ) -> Self {
         unsafe { Self::from_interpreter_with_stack(interpreter).0 }
@@ -89,7 +110,8 @@ impl<'ctx, 'frame, 'host> EvmContext<'ctx, 'frame, 'host> {
     /// # Safety
     ///
     /// The caller must keep the returned stack length at or below the stack capacity and ensure
-    /// the first `stack_len` words are initialized before accessing the interpreter stack.
+    /// the first `stack_len` words are initialized before accessing the interpreter stack. The
+    /// caller must also uphold the contract of [`from_interpreter`](Self::from_interpreter).
     #[inline]
     pub unsafe fn from_interpreter_with_stack(
         interpreter: &'ctx mut Interpreter<'frame, 'host, BaseEvmTypes>,
@@ -121,11 +143,18 @@ impl<'ctx, 'frame, 'host> EvmContext<'ctx, 'frame, 'host> {
         (this, stack, stack_len)
     }
 
-    /// Finishes state owned by the JIT context after compiled execution.
+    /// Finishes state owned by the JIT context after compiled execution, writing the gas back to
+    /// the interpreter, including the memory gas accounting.
+    ///
+    /// # Safety
+    ///
+    /// The contract of [`from_interpreter`](Self::from_interpreter) must hold: `gas` must carry
+    /// the memory accounting of the interpreter's memory.
     #[inline]
-    pub const fn finish_interpreter_run(&mut self) {
+    pub const unsafe fn finish_interpreter_run(&mut self) {
         let gas = self.gas;
-        self.interpreter_mut().set_gas(gas);
+        // SAFETY: Upheld by the caller.
+        unsafe { self.interpreter_mut().set_gas_with_memory(gas) };
     }
 
     /// Returns the active interpreter frame.
@@ -146,19 +175,31 @@ impl<'ctx, 'frame, 'host> EvmContext<'ctx, 'frame, 'host> {
         self.interpreter().memory()
     }
 
-    /// Returns the current linear memory.
+    /// Returns the current linear memory mutably.
+    ///
+    /// # Safety
+    ///
+    /// The memory must only be read and written through it. It must not be grown, shrunk or
+    /// reallocated, which would leave the cached base pointer and length stale; use
+    /// [`resize_memory`](Self::resize_memory) to grow it.
     #[inline]
-    pub const fn memory_mut(&mut self) -> &mut Memory {
-        self.interpreter_mut().memory_mut()
+    pub const unsafe fn memory_mut(&mut self) -> &mut Memory {
+        // SAFETY: Upheld by the caller.
+        unsafe { self.interpreter_mut().memory_mut_unchecked() }
     }
 
     /// Resizes memory using EVM memory gas accounting.
+    ///
+    /// # Safety
+    ///
+    /// The contract of [`from_interpreter`](Self::from_interpreter) must hold: `gas` must carry
+    /// the memory accounting of the interpreter's memory.
     #[inline]
-    pub fn resize_memory(&mut self, offset: usize, len: usize) -> Result<(), InstrStop> {
-        let gas_params = *self.gas_params();
-        let memory = self.memory_mut() as *mut Memory;
-        let gas = &mut self.gas as *mut Gas;
-        unsafe { (*memory).resize_evm(&mut *gas, &gas_params, offset, len)? };
+    pub unsafe fn resize_memory(&mut self, offset: usize, len: usize) -> Result<(), InstrStop> {
+        // SAFETY: `gas` is this interpreter's gas, as the caller guarantees.
+        unsafe {
+            self.interpreter.as_mut().resize_memory_with_gas(&mut self.gas, offset, len)?;
+        }
         self.refresh_memory_cache();
         Ok(())
     }
@@ -253,8 +294,8 @@ impl<'ctx, 'frame, 'host> EvmContext<'ctx, 'frame, 'host> {
     /// Must be called after any operation that may resize memory.
     #[inline]
     pub const fn refresh_memory_cache(&mut self) {
-        let mem_len = self.memory().len();
-        let mem_base = self.memory_mut().as_mut_ptr();
+        let memory = self.interpreter_mut().memory_mut();
+        let (mem_base, mem_len) = (memory.as_mut_ptr(), memory.len());
         self.mem_base = mem_base;
         self.mem_len = mem_len;
     }
@@ -351,7 +392,9 @@ impl EvmCompilerFn {
         if result == InstrStop::OutOfGas {
             ecx.gas.spend_all();
         }
-        ecx.finish_interpreter_run();
+        // SAFETY: `ecx` was created from `interpreter` above, and its gas memory accounting only
+        // changed through `resize_memory`.
+        unsafe { ecx.finish_interpreter_run() };
         result
     }
 

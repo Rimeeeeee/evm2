@@ -59,10 +59,12 @@ impl Memory {
         self.data.as_slice()
     }
 
-    /// Returns a raw pointer to memory bytes.
+    /// Returns all initialized memory bytes mutably.
+    ///
+    /// The length is fixed: the slice cannot grow or shrink memory.
     #[inline]
-    pub const fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.data.as_mut_ptr()
+    pub const fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.data.as_mut_slice()
     }
 
     /// Returns whether memory is empty.
@@ -73,30 +75,20 @@ impl Memory {
 
     /// Clears memory while retaining the allocation.
     #[inline]
-    pub fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.data.clear();
     }
 
     #[inline]
-    fn resize_to(&mut self, new_size: usize) {
-        self.data.resize(new_size, 0);
-    }
-
-    /// Resizes memory to cover `offset..offset + len`.
-    ///
-    /// Does not account for gas.
-    #[inline]
-    pub fn resize(&mut self, offset: usize, len: usize) -> Result {
-        let Some(end) = offset.checked_add(len) else {
-            return Err(InstrStop::MemoryOOG);
-        };
-        if end > self.data.len() {
-            self.resize_to(end);
+    fn grow_to(&mut self, new_size: usize) {
+        if new_size > self.data.len() {
+            self.data.resize(new_size, 0);
         }
-        Ok(())
     }
 
     /// Resizes memory to cover `offset..offset + len` and charges EVM expansion gas.
+    ///
+    /// On failure, neither the memory nor the memory accounting in `gas` changes.
     #[inline]
     pub fn resize_evm(
         &mut self,
@@ -106,7 +98,7 @@ impl Memory {
         len: usize,
     ) -> Result {
         let new_num_words = num_words(offset.saturating_add(len));
-        if new_num_words > gas.memory().words_num {
+        if new_num_words > gas.memory().words_num() {
             return self.resize_evm_cold(gas, gas_params, new_num_words);
         }
 
@@ -131,12 +123,16 @@ impl Memory {
             return Err(InstrStop::MemoryLimitOOG);
         }
 
+        let mut memory_gas = *gas.memory();
         let cost = gas_params.memory_cost(new_num_words);
-        let cost =
-            unsafe { gas.memory_mut().set_words_num(new_num_words, cost).unwrap_unchecked() };
+        let Some(cost) = memory_gas.set_words_num(new_num_words, cost) else {
+            cold_path();
+            return Err(InstrStop::MemoryOOG);
+        };
 
         gas.spend(cost).map_err(|_| InstrStop::MemoryOOG)?;
-        self.resize_to(new_size);
+        self.grow_to(new_size);
+        *gas.memory_mut() = memory_gas;
         Ok(())
     }
 
@@ -167,23 +163,23 @@ impl Memory {
 
     /// Reads a word from memory.
     ///
-    /// # Panics
+    /// # Safety
     ///
-    /// Panics if the range is out of bounds.
+    /// `offset..offset + 32` must be in bounds.
     #[inline]
     #[cfg_attr(debug_assertions, track_caller)]
-    pub fn get_word(&self, offset: usize) -> Word {
+    pub unsafe fn get_word(&self, offset: usize) -> Word {
         Word::from_be_slice(self.slice_range(offset..offset + 32))
     }
 
     /// Writes bytes into memory.
     ///
-    /// # Panics
+    /// # Safety
     ///
-    /// Panics if the range is out of bounds.
+    /// If `value` is non-empty, `offset..offset + value.len()` must be in bounds.
     #[inline]
     #[cfg_attr(debug_assertions, track_caller)]
-    pub fn set(&mut self, offset: usize, value: &[u8]) {
+    pub unsafe fn set(&mut self, offset: usize, value: &[u8]) {
         if !value.is_empty() {
             self.slice_range_mut(offset..offset + value.len()).copy_from_slice(value);
         }
@@ -205,12 +201,18 @@ impl Memory {
 
     /// Writes a data slice into memory with zero padding.
     ///
-    /// # Panics
+    /// # Safety
     ///
-    /// Panics if the range is out of bounds.
+    /// If `len` is non-zero, `memory_offset..memory_offset + len` must be in bounds.
     #[inline]
     #[cfg_attr(debug_assertions, track_caller)]
-    pub fn set_data(&mut self, memory_offset: usize, data_offset: usize, len: usize, data: &[u8]) {
+    pub unsafe fn set_data(
+        &mut self,
+        memory_offset: usize,
+        data_offset: usize,
+        len: usize,
+        data: &[u8],
+    ) {
         unsafe { set_data(&mut self.data, data, memory_offset, data_offset, len) };
     }
 
@@ -227,12 +229,12 @@ impl Memory {
 
     /// Returns a memory slice.
     ///
-    /// # Panics
+    /// # Safety
     ///
-    /// Panics if the range is out of bounds.
+    /// If `len` is non-zero, `offset..offset + len` must be in bounds.
     #[inline]
     #[cfg_attr(debug_assertions, track_caller)]
-    pub fn slice(&self, offset: usize, len: usize) -> &[u8] {
+    pub unsafe fn slice(&self, offset: usize, len: usize) -> &[u8] {
         if len == 0 {
             return &[];
         }
@@ -285,7 +287,7 @@ mod tests {
         let gas_params = Version::new(SpecId::FRONTIER).gas_params;
         memory.resize_evm(&mut gas, &gas_params, 0, 32).unwrap();
         assert_eq!(gas.remaining(), 97);
-        assert_eq!(gas.memory().words_num, 1);
+        assert_eq!(gas.memory().words_num(), 1);
         assert_eq!(memory.len(), 32);
 
         let gas_params = Version::new(SpecId::FRONTIER).gas_params;
@@ -296,7 +298,7 @@ mod tests {
         let gas_params = Version::new(SpecId::FRONTIER).gas_params;
         memory.resize_evm(&mut gas, &gas_params, 0, 64).unwrap();
         assert_eq!(gas.remaining(), 94);
-        assert_eq!(gas.memory().words_num, 2);
+        assert_eq!(gas.memory().words_num(), 2);
         assert_eq!(memory.len(), 64);
     }
 
@@ -318,6 +320,22 @@ mod tests {
             Err(InstrStop::MemoryLimitOOG)
         );
         assert_eq!(memory.len(), 64);
-        assert_eq!(gas.memory().words_num, 2);
+        assert_eq!(gas.memory().words_num(), 2);
+    }
+
+    #[test]
+    fn failed_expansion_can_be_retried() {
+        let gas_params = Version::new(SpecId::FRONTIER).gas_params;
+        let mut memory = Memory::new();
+
+        let mut gas = Gas::new(2);
+        assert_matches!(memory.resize_evm(&mut gas, &gas_params, 0, 32), Err(InstrStop::MemoryOOG));
+        assert_eq!(memory.len(), 0);
+        assert_eq!((gas.memory().words_num(), gas.memory().expansion_cost()), (0, 0));
+
+        let mut gas = Gas::new(3);
+        memory.resize_evm(&mut gas, &gas_params, 0, 32).unwrap();
+        assert_eq!(memory.len(), 32);
+        assert_eq!((gas.memory().words_num(), gas.memory().expansion_cost()), (1, 3));
     }
 }
