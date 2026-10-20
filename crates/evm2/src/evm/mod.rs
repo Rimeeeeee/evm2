@@ -734,6 +734,15 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         self.state.logs()
     }
 
+    /// Returns the logs emitted by the current in-flight transaction mutably.
+    ///
+    /// Unlike [`Self::state_mut`], this keeps the EVM verified as `Send`, since logs are not
+    /// erased.
+    #[inline]
+    pub const fn logs_mut(&mut self) -> &mut Vec<Log> {
+        self.state.logs_mut()
+    }
+
     /// Returns the precompile provider.
     #[inline]
     pub fn precompiles(&self) -> &(dyn PrecompileProvider<T> + 'a) {

@@ -1,7 +1,7 @@
 //! Internal transfer inspector.
 
 use alloc::{vec, vec::Vec};
-use alloy_primitives::{Address, B256, Log, LogData, U256, address, b256};
+use alloy_primitives::{Address, B256, Log, U256, address, b256};
 use alloy_sol_types::SolValue;
 use evm2::{
     Evm, EvmTypes, Inspector,
@@ -73,7 +73,8 @@ impl TransferInspector {
     }
 
     fn on_transfer<T: EvmTypes>(&mut self, message: &Message<T>, host: &mut Evm<'_, T>) {
-        self.checkpoints.push(TransferCheckpoint { transfers: self.transfers.len(), log: None });
+        self.checkpoints
+            .push(TransferCheckpoint { transfers: self.transfers.len(), logs: host.logs().len() });
 
         let kind = match message.kind {
             MessageKind::Call | MessageKind::CallCode => TransferKind::Call,
@@ -101,25 +102,20 @@ impl TransferInspector {
             let to = B256::from_slice(&to.abi_encode());
             let data = value.abi_encode();
 
-            let log = Log {
-                address: TRANSFER_LOG_EMITTER,
-                data: LogData::new_unchecked(vec![TRANSFER_EVENT_TOPIC, from, to], data.into()),
-            };
-            if let Some(checkpoint) = self.checkpoints.last_mut() {
-                checkpoint.log = Some(host.logs().len());
-            }
-            host.log(log);
+            host.log(Log::new_unchecked(
+                TRANSFER_LOG_EMITTER,
+                vec![TRANSFER_EVENT_TOPIC, from, to],
+                data.into(),
+            ));
         }
     }
 
-    fn on_transfer_end<T: EvmTypes>(&mut self, result: &MessageResult<T>, host: &mut Evm<'_, T>) {
-        let Some(checkpoint) = self.checkpoints.pop() else { return };
-        if result.is_success() {
-            return;
-        }
-        self.transfers.truncate(checkpoint.transfers);
-        if let Some(log) = checkpoint.log {
-            host.state_mut().logs_mut().truncate(log);
+    fn on_transfer_end<T: EvmTypes>(&mut self, failed: bool, host: &mut Evm<'_, T>) {
+        if let Some(checkpoint) = self.checkpoints.pop()
+            && failed
+        {
+            self.transfers.truncate(checkpoint.transfers);
+            host.logs_mut().truncate(checkpoint.logs);
         }
     }
 }
@@ -140,7 +136,7 @@ impl<T: EvmTypes> Inspector<T> for TransferInspector {
         _message: &Message<T>,
         result: &mut MessageResult<T>,
     ) {
-        self.on_transfer_end::<T>(result, interp.host());
+        self.on_transfer_end::<T>(!result.is_success(), interp.host());
     }
 
     fn create(
@@ -158,7 +154,10 @@ impl<T: EvmTypes> Inspector<T> for TransferInspector {
         _message: &Message<T>,
         result: &mut MessageResult<T>,
     ) {
-        self.on_transfer_end::<T>(result, interp.host());
+        // A create that stops early without a created address, such as on nonce overflow, also
+        // counts as failed even though its stop is `Return`.
+        let failed = !result.is_success() || result.created_address.is_none();
+        self.on_transfer_end::<T>(failed, interp.host());
     }
 
     fn selfdestruct(
@@ -209,6 +208,6 @@ pub enum TransferKind {
 struct TransferCheckpoint {
     /// Number of transfers recorded before the frame.
     transfers: usize,
-    /// Index of the transfer log inserted for the frame.
-    log: Option<usize>,
+    /// Number of logs emitted before the frame.
+    logs: usize,
 }

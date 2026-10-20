@@ -243,3 +243,48 @@ fn discards_failed_internal_create_transfer_and_log() {
     assert_eq!(logs.len(), 1);
     assert_eq!(logs[0].topics()[2], factory.into_word());
 }
+
+#[test]
+fn discards_internal_create_transfer_on_nonce_overflow() {
+    let deployer = Address::ZERO;
+    let factory = address!("0x1000000000000000000000000000000000000000");
+
+    // Creates a contract with 1 wei from a factory whose nonce cannot be bumped.
+    let factory_code = hex!("60fe600053600160006001f05000");
+    let mut db = CacheDB::new(EmptyDB::default());
+    db.load_account(deployer).info.balance = U256::from(u64::MAX);
+    db.insert_account_info(
+        &factory,
+        AccountInfo {
+            nonce: u64::MAX,
+            code: Some(Bytecode::new_legacy(factory_code.into())),
+            ..Default::default()
+        },
+    );
+
+    let context = Context::mainnet().with_db(db).modify_cfg_chained(|c| c.spec = SpecId::LONDON);
+    let mut evm =
+        context.build_mainnet_with_inspector(TransferInspector::new(false).with_logs(true));
+    let res = evm
+        .inspect_tx(TxEnv {
+            caller: deployer,
+            gas_limit: 1000000,
+            kind: TransactTo::Call(factory),
+            value: U256::from(10),
+            nonce: 0,
+            ..Default::default()
+        })
+        .unwrap();
+
+    assert!(res.result.is_success());
+    assert_eq!(
+        evm.inspector().transfers(),
+        &[TransferOperation {
+            kind: TransferKind::Call,
+            from: deployer,
+            to: factory,
+            value: U256::from(10),
+        }]
+    );
+    assert_eq!(res.tx_result.result.logs.len(), 1);
+}
