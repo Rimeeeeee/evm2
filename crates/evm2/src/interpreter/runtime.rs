@@ -6,7 +6,7 @@ use crate::{
     EvmTypesHost, ExecutionConfig, ExecutionError, HostError, SpecId, Version,
     bytecode::Bytecode,
     env::TxEnv,
-    evm::inspector::Inspector,
+    evm::inspector::InspectorSlot,
     interpreter::dispatch,
     trustme,
     version::{EvmFeatures, GasParams},
@@ -33,7 +33,7 @@ pub struct Interpreter<'frame, 'host, T: EvmTypesHost> {
     #[derive_where(skip)]
     message: Option<&'frame Message<T>>,
     host: Option<NonNull<T::Host<'host>>>,
-    inspector: Option<NonNull<dyn Inspector<T> + 'host>>,
+    inspector: Option<NonNull<InspectorSlot<'host, T>>>,
     pub(in crate::interpreter) stack_len: usize,
     #[derive_where(skip)]
     pub(in crate::interpreter) stack: Box<StackBacking>,
@@ -413,10 +413,10 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
 
     /// Runs the interpreter until it stops with an execution inspector.
     #[inline]
-    pub fn run_inspect(
+    pub(crate) fn run_inspect(
         &mut self,
         host: &mut T::Host<'host>,
-        inspector: &mut (dyn Inspector<T> + 'host),
+        inspector: &InspectorSlot<'host, T>,
     ) -> Result<InstrStop, ExecutionError> {
         self.run_inner(host, Some(NonNull::from(inspector)))
     }
@@ -445,7 +445,7 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     fn run_inner(
         &mut self,
         host: &mut T::Host<'host>,
-        inspector: Option<NonNull<dyn Inspector<T> + 'host>>,
+        inspector: Option<NonNull<InspectorSlot<'host, T>>>,
     ) -> Result<InstrStop, ExecutionError> {
         self.prepare_run(host);
         self.inspector = inspector;
@@ -658,10 +658,10 @@ impl<'frame, 'host, T: EvmTypesHost> InterpreterState<'frame, 'host, T> {
     pub(crate) fn inspect_step(&mut self, pc: Pc, stack_len: usize) {
         self.0.pc = pc.as_ptr();
         self.0.stack_len = stack_len;
-        unsafe {
-            let mut inspector = self.0.inspector.unwrap_unchecked();
-            inspector.as_mut().step(&mut self.0);
-        }
+        // SAFETY: The inspector slot is set exactly when the frame runs in inspect mode, which
+        // is the only way this is called, and the EVM keeps it alive for the run.
+        unsafe { self.0.inspector.unwrap_unchecked().as_ref() }
+            .with(|inspector| inspector.step(&mut self.0));
         self.0.step_gas_before = self.0.gas.remaining();
         self.0.failed_charge = None;
     }
@@ -677,10 +677,9 @@ impl<'frame, 'host, T: EvmTypesHost> InterpreterState<'frame, 'host, T> {
             // Failed charges may leave a wrapped counter until frame settlement.
             self.0.gas.set_remaining(0);
         }
-        unsafe {
-            let mut inspector = self.0.inspector.unwrap_unchecked();
-            inspector.as_mut().step_end(&mut self.0);
-        }
+        // SAFETY: As in `inspect_step`.
+        unsafe { self.0.inspector.unwrap_unchecked().as_ref() }
+            .with(|inspector| inspector.step_end(&mut self.0));
     }
 
     #[inline]
@@ -690,10 +689,13 @@ impl<'frame, 'host, T: EvmTypesHost> InterpreterState<'frame, 'host, T> {
         target: &Address,
         value: &Word,
     ) {
-        if let Some(mut inspector) = self.0.inspector {
+        if let Some(inspector) = self.0.inspector {
+            // SAFETY: As in `inspect_step`, and the host is set for the whole run.
             unsafe {
                 let mut host = self.0.host.unwrap_unchecked();
-                inspector.as_mut().selfdestruct(contract, target, value, host.as_mut());
+                inspector.as_ref().with(|inspector| {
+                    inspector.selfdestruct(contract, target, value, host.as_mut());
+                });
             }
         }
     }
