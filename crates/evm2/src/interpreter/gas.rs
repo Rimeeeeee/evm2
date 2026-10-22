@@ -433,7 +433,8 @@ impl GasTracker {
     /// A failing frame rolls back its state changes, so its state gas is refilled
     /// in LIFO order ([`Self::rollback_state_gas`]) and the execution refund counter
     /// is dropped; an exceptional halt additionally consumes the frame's execution
-    /// gas. On success the gas is left as-is. Applied once when a frame returns, so
+    /// gas. On success the gas is left as-is. Applied when a frame returns and after inspector
+    /// overrides; settling the same failure again is idempotent, so
     /// every consumer — the parent [`Self::merge_child_gas`], top-level accounting,
     /// and inspectors — reads the same settled gas.
     #[inline]

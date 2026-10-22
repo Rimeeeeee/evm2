@@ -1,8 +1,9 @@
 use crate::fuzzer::case::EvmCase;
+use alloy_eips::eip8141::FrameReceipt;
 use alloy_primitives::{Address, B256, U256, keccak256, map::HashMap};
 use core::convert::Infallible;
 use evm2::evm::{AccountChangeRef, StateChangeSink, StorageChange, registry::HandlerError};
-use revm::{
+use revm_bogota::{
     context_interface::result::{EVMError, InvalidTransaction},
     database::bal::EvmDatabaseError,
 };
@@ -61,6 +62,19 @@ pub(crate) struct TxReceipt {
     pub(crate) logs: Vec<CanonicalLog>,
     pub(crate) state: CanonicalState,
     pub(crate) error: Option<FuzzError>,
+    pub(crate) frame: Option<FrameOutcome>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FrameOutcome {
+    pub(crate) payer: Address,
+    pub(crate) receipts: Vec<FrameReceipt>,
+    pub(crate) outputs: Vec<Vec<u8>>,
+    pub(crate) spent: u64,
+    pub(crate) state_gas: u64,
+    pub(crate) refunded: u64,
+    pub(crate) floor: u64,
+    pub(crate) block_execution: u64,
 }
 
 impl TxReceipt {
@@ -72,6 +86,7 @@ impl TxReceipt {
             logs: Vec::new(),
             state: CanonicalState::default(),
             error: Some(error),
+            frame: None,
         }
     }
 }
@@ -121,6 +136,7 @@ pub(crate) enum FuzzError {
     InvalidNonce,
     NonceOverflow,
     UnsupportedTransactionType,
+    InvalidFrameTransaction,
     Transaction(InvalidTransaction),
     Evm2(HandlerError),
     Revm(EVMError<EvmDatabaseError<Infallible>>),
@@ -156,6 +172,7 @@ impl From<HandlerError> for FuzzError {
             HandlerError::InvalidNonce { .. } => Self::InvalidNonce,
             HandlerError::NonceOverflow => Self::NonceOverflow,
             HandlerError::UnsupportedTransactionType(_) => Self::UnsupportedTransactionType,
+            HandlerError::InvalidFrameTransaction(_) => Self::InvalidFrameTransaction,
             HandlerError::MissingChainId => Self::Transaction(InvalidTransaction::MissingChainId),
             HandlerError::RejectCallerWithCode => {
                 Self::Transaction(InvalidTransaction::RejectCallerWithCode)
@@ -176,8 +193,7 @@ impl From<HandlerError> for FuzzError {
             HandlerError::TxGasLimitGreaterThanCap { gas_limit, cap } => {
                 Self::Transaction(InvalidTransaction::TxGasLimitGreaterThanCap { gas_limit, cap })
             }
-            error @ (HandlerError::InvalidFrameTransaction(_)
-            | HandlerError::Database(_)
+            error @ (HandlerError::Database(_)
             | HandlerError::Fatal(_)
             | HandlerError::External(_)
             | HandlerError::WrongTransactionType { .. }
@@ -204,7 +220,11 @@ impl From<EVMError<EvmDatabaseError<Infallible>>> for FuzzError {
                 | InvalidTransaction::Eip1559NotSupported
                 | InvalidTransaction::Eip4844NotSupported
                 | InvalidTransaction::Eip7702NotSupported
+                | InvalidTransaction::Eip8141NotSupported
                 | InvalidTransaction::Eip7873NotSupported => Self::UnsupportedTransactionType,
+                InvalidTransaction::Eip8141InvalidFields | InvalidTransaction::Str(_) => {
+                    Self::InvalidFrameTransaction
+                }
                 error => Self::Transaction(error),
             },
             EVMError::Database(EvmDatabaseError::Database(error)) => match error {},
@@ -234,15 +254,13 @@ impl StateChangeSink for CanonicalState {
     }
 
     fn storage(&mut self, change: StorageChange) -> Result<(), Self::Error> {
-        if !change.current.is_zero() {
-            self.storage.insert((change.address, change.key), change.current);
-        }
+        self.storage.insert((change.address, change.key), change.current);
         Ok(())
     }
 }
 
 pub(crate) fn state_from_revm(
-    state: &revm::state::EvmState,
+    state: &revm_bogota::state::EvmState,
     original_accounts: &HashMap<Address, CanonicalAccount>,
 ) -> CanonicalState {
     let mut canonical = CanonicalState::default();
@@ -286,9 +304,7 @@ pub(crate) fn state_from_revm(
             );
         }
         for (key, slot) in changed_storage_slots {
-            if !slot.present_value().is_zero() {
-                canonical.storage.insert((address, *key), slot.present_value());
-            }
+            canonical.storage.insert((address, *key), slot.present_value());
         }
     }
     canonical

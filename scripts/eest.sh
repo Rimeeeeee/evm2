@@ -7,7 +7,8 @@
 # <path> may be absolute or relative to the current directory. Every JSON
 # fixture found under it runs in the explicit additional suites, with state vs
 # blockchain kind detected per file. Available modes are additional,
-# additional::inspected, and (with --features jit) additional::jit/additional::aot.
+# additional::inspected, additional::revm (paired comparison), and (with --features
+# jit) additional::jit/additional::aot.
 # Each selected mode shares one runtime across the full folder, without normal
 # ignore lists or compiled smoke subsets. Extra cargo-nextest arguments can select
 # a backend, for example:

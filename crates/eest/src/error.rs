@@ -87,6 +87,9 @@ pub(crate) enum TestErrorKind {
     /// Execution resource initialization failed.
     #[error(transparent)]
     ExecutionResource(#[from] ExecutionResourceError),
+    /// Native execution disagreed with the pinned reference implementation.
+    #[error("{0}")]
+    ReferenceMismatch(String),
 }
 
 impl From<TxBuildError> for TestErrorKind {

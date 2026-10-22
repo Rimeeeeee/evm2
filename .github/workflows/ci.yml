@@ -7,6 +7,7 @@ on:
   push:
     branches: [main, bogota-plan]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -216,10 +217,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu, macos]
-        mode: [jit]
+        mode: [jit, aot]
         include:
-          - os: ubuntu
-            mode: aot
+          - mode: aot
             subset: ci-aot
             filter: test(statetests::aot)
           - mode: jit
@@ -229,9 +229,11 @@ jobs:
             mode: jit
             subset: all
         exclude:
-          # Only pushes to main and manual runs test every OS.
+          # Branch pushes and manual runs test every OS.
           - os: macos
             mode: ${{ contains(fromJSON('["push", "workflow_dispatch"]'), github.event_name) && 'none' || 'jit' }}
+          - os: macos
+            mode: ${{ contains(fromJSON('["push", "workflow_dispatch"]'), github.event_name) && 'none' || 'aot' }}
     steps:
       - name: Secure runner
         uses: tempoxyz/gh-actions/actions/secure-runner@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
@@ -272,7 +274,6 @@ jobs:
           cargo nextest --profile ci run -p evm2-eest --features jit --test eest \
             --ignore-default-filter --no-fail-fast -E "${{ matrix.filter }}"
       - name: Bogota EEST corpus
-        if: ${{ matrix.os == 'ubuntu' }}
         shell: bash
         env:
           INPUT_MODE: ${{ matrix.mode }}
@@ -294,13 +295,15 @@ jobs:
               EVM2_DISPATCH_BACKEND="$dispatch" cargo nextest --profile ci run --locked -p evm2-eest --features jit --test eest --ignore-default-filter -E 'test(=additional)'
             done
             cargo nextest --profile ci run --locked -p evm2-eest --features jit --test eest --ignore-default-filter -E 'test(=additional::inspected)'
+            cargo nextest --profile ci run --locked -p evm2-eest --features jit --test eest --ignore-default-filter -E 'test(=additional::revm)'
           fi
           cargo nextest --profile ci run --locked -p evm2-eest --features jit --test eest --ignore-default-filter -E "test(=additional::$INPUT_MODE)"
       - name: Frame runtime and LLVM configuration regressions
-        if: ${{ matrix.os == 'ubuntu' && matrix.mode == 'jit' }}
+        if: ${{ matrix.mode == 'jit' }}
         run: |
           cargo test --locked -p evm2-jit-runtime --lib frame_tests -- --test-threads=1
           cargo test --locked -p evm2-jit-llvm --test llvm_config
+          cargo test --locked -p evm2 --example bal_parallel
 
   no-std:
     name: no_std ${{ matrix.target }}

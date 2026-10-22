@@ -1232,13 +1232,14 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         &mut self,
         tx_env: &TxEnv<T>,
         message: &mut Message<T>,
+        rollback_checkpoint: &mut StateCheckpoint,
     ) -> Result<MessageResult<T>, ExecutionError> {
         if let Some(result) = self.execute_default_frame(message)? {
             return Ok(result);
         }
         let mut result = match message.kind {
             MessageKind::Create | MessageKind::Create2 => {
-                self.execute_create_message(tx_env, message)
+                self.execute_create_message(tx_env, message, rollback_checkpoint)
             }
             MessageKind::Call
             | MessageKind::CallCode
@@ -1261,10 +1262,11 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         &mut self,
         tx_env: &'frame TxEnv<T>,
         message: &'frame mut Message<T>,
+        rollback_checkpoint: &mut StateCheckpoint,
     ) -> Result<MessageResult<T>, ExecutionError> {
         let guard = self.enter_execution();
         let Some(inspector) = guard.evm.inspector.as_deref_mut() else {
-            return guard.evm.execute_message_impl(tx_env, message);
+            return guard.evm.execute_message_impl(tx_env, message, rollback_checkpoint);
         };
         // SAFETY: The inspector is stored in `self`; the execution guard prevents inspector
         // replacement while the hooks are running.
@@ -1304,7 +1306,9 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         let mut result = if let Some(error) = frame.take_error() {
             Err(error)
         } else {
-            inspected.map(Ok).unwrap_or_else(|| guard.evm.execute_message_impl(tx_env, message))
+            inspected.map(Ok).unwrap_or_else(|| {
+                guard.evm.execute_message_impl(tx_env, message, rollback_checkpoint)
+            })
         };
 
         if let Ok(result) = &mut result {
@@ -1313,6 +1317,9 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
             } else {
                 inspector.call_end(frame, message, result);
             }
+            // Hooks can replace a successful call with a revert or halt, or supply a result
+            // without dispatch. Settle the final outcome before its gas reaches the caller.
+            result.gas.settle_gas(result.stop);
         }
 
         if let Some(error) = frame.take_error() {
@@ -1331,6 +1338,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         &mut self,
         tx_env: &TxEnv<T>,
         message: &mut Message<T>,
+        rollback_checkpoint: &mut StateCheckpoint,
     ) -> Result<MessageResult<T>, ExecutionError> {
         if message.depth > CALL_DEPTH_LIMIT {
             return Ok(Self::error_message_result(
@@ -1348,6 +1356,10 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
             };
         }
         let checkpoint = self.state.checkpoint();
+        // Failed creation preserves the creator's nonce bump, including when `create_end`
+        // changes a successful deployment into a failure. Reuse this same boundary for the
+        // final post-inspector rollback instead of reverting the earlier preparation phase.
+        *rollback_checkpoint = checkpoint.clone();
         if let Err(error) = self.create_message_account(message) {
             self.state.rollback(checkpoint, self.features);
             return match error {
@@ -1796,22 +1808,20 @@ impl<'a, T: EvmTypes> Host<T> for Evm<'a, T> {
         tx_env: &TxEnv<T>,
         message: &mut Message<T>,
     ) -> Result<MessageResult<T>, ExecutionError> {
-        let checkpoint = self.state.checkpoint();
+        let mut checkpoint = self.state.checkpoint();
         if let Some(rt) = &mut self.frame_tx {
             rt.enter_scope();
         }
         let result = if self.inspector.is_some() {
-            self.execute_message_inspected(tx_env, message)
+            self.execute_message_inspected(tx_env, message, &mut checkpoint)
         } else {
-            self.execute_message_impl(tx_env, message)
+            self.execute_message_impl(tx_env, message, &mut checkpoint)
         };
+        let success = result.as_ref().is_ok_and(|r| r.stop.is_success());
         if let Some(rt) = &mut self.frame_tx {
-            let success = result.as_ref().is_ok_and(|r| r.stop.is_success());
             rt.exit_scope(success);
-            if !success {
-                self.state.rollback(checkpoint, self.features);
-            }
-        } else if result.is_err() {
+        }
+        if !success {
             self.state.rollback(checkpoint, self.features);
         }
         result
@@ -2068,9 +2078,12 @@ mod tests {
         test_utils::{legacy_bytecode, push_address},
     };
     use alloc::{borrow::Cow, string::ToString, sync::Arc, vec, vec::Vec};
-    use alloy_consensus::{TxLegacy, transaction::Recovered};
+    use alloy_consensus::{TxEip8141, TxLegacy, transaction::Recovered};
     use alloy_eip7928::{BlockAccessList, StorageChange};
-    use alloy_primitives::{Address, Bytes, KECCAK256_EMPTY, Log, LogData, TxKind, U256};
+    use alloy_eips::eip8141::{Frame, FrameLimits, FrameMode, NONCE_MANAGER};
+    use alloy_primitives::{
+        Address, Bytes, KECCAK256_EMPTY, Log, LogData, TxKind, U256, keccak256,
+    };
     use core::{
         error::Error,
         fmt,
@@ -4454,5 +4467,195 @@ mod tests {
         );
 
         let _ = evm.transact(&test_tx(0));
+    }
+
+    struct CreateRollbackInspector {
+        before: Option<InstrStop>,
+        after: Option<InstrStop>,
+    }
+
+    impl Inspector<BaseEvmTypes> for CreateRollbackInspector {
+        fn create(
+            &mut self,
+            _interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+            message: &mut Message,
+        ) -> Option<MessageResult> {
+            self.before.map(|stop| MessageResultExt {
+                stop,
+                gas: GasTracker::new_with_execution_gas_and_reservoir(
+                    message.gas_limit,
+                    message.reservoir,
+                ),
+                ..Default::default()
+            })
+        }
+
+        fn create_end(
+            &mut self,
+            _interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+            _message: &Message,
+            result: &mut MessageResult,
+        ) {
+            if let Some(stop) = self.after {
+                result.stop = stop;
+            }
+        }
+    }
+
+    #[test]
+    fn failed_nested_creates_preserve_creator_nonce_and_revert_deployment_effects() {
+        let sender = Address::with_last_byte(0xa0);
+        let creator = Address::with_last_byte(0xb0);
+        for frame_tx in [false, true] {
+            for create2 in [false, true] {
+                for (init_stop, before, after) in [
+                    (op::REVERT, None, None),
+                    (op::INVALID, None, None),
+                    (op::RETURN, None, Some(InstrStop::Revert)),
+                    (op::RETURN, None, Some(InstrStop::OutOfGas)),
+                    (op::RETURN, Some(InstrStop::Revert), None),
+                    (op::RETURN, Some(InstrStop::InvalidFEOpcode), None),
+                ] {
+                    for inspected in [false, true] {
+                        if !inspected && (before.is_some() || after.is_some()) {
+                            continue;
+                        }
+                        let label = alloc::format!(
+                            "frame={frame_tx}, create2={create2}, init={init_stop}, before={before:?}, after={after:?}, inspected={inspected}"
+                        );
+                        let initcode = [
+                            op::PUSH1,
+                            1,
+                            op::PUSH0,
+                            op::SSTORE,
+                            op::PUSH0,
+                            op::PUSH0,
+                            op::LOG0,
+                            op::PUSH0,
+                            op::PUSH0,
+                            init_stop,
+                        ];
+                        let created = if create2 {
+                            creator.create2(U256::ONE.to_be_bytes::<32>(), keccak256(initcode))
+                        } else {
+                            creator.create(1)
+                        };
+                        let mut code = vec![op::PUSH32];
+                        code.extend_from_slice(&initcode);
+                        code.resize(33, 0);
+                        code.extend_from_slice(&[op::PUSH0, op::MSTORE]);
+                        if create2 {
+                            code.extend_from_slice(&[op::PUSH1, 1]);
+                        }
+                        code.extend_from_slice(&[
+                            op::PUSH1,
+                            initcode.len() as u8,
+                            op::PUSH0,
+                            op::PUSH1,
+                            1,
+                            if create2 { op::CREATE2 } else { op::CREATE },
+                            op::POP,
+                            op::STOP,
+                        ]);
+                        let mut database = InMemoryDB::default();
+                        database.insert_account_info(
+                            &sender,
+                            AccountInfo::default()
+                                .with_balance(U256::from(1_000_000_000))
+                                .with_code(Bytecode::new_legacy(if frame_tx {
+                                    Bytes::from_static(&[
+                                        op::PUSH1,
+                                        3,
+                                        op::PUSH0,
+                                        op::PUSH0,
+                                        op::APPROVE,
+                                    ])
+                                } else {
+                                    Bytes::new()
+                                })),
+                        );
+                        database.insert_account_info(
+                            &creator,
+                            AccountInfo::default()
+                                .with_nonce(1)
+                                .with_balance(U256::from(1_000_000))
+                                .with_code(Bytecode::new_legacy(code.into())),
+                        );
+                        database.insert_account_info(
+                            &NONCE_MANAGER,
+                            AccountInfo::default().with_nonce(1),
+                        );
+                        let spec = if frame_tx { SpecId::BOGOTA } else { SpecId::AMSTERDAM };
+                        let mut evm = Evm::<BaseEvmTypes>::new(
+                            spec,
+                            BlockEnvExt::default(),
+                            ethereum_tx_registry(spec),
+                            database,
+                            Precompiles::base(spec),
+                        );
+                        if inspected {
+                            evm.set_inspector(CreateRollbackInspector { before, after });
+                        }
+                        let envelope = if frame_tx {
+                            TxEnvelope::Eip8141(TxEip8141 {
+                                chain_id: 1,
+                                sender,
+                                nonce_keys: Some(vec![U256::ZERO]),
+                                frames: [
+                                    (FrameMode::Verify, sender, 3),
+                                    (FrameMode::Sender, creator, 0),
+                                ]
+                                .into_iter()
+                                .map(|(mode, target, flags)| Frame {
+                                    mode,
+                                    target: target.into(),
+                                    flags,
+                                    limits: FrameLimits { execution: 500_000, state: 1_000_000 },
+                                    ..Default::default()
+                                })
+                                .collect(),
+                                ..Default::default()
+                            })
+                        } else {
+                            TxEnvelope::Legacy(TxLegacy {
+                                gas_limit: 1_000_000,
+                                to: TxKind::Call(creator),
+                                ..Default::default()
+                            })
+                        };
+                        let result = evm
+                            .transact(&Recovered::new_unchecked(envelope, sender))
+                            .unwrap_or_else(|error| panic!("{label}: {error:?}"))
+                            .commit();
+                        assert!(result.status, "{label}");
+                        assert!(result.logs.is_empty(), "{label}");
+                        assert_eq!(
+                            evm.state.account(&creator).unwrap().nonce(),
+                            if before.is_some() { 1 } else { 2 },
+                            "{label}"
+                        );
+                        assert_eq!(
+                            evm.state.account(&creator).unwrap().balance(),
+                            U256::from(1_000_000),
+                            "{label}"
+                        );
+                        assert!(
+                            evm.state.account_info_untracked(&created).unwrap().is_none(),
+                            "{label}"
+                        );
+                        assert_eq!(
+                            evm.state
+                                .storage(&created)
+                                .unwrap()
+                                .into_slot(U256::ZERO)
+                                .unwrap()
+                                .current(),
+                            U256::ZERO,
+                            "{label}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

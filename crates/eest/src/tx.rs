@@ -352,7 +352,13 @@ fn recovered_envelope(tx: TypedTransaction, caller: Address) -> RecoveredTxEnvel
 
 #[cfg(test)]
 mod tests {
-    use super::TestAuthorization;
+    use super::*;
+    use alloy_consensus::ReceiptEnvelope;
+    use alloy_eips::{
+        Encodable2718,
+        eip8141::{FrameGasUsed, FrameReceipt, FrameReceiptPayload, FrameStatus},
+    };
+    use alloy_primitives::{hex, keccak256};
     use serde_json::json;
 
     #[test]
@@ -368,5 +374,120 @@ mod tests {
         let authorization = TestAuthorization { value: value.clone() };
 
         assert_eq!(serde_json::to_value(authorization).unwrap(), value);
+    }
+
+    #[test]
+    fn canonical_frame_bytes_are_authoritative_and_require_exact_input() {
+        // Independently assembled type-6 seven-field list with one six-field frame.
+        let raw = hex!(
+            "06e70180941111111111111111111111111111111111111111c9c8808080c280808080c0c3808080c0"
+        );
+        let recovered = build_recovered_tx_bytes(&raw).unwrap();
+        assert_eq!(recovered.signer(), Address::repeat_byte(0x11));
+        let frame = recovered.inner().as_eip8141().unwrap();
+        assert_eq!(frame.encoded_2718(), raw);
+        assert_eq!(frame.tx_hash(), keccak256(raw));
+        assert_eq!(frame.signature_hash(), keccak256(raw));
+        assert_eq!(frame.chain_id, 1);
+        assert_eq!(frame.nonce_keys, None);
+        assert_eq!(frame.frames, vec![Frame::default()]);
+        let reference = crate::reference_tx(&recovered).unwrap();
+        assert_eq!(reference.caller, frame.sender);
+        assert_eq!(reference.frame_transaction.unwrap().frames, frame.frames);
+
+        for length in 0..raw.len() {
+            assert!(build_recovered_tx_bytes(&raw[..length]).is_err(), "prefix {length}");
+        }
+        let mut trailing = raw.to_vec();
+        trailing.push(0x80);
+        assert!(matches!(build_recovered_tx_bytes(&trailing),
+            Err(TxBuildError::BuildTransaction(message)) if message == "trailing transaction bytes"));
+        let mut network = Vec::new();
+        frame.network_encode(&mut network);
+        assert!(build_recovered_tx_bytes(&network).is_err());
+    }
+
+    #[test]
+    fn frame_fixture_conversion_keeps_full_width_fields_and_signing_elision() {
+        for length in [0, 1, 55, 56, 255, 256] {
+            let mut tx = TxEip8141 {
+                chain_id: 1,
+                nonce: u64::MAX,
+                nonce_keys: Some(vec![U256::ONE, U256::MAX]),
+                sender: Address::repeat_byte(0x11),
+                frames: vec![Frame {
+                    data: vec![0x81; length].into(),
+                    value: U256::MAX,
+                    ..Default::default()
+                }],
+                signatures: vec![
+                    FrameSignature { signature: vec![0x82; length].into(), ..Default::default() },
+                    FrameSignature {
+                        msg: SignatureMessage::Explicit(B256::repeat_byte(0x33)),
+                        signature: vec![0x84; length].into(),
+                        ..Default::default()
+                    },
+                ],
+                fees: TransactionFees {
+                    max_fee_per_gas: U256::MAX,
+                    max_priority_fee_per_gas: U256::MAX - U256::ONE,
+                    max_fee_per_blob_gas: U256::MAX - U256::from(2),
+                },
+                ..Default::default()
+            };
+            let recovered = build_recovered_tx_bytes(&tx.encoded_2718()).unwrap();
+            assert_eq!(recovered.inner().as_eip8141().unwrap(), &tx);
+            let reference = crate::reference_tx(&recovered).unwrap();
+            let frame = reference.frame_transaction.unwrap();
+            assert_eq!(frame.max_fee_per_gas, U256::MAX);
+            assert_eq!(frame.max_priority_fee_per_gas, U256::MAX - U256::ONE);
+            assert_eq!(frame.max_fee_per_blob_gas, U256::MAX - U256::from(2));
+            assert_eq!(frame.nonce_keys, tx.nonce_keys);
+            let mut nonce_calldata = vec![0xe2, 0x01, 0xa0];
+            nonce_calldata.extend([0xff; 32]);
+            nonce_calldata.push(0x88);
+            nonce_calldata.extend([0xff; 8]);
+            assert_eq!(frame.nonce_calldata, nonce_calldata);
+            assert_eq!(frame.signature_hash, tx.signature_hash());
+
+            let signature_hash = tx.signature_hash();
+            let mut transformed = tx.clone();
+            transformed.signatures[0].signature = Bytes::new();
+            assert_eq!(signature_hash, keccak256(transformed.encoded_2718()));
+            tx.signatures[0].signature = vec![0x85; length + 1].into();
+            assert_eq!(tx.signature_hash(), signature_hash);
+            tx.signatures[1].signature = vec![0x86; length + 1].into();
+            assert_ne!(tx.signature_hash(), signature_hash);
+        }
+    }
+
+    #[test]
+    fn canonical_frame_receipt_has_no_output_or_bloom_wire_fields() {
+        let receipt = ReceiptEnvelope::Eip8141(
+            FrameReceiptPayload {
+                cumulative_gas_used: 128,
+                payer: Address::repeat_byte(0x11),
+                frame_receipts: vec![
+                    FrameReceipt {
+                        status: FrameStatus::Success,
+                        gas_used: FrameGasUsed { execution: 1, state: 2 },
+                        logs: vec![],
+                    },
+                    FrameReceipt { status: FrameStatus::SkippedAtomicBatch, ..Default::default() },
+                ],
+            }
+            .into(),
+        );
+        // Type 6, [cumulative gas, payer, [[status, [execution,state], logs], ...]].
+        let expected =
+            hex!("06e48180941111111111111111111111111111111111111111ccc501c20102c0c502c28080c0");
+        assert_eq!(receipt.encoded_2718(), expected);
+        assert_eq!(ReceiptEnvelope::decode_2718_exact(&expected).unwrap(), receipt);
+        let mut invalid_status = expected;
+        invalid_status[27] = 3;
+        assert!(ReceiptEnvelope::decode_2718_exact(&invalid_status).is_err());
+        let mut trailing = expected.to_vec();
+        trailing.push(0x80);
+        assert!(ReceiptEnvelope::decode_2718_exact(&trailing).is_err());
     }
 }

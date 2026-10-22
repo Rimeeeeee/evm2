@@ -2,7 +2,7 @@ use crate::fixture::Suites;
 use criterion::{BatchSize, BenchmarkGroup, black_box, measurement::WallTime};
 use evm2::{SpecId, Version};
 use evm2_cli::evm_bench::BenchCase;
-use revm::{
+use revm_bogota::{
     ExecuteEvm, MainBuilder, MainContext,
     context::{BlockEnv, CfgEnv, Context, TxEnv},
     database::{CacheDB, EmptyDB, InMemoryDB},
@@ -12,7 +12,7 @@ use revm::{
 use std::{borrow::Cow, sync::Arc};
 
 type BenchDB = CacheDB<Arc<InMemoryDB>>;
-type BenchEvm = revm::MainnetEvm<revm::handler::MainnetContext<BenchDB>>;
+type BenchEvm = revm_bogota::MainnetEvm<revm_bogota::handler::MainnetContext<BenchDB>>;
 
 #[derive(Clone)]
 pub(crate) struct PreparedBench {
@@ -29,7 +29,9 @@ impl PreparedBench {
         let suite = suites.get(bench.fixture_path);
         let (unit, test) = revm_case(suite.input(), &bench.name, spec);
         let tx = test.tx_env(&unit).expect("revm benchmark transaction must build");
-        let (cfg, block) = envs(&unit, revm_spec_id(spec));
+        let (mut cfg, block) = envs(&unit, revm_spec_id(spec));
+        cfg.enable_eip8250 = spec.enables(SpecId::BOGOTA);
+        cfg.set_max_blobs_per_tx(Version::base(spec).max_blobs_per_tx as u64);
         let db = Arc::new(database(&unit));
         Self { name: bench.name.clone(), cfg, block, db, tx }
     }
@@ -76,15 +78,15 @@ impl Runner {
     fn run(
         &mut self,
     ) -> Result<
-        revm::context_interface::result::ExecResultAndState<
-            revm::context_interface::result::ExecutionResult<
-                revm::context_interface::result::HaltReason,
+        revm_bogota::context_interface::result::ExecResultAndState<
+            revm_bogota::context_interface::result::ExecutionResult<
+                revm_bogota::context_interface::result::HaltReason,
             >,
-            revm::state::EvmState,
+            revm_bogota::state::EvmState,
         >,
-        revm::context_interface::result::EVMError<
-            <BenchDB as revm::Database>::Error,
-            revm::context_interface::result::InvalidTransaction,
+        revm_bogota::context_interface::result::EVMError<
+            <BenchDB as revm_bogota::Database>::Error,
+            revm_bogota::context_interface::result::InvalidTransaction,
         >,
     > {
         self.evm.transact(self.tx.clone())
@@ -132,12 +134,13 @@ fn new_evm(cfg: CfgEnv, block: BlockEnv, db: BenchDB) -> BenchEvm {
 fn database(unit: &TestUnit) -> InMemoryDB {
     let mut db = InMemoryDB::new(EmptyDB::new());
     for (address, account) in &unit.pre {
-        let mut info = revm::state::AccountInfo {
+        let mut info = revm_bogota::state::AccountInfo {
             balance: account.balance,
             nonce: account.nonce,
             code: Some(
-                revm::state::Bytecode::new_raw_checked(account.code.clone())
-                    .unwrap_or_else(|_| revm::state::Bytecode::new_legacy(account.code.clone())),
+                revm_bogota::state::Bytecode::new_raw_checked(account.code.clone()).unwrap_or_else(
+                    |_| revm_bogota::state::Bytecode::new_legacy(account.code.clone()),
+                ),
             ),
             ..Default::default()
         };
@@ -168,6 +171,7 @@ fn revm_spec_id(spec: SpecId) -> RevmSpecId {
         SpecId::PRAGUE => RevmSpecId::PRAGUE,
         SpecId::OSAKA => RevmSpecId::OSAKA,
         SpecId::AMSTERDAM => RevmSpecId::AMSTERDAM,
+        SpecId::BOGOTA => RevmSpecId::BOGOTA,
         _ => panic!("unsupported benchmark spec: {spec:?}"),
     }
 }

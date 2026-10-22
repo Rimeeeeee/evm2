@@ -8,7 +8,7 @@ use alloy_eips::{eip7702::SignedAuthorization, eip7840::BlobParams};
 use alloy_primitives::{Address, B256, Bytes, Keccak256, Log, TxKind, U256};
 use alloy_rpc_types_eth::{AccessList as RpcAccessList, AccessListItem as RpcAccessListItem};
 use evm2::{
-    SpecId,
+    SpecId, Version,
     evm::{
         BEACON_ROOTS_ADDRESS, CONSOLIDATION_REQUEST_ADDRESS, HISTORY_STORAGE_ADDRESS,
         WITHDRAWAL_REQUEST_ADDRESS,
@@ -23,7 +23,7 @@ use evm2_eest::{
     },
     execute_blockchain_tests_suite,
 };
-use revm::{
+use revm_bogota::{
     Context, DatabaseCommit, ExecuteEvm, MainBuilder, MainContext, SystemCallEvm,
     context::{BlockEnv as RevmBlockEnv, CfgEnv, ContextTr, JournalTr, TxEnv},
     context_interface::{Cfg, block::BlobExcessGasAndPrice, either::Either},
@@ -241,10 +241,6 @@ impl ReplayFixture {
         assert_canonical(&name, &case);
         let spec = fork_to_spec_id(case.network);
         assert!(spec.enables(SpecId::MERGE), "replay corpus must be post-merge");
-        assert!(
-            spec < SpecId::BOGOTA,
-            "the CLI's upstream revm comparison does not implement Bogota; run the evm2 frame_reference integration test for the pinned reference"
-        );
         Self { name: name.clone(), spec, suite: BlockchainTest([(name, case)].into()) }
     }
 
@@ -321,6 +317,8 @@ impl ReplayFixture {
 
         let mut cfg = CfgEnv::new();
         cfg.set_spec_and_mainnet_gas_params(revm_spec);
+        cfg.enable_eip8250 = spec.enables(SpecId::BOGOTA);
+        cfg.set_max_blobs_per_tx(Version::base(spec).max_blobs_per_tx as u64);
 
         let mut parent_block_hash = Some(case.genesis_block_header.hash);
         let mut parent_excess_blob_gas =
@@ -365,10 +363,28 @@ impl ReplayFixture {
                     let tx = revm_tx(raw);
                     if spec.enables(SpecId::AMSTERDAM) {
                         let block_gas_limit = header.gas_limit.saturating_to::<u64>();
+                        let (execution_reservation, state_reservation) = if let Some(frame) =
+                            &tx.frame_transaction
+                        {
+                            let execution = frame
+                                .intrinsic_gas_with_params(tx.caller, cfg.gas_params())
+                                .unwrap()
+                                .checked_add(frame.total_frame_execution_gas_limit().unwrap())
+                                .unwrap()
+                                .max(
+                                    frame
+                                        .calldata_floor_gas_with_params(tx.caller, cfg.gas_params())
+                                        .unwrap(),
+                                );
+                            (execution, frame.total_frame_state_gas_limit().unwrap())
+                        } else {
+                            (tx.gas_limit.min(cfg.tx_gas_limit_cap()), tx.gas_limit)
+                        };
                         assert!(
-                            tx.gas_limit.min(cfg.tx_gas_limit_cap())
+                            execution_reservation
                                 <= block_gas_limit.saturating_sub(execution_gas_used)
-                                && tx.gas_limit <= block_gas_limit.saturating_sub(state_gas_used),
+                                && state_reservation
+                                    <= block_gas_limit.saturating_sub(state_gas_used),
                             "revm transaction gas limit exceeds available block gas",
                         );
                     }
@@ -377,7 +393,7 @@ impl ReplayFixture {
                     });
                     gas_used = gas_used.saturating_add(result.tx_gas_used());
                     execution_gas_used =
-                        execution_gas_used.saturating_add(result.gas().block_regular_gas_used());
+                        execution_gas_used.saturating_add(result.block_regular_gas_used());
                     state_gas_used =
                         state_gas_used.saturating_add(result.gas().block_state_gas_used());
                     hook.transaction_finished(TransactionFinished {
@@ -387,7 +403,7 @@ impl ReplayFixture {
                         transaction_index,
                         total_transactions,
                         gas_used: result.tx_gas_used(),
-                        execution_gas_used: result.gas().block_regular_gas_used(),
+                        execution_gas_used: result.block_regular_gas_used(),
                         state_gas_used: result.gas().block_state_gas_used(),
                         success: result.is_success(),
                         logs: result.logs(),
@@ -617,6 +633,7 @@ fn revm_spec_id(spec: SpecId) -> RevmSpecId {
         SpecId::PRAGUE => RevmSpecId::PRAGUE,
         SpecId::OSAKA => RevmSpecId::OSAKA,
         SpecId::AMSTERDAM => RevmSpecId::AMSTERDAM,
+        SpecId::BOGOTA => RevmSpecId::BOGOTA,
         other => panic!("unsupported replay spec: {other:?}"),
     }
 }
@@ -638,7 +655,8 @@ fn authorization_list(raw: &Transaction) -> Option<Vec<SignedAuthorization>> {
 // revm side.
 // ---------------------------------------------------------------------------
 
-type RevmEvm<'a> = revm::MainnetEvm<revm::handler::MainnetContext<&'a mut RevmInMemoryDB>>;
+type RevmEvm<'a> =
+    revm_bogota::MainnetEvm<revm_bogota::handler::MainnetContext<&'a mut RevmInMemoryDB>>;
 
 fn revm_pre_state(case: &BlockchainTestCase) -> RevmInMemoryDB {
     let mut database = CacheDB::new(EmptyDB::new());
@@ -765,6 +783,13 @@ fn revm_system_call(evm: &mut RevmEvm<'_>, address: Address, data: Bytes, label:
 }
 
 fn revm_tx(raw: &Transaction) -> TxEnv {
+    if raw.txbytes.is_some()
+        || raw.transaction_type.is_some_and(|kind| kind == U256::from(6))
+        || raw.frames.is_some()
+    {
+        return evm2_eest::reference_block_transaction(raw)
+            .unwrap_or_else(|error| panic!("revm frame replay transaction must convert: {error}"));
+    }
     let caller = raw.sender.expect("replay transaction must carry a sender");
     let tx_type = raw.transaction_type.map(|ty| ty.saturating_to::<u8>()).unwrap_or(0);
 

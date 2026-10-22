@@ -22,6 +22,8 @@ pub enum ExecutionMode {
     Interpreter,
     /// Run through inspected instruction dispatch without producing debug output.
     InspectedInterpreter,
+    /// Compare every native transaction directly with the pinned Bogota revm implementation.
+    Revm,
     /// Run through the evm2 JIT runtime, failing qualification if any code falls back.
     #[cfg(feature = "jit")]
     Jit,
@@ -70,6 +72,7 @@ impl Error for ExecutionResourceError {}
 #[derive(Clone, Debug)]
 pub(crate) struct ExecutionResources {
     inspected: bool,
+    differential: bool,
     #[cfg(feature = "jit")]
     backend: Option<JitBackend>,
     #[cfg(feature = "jit")]
@@ -80,7 +83,9 @@ impl ExecutionResources {
     #[cfg(feature = "jit")]
     pub(crate) fn new(mode: ExecutionMode) -> Result<Self, ExecutionResourceError> {
         let backend = match mode {
-            ExecutionMode::Interpreter | ExecutionMode::InspectedInterpreter => None,
+            ExecutionMode::Interpreter
+            | ExecutionMode::InspectedInterpreter
+            | ExecutionMode::Revm => None,
             ExecutionMode::Jit | ExecutionMode::Aot => {
                 let aot = mode == ExecutionMode::Aot;
                 Some(crate::jit::make_backend(aot).map_err(ExecutionResourceError)?)
@@ -88,6 +93,7 @@ impl ExecutionResources {
         };
         Ok(Self {
             inspected: mode == ExecutionMode::InspectedInterpreter,
+            differential: mode == ExecutionMode::Revm,
             backend,
             fallbacks: Arc::default(),
         })
@@ -95,7 +101,14 @@ impl ExecutionResources {
 
     #[cfg(not(feature = "jit"))]
     pub(crate) const fn new(mode: ExecutionMode) -> Result<Self, ExecutionResourceError> {
-        Ok(Self { inspected: matches!(mode, ExecutionMode::InspectedInterpreter) })
+        Ok(Self {
+            inspected: matches!(mode, ExecutionMode::InspectedInterpreter),
+            differential: matches!(mode, ExecutionMode::Revm),
+        })
+    }
+
+    pub(crate) const fn differential(&self) -> bool {
+        self.differential
     }
 
     #[cfg(feature = "jit")]

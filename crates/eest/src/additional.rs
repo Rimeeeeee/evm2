@@ -21,6 +21,7 @@ pub(crate) fn suites(path: PathBuf) -> Vec<TestSuite> {
     vec![
         suite(path.clone(), "additional", run_file, run_files),
         suite(path.clone(), "additional::inspected", run_file_inspected, run_files_inspected),
+        suite(path.clone(), "additional::revm", run_file_revm, run_files_revm),
         #[cfg(feature = "jit")]
         suite(path.clone(), "additional::jit", run_file_jit, run_files_jit),
         #[cfg(feature = "jit")]
@@ -59,6 +60,14 @@ fn run_file_inspected(path: PathBuf) -> Result<(), Failed> {
 
 fn run_files_inspected(paths: Vec<PathBuf>) -> Result<(), Failed> {
     run_with_mode(paths, ExecutionMode::InspectedInterpreter)
+}
+
+fn run_file_revm(path: PathBuf) -> Result<(), Failed> {
+    run_files_revm(vec![path])
+}
+
+fn run_files_revm(paths: Vec<PathBuf>) -> Result<(), Failed> {
+    run_with_mode(paths, ExecutionMode::Revm)
 }
 
 #[cfg(feature = "jit")]

@@ -95,7 +95,7 @@ postcard = { workspace = true, features = ["alloc"] }
 rand = { workspace = true, features = ["std"] }
 ark-std = { workspace = true }
 rstest.workspace = true
-revm-bogota = { package = "revm", git = "https://github.com/Soubhik-10/revm", rev = "b2109aeb7a69505617c629538e9014bd20148e5c", default-features = false, features = ["std"] }
+revm-bogota.workspace = true
 
 [[example]]
 name = "custom_evm"

@@ -4,7 +4,7 @@ use evm2_cli::{
     replay_bench::{ReplayFixture, diff},
 };
 use evm2_eest::BlockchainTestNoopHook;
-use revm::database::InMemoryDB;
+use revm_bogota::database::InMemoryDB;
 use std::{
     borrow::Cow,
     path::{Path, PathBuf},

@@ -77,13 +77,13 @@
 - [x] Lifecycle, gas, nonce, assertion, tracing and memory regressions.
 - [x] Frame fixture checks in the existing CI workflow.
 - [x] Raw type-6 transaction capture and export.
-- [ ] Exhaustive malformed-payload and first-error ordering regressions.
-- [ ] Complete custom-host, precompile and nested-inspector test coverage.
-- [ ] Transaction, signature, receipt and fixture serialization regression vectors.
-- [ ] Full official-corpus differential testing against pinned revm.
-- [ ] Frame transaction generation and comparison in the CLI fuzzer.
-- [ ] Generated approval, atomic-group, nonce and assertion sequence tests.
-- [ ] Extend the BAL parallel example to frame transactions.
-- [ ] Serial/parallel frame state, receipt, gas and error-order equivalence tests.
-- [ ] Ordinary-transaction performance and allocation measurements.
-- [ ] Additional-platform JIT and AOT CI coverage.
+- [x] Malformed-payload and first-error ordering regressions.
+- [x] Custom EVM family, precompile and nested-inspector regressions.
+- [x] Transaction, signature, receipt and fixture serialization regression vectors.
+- [x] Full official-corpus differential testing against pinned revm.
+- [x] Frame transaction generation and comparison in the CLI fuzzer.
+- [x] Generated approval, atomic-group, nonce and assertion sequence tests.
+- [x] Extend the BAL parallel example to frame transactions.
+- [x] Serial/parallel frame state, receipt, gas and error-order equivalence tests.
+- [x] Ordinary-transaction performance and allocation measurements.
+- [x] Additional-platform JIT and AOT CI coverage.

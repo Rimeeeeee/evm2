@@ -609,7 +609,18 @@ fn execute_block(
             if build_bal {
                 evm.state_mut().bump_bal_index();
             }
-            match execute_tx(&mut evm, &mut block_state, &tx) {
+            let reference = resources.differential().then(|| {
+                let before = snapshot_database(&evm, &block_state);
+                crate::reference::execute(&before, next_block_env, spec, &tx)
+            });
+            let executed = execute_tx(&mut evm, &mut block_state, &tx);
+            if let Some(reference) = reference {
+                let post = snapshot_database(&evm, &block_state);
+                crate::reference::compare(reference, executed.as_ref(), &post).map_err(
+                    |error| TestError::case(path, name, TestErrorKind::UnexpectedFailure(error)),
+                )?;
+            }
+            match executed {
                 Ok(result) => {
                     cumulative_tx_gas_used =
                         cumulative_tx_gas_used.saturating_add(result.tx_gas_used());
@@ -1032,6 +1043,22 @@ fn execute_tx(
     Ok(evm.transact(tx)?.commit_to(block_state))
 }
 
+fn snapshot_database(
+    evm: &Evm<'static, BaseEvmTypes>,
+    block_state: &BlockStateAccumulator,
+) -> InMemoryDB {
+    let mut database = if let Some(database) = evm.database_as::<InMemoryDB>() {
+        database.clone()
+    } else {
+        evm.database_as::<DbStats<InMemoryDB>>()
+            .expect("fixture database is an InMemoryDB or its statistics wrapper")
+            .inner()
+            .clone()
+    };
+    database.commit_source(block_state);
+    database
+}
+
 fn commit_state_changes<S: StateChangeSource>(
     evm: &mut Evm<'_, BaseEvmTypes>,
     block_state: &mut BlockStateAccumulator,
@@ -1120,7 +1147,7 @@ fn blob_params_for_timestamp(timestamp: U256, spec: SpecId) -> BlobParams {
     }
 }
 
-fn build_tx(raw: &Transaction) -> Result<RecoveredTxEnvelope, TestErrorKind> {
+pub(crate) fn build_tx(raw: &Transaction) -> Result<RecoveredTxEnvelope, TestErrorKind> {
     if let Some(bytes) = &raw.txbytes {
         return Ok(build_recovered_tx_bytes(bytes)?);
     }

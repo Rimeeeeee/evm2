@@ -36,7 +36,7 @@ bitflags = { workspace = true, features = ["serde"] }
 clap.workspace = true
 futures-util.workspace = true
 rand.workspace = true
-revm.workspace = true
+revm-bogota = { workspace = true, default-features = true, features = ["asm-keccak"] }
 secp256k1 = { workspace = true, features = ["global-context", "recovery"] }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true, features = ["raw_value", "std"] }
@@ -79,7 +79,7 @@ mimalloc = ["dep:mimalloc"]
 
 [dev-dependencies]
 criterion.workspace = true
-revm = { workspace = true, features = ["test-types"] }
+revm-bogota = { workspace = true, default-features = true, features = ["test-types"] }
 
 [[bench]]
 name = "evm"

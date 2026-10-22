@@ -1,8 +1,6 @@
 //! Bogota devnet 1 frame transaction preparation and ordered execution.
 //!
-//! The protocol identity and immutable oracle are recorded in
-//! `docs/frame-transactions-implementation-todo.md`. Newer draft signing, nonce and
-//! assertion layouts must not be enabled under this fork.
+//! Newer draft signing, nonce and assertion layouts must not be enabled under this fork.
 
 use super::{effective_gas_price, validate_chain_id, validate_gas_price, validate_priority_fee};
 use crate::{

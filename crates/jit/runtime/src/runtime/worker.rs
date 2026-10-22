@@ -826,4 +826,38 @@ mod lifecycle_tests {
         release.send(()).unwrap();
         owner.join().unwrap();
     }
+
+    #[cfg(feature = "llvm")]
+    #[test]
+    fn cancun_sstore_compiles_without_fallback() {
+        for target in [CompilerTarget::Jit, CompilerTarget::Aot] {
+            let bytecode = Bytes::from_static(&[0x60, 0x42, 0x5f, 0x55, 0x00]);
+            let config = RuntimeConfig::default();
+            let mut state = None;
+            let result = compile_with_state(
+                CompileJob {
+                    kind: if target == CompilerTarget::Aot {
+                        CompilationKind::Aot
+                    } else {
+                        CompilationKind::Jit
+                    },
+                    key: RuntimeCacheKey {
+                        code_hash: alloy_primitives::keccak256(&bytecode),
+                        spec_id: evm2::SpecId::CANCUN,
+                    },
+                    bytecode,
+                    symbol_name: "cancun_sstore_compiles_without_fallback".into(),
+                    opt_level: OptimizationLevel::None,
+                    sync_notifier: SyncNotifier::none(),
+                    generation: 0,
+                },
+                &config,
+                target,
+                &mut state,
+            );
+            if let Err(error) = result.outcome {
+                panic!("Cancun SSTORE {target:?} compilation failed: {error}");
+            }
+        }
+    }
 }

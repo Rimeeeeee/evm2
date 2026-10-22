@@ -63,6 +63,7 @@ pub(crate) struct SpecOutcome {
 struct SpecFailure {
     error: HandlerError,
     outcome: SpecOutcome,
+    comparison_error: Option<String>,
 }
 
 /// Execution options for a single suite.
@@ -248,6 +249,11 @@ fn validate_result(
     spec: SpecId,
     config: ExecuteConfig,
 ) -> Result<(), TestError> {
+    if let Err(failure) = &result
+        && let Some(error) = &failure.comparison_error
+    {
+        return Err(TestError::case(path, name, TestErrorKind::ReferenceMismatch(error.clone())));
+    }
     let error = match (&post.expect_exception, result) {
         (Some(_), Err(failure)) => {
             if config.print_json_outcome {
@@ -382,11 +388,23 @@ fn execute_spec(
     }
     let mut post = database;
     pre_block_system_calls(&mut evm, &mut post, spec, env);
-    let result = match evm.transact(tx) {
-        Ok(pending) => {
-            let Ok(result) = pending.commit_with(&mut post);
-            result
-        }
+    let reference =
+        resources.differential().then(|| crate::reference::execute(&post, block, spec, tx));
+    let executed = evm.transact(tx).map(|pending| {
+        let Ok(result) = pending.commit_with(&mut post);
+        result
+    });
+    if let Some(reference) = reference
+        && let Err(error) = crate::reference::compare(reference, executed.as_ref(), &post)
+    {
+        return Err(Box::new(SpecFailure {
+            error: HandlerError::External(error.clone().into()),
+            outcome: failed_spec_outcome(&post),
+            comparison_error: Some(error),
+        }));
+    }
+    let result = match executed {
+        Ok(result) => result,
         Err(error) => {
             let outcome = failed_spec_outcome(&post);
             if trace {
@@ -397,7 +415,7 @@ fn execute_spec(
                     outcome.state_root,
                 );
             }
-            return Err(Box::new(SpecFailure { error, outcome }));
+            return Err(Box::new(SpecFailure { error, outcome, comparison_error: None }));
         }
     };
     if let Some(counts) = db_stats_counts

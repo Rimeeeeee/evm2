@@ -5,12 +5,16 @@ use crate::fuzzer::{
     rng::Gen,
 };
 use alloy_consensus::{
-    TxEip1559, TxEip2930, TxEip4844, TxEip7702, TxLegacy,
+    TxEip1559, TxEip2930, TxEip4844, TxEip7702, TxEip8141, TxLegacy,
     transaction::{Recovered, TxEip4844Variant},
 };
 use alloy_eips::{
     eip2930::{AccessList, AccessListItem},
     eip7702::{Authorization, SignedAuthorization},
+    eip8141::{Frame, FrameLimits, FrameMode, FrameSignature, NONCE_MANAGER, SignatureScheme},
+    eip8272::{
+        RECENT_ROOT_ADDRESS, RECENT_ROOT_CODE, RECENT_ROOT_ENTRY_DOMAIN, RECENT_ROOT_STORAGE_DOMAIN,
+    },
 };
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256, map::HashMap};
 use evm2::{
@@ -19,7 +23,7 @@ use evm2::{
     ethereum::{RecoveredTxEnvelope, TxEnvelope},
     interpreter::op,
 };
-use revm::{
+use revm_bogota::{
     context::{BlockEnv as RevmBlockEnv, TxEnv as RevmTxEnv},
     primitives::TxKind as RevmTxKind,
 };
@@ -94,6 +98,10 @@ impl Default for CaseGenerator {
 
 impl CaseGenerator {
     pub(crate) fn generate(&mut self, rng: &mut Gen) -> &EvmCase {
+        if rng.one_in(4) {
+            self.generate_frames(rng);
+            return &self.case;
+        }
         let Self { case, program, address_pool, call_pool } = self;
         let EvmCase { spec, block, tx, extra_txs, features, accounts } = case;
         *spec = match rng.range(13) {
@@ -115,6 +123,14 @@ impl CaseGenerator {
         *block = CaseBlock::generate(rng, spec);
         let extra_accounts = rng.range_inclusive(0, 4);
         accounts.resize_with(2 + extra_accounts, CaseAccount::default);
+        accounts[0] =
+            CaseAccount { address: CALLER, balance: CALLER_BALANCE, ..Default::default() };
+        accounts[1] = CaseAccount {
+            address: TARGET,
+            balance: U256::from(1_000_000),
+            nonce: 1,
+            ..Default::default()
+        };
         for (i, account) in accounts[2..].iter_mut().enumerate() {
             account.storage.clear();
             if rng.one_in(2) {
@@ -174,6 +190,8 @@ pub(crate) struct CaseBlock {
     pub(crate) timestamp: U256,
     pub(crate) gas_limit: u64,
     pub(crate) basefee: u64,
+    #[serde(default)]
+    pub(crate) slot_num: u64,
 }
 
 fn tiny_callee_code(rng: &mut Gen, spec: SpecId) -> Bytes {
@@ -233,6 +251,7 @@ impl CaseBlock {
             timestamp: rng.small_word(2_000_000_000),
             gas_limit: 30_000_000,
             basefee: 0,
+            slot_num: 0,
         }
     }
 
@@ -243,6 +262,7 @@ impl CaseBlock {
             timestamp: self.timestamp,
             gas_limit: U256::from(self.gas_limit),
             basefee: U256::from(self.basefee),
+            slot_num: U256::from(self.slot_num),
             ..BlockEnvExt::default()
         }
     }
@@ -254,6 +274,7 @@ impl CaseBlock {
             timestamp: self.timestamp,
             gas_limit: self.gas_limit,
             basefee: self.basefee,
+            slot_num: self.slot_num,
             ..RevmBlockEnv::default()
         }
     }
@@ -278,6 +299,8 @@ pub(crate) struct CaseTx {
     pub(crate) blob_hashes: Vec<B256>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) authorization_list: Option<Vec<SignedAuthorization>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) frame_transaction: Option<TxEip8141>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -288,6 +311,7 @@ pub(crate) enum FuzzTxKind {
     Eip1559,
     Eip4844,
     Eip7702,
+    Eip8141,
 }
 
 impl fmt::Display for FuzzTxKind {
@@ -298,6 +322,7 @@ impl fmt::Display for FuzzTxKind {
             Self::Eip1559 => "eip1559",
             Self::Eip4844 => "eip4844",
             Self::Eip7702 => "eip7702",
+            Self::Eip8141 => "eip8141",
         })
     }
 }
@@ -310,6 +335,7 @@ impl FuzzTxKind {
             Self::Eip1559 => spec.enables(SpecId::LONDON),
             Self::Eip4844 => spec.enables(SpecId::CANCUN),
             Self::Eip7702 => spec.enables(SpecId::PRAGUE),
+            Self::Eip8141 => spec.enables(SpecId::BOGOTA),
         }
     }
 
@@ -552,6 +578,7 @@ impl CaseTx {
         let direct_precompile = rng.one_in(10).then(|| precompile::random_target(rng, spec));
         let creates = direct_precompile.is_none() && kind.supports_create() && rng.one_in(8);
         self.kind = kind;
+        self.frame_transaction = None;
         self.caller = CALLER;
         self.target = if let Some(precompile) = direct_precompile {
             precompile.address()
@@ -592,6 +619,10 @@ impl CaseTx {
 
     pub(crate) fn evm2(&self) -> RecoveredTxEnvelope {
         match self.kind {
+            FuzzTxKind::Eip8141 => Recovered::new_unchecked(
+                TxEnvelope::Eip8141(self.frame_transaction.clone().unwrap_or_default()),
+                self.caller,
+            ),
             FuzzTxKind::Legacy => Recovered::new_unchecked(
                 TxEnvelope::Legacy(TxLegacy {
                     nonce: self.nonce,
@@ -681,7 +712,11 @@ impl CaseTx {
     }
 
     pub(crate) fn direct_precompile(&self) -> Option<PrecompileTarget> {
-        if self.creates { None } else { precompile::target_for_address(self.target) }
+        if self.creates || self.kind == FuzzTxKind::Eip8141 {
+            None
+        } else {
+            precompile::target_for_address(self.target)
+        }
     }
 
     pub(crate) fn precompile_input_shape(&self, precompile: PrecompileTarget) -> FuzzFeatures {
@@ -697,6 +732,10 @@ impl CaseTx {
     }
 
     pub(crate) fn revm(&self) -> RevmTxEnv {
+        if self.kind == FuzzTxKind::Eip8141 {
+            return evm2_eest::reference_tx(&self.evm2())
+                .expect("frame fuzzer transaction converts to reference environment");
+        }
         RevmTxEnv {
             tx_type: match self.kind {
                 FuzzTxKind::Legacy => 0,
@@ -704,6 +743,7 @@ impl CaseTx {
                 FuzzTxKind::Eip1559 => 2,
                 FuzzTxKind::Eip4844 => 3,
                 FuzzTxKind::Eip7702 => 4,
+                FuzzTxKind::Eip8141 => unreachable!(),
             },
             caller: self.caller,
             gas_limit: self.gas_limit,
@@ -718,11 +758,13 @@ impl CaseTx {
                 | FuzzTxKind::Eip1559
                 | FuzzTxKind::Eip4844
                 | FuzzTxKind::Eip7702 => Some(1),
+                FuzzTxKind::Eip8141 => unreachable!(),
             },
             access_list: self.access_list.clone(),
             gas_priority_fee: match self.kind {
                 FuzzTxKind::Eip1559 | FuzzTxKind::Eip4844 | FuzzTxKind::Eip7702 => Some(0),
                 FuzzTxKind::Legacy | FuzzTxKind::Eip2930 => None,
+                FuzzTxKind::Eip8141 => unreachable!(),
             },
             blob_hashes: self.blob_hashes.clone(),
             max_fee_per_blob_gas: if self.kind == FuzzTxKind::Eip4844 { 1 } else { 0 },
@@ -814,6 +856,339 @@ mod spec_serde {
     }
 }
 
+const FRAME_FAILURE: Address = Address::with_last_byte(0x41);
+const FRAME_ASSERTION: Address = Address::with_last_byte(0x42);
+const FRAME_DELEGATE: Address = Address::with_last_byte(0x43);
+const FRAME_SPONSOR: Address = Address::with_last_byte(0x44);
+
+fn generated_frame(mode: FrameMode, target: Address, flags: u8) -> Frame {
+    Frame {
+        mode,
+        target: target.into(),
+        flags,
+        limits: FrameLimits { execution: 150_000, state: 400_000 },
+        ..Default::default()
+    }
+}
+
+fn frame_case_tx(payload: TxEip8141) -> CaseTx {
+    CaseTx {
+        kind: FuzzTxKind::Eip8141,
+        // The wrapper's metadata must never replace the frame envelope's explicit sender.
+        caller: Address::ZERO,
+        target: TARGET,
+        frame_transaction: Some(payload),
+        ..Default::default()
+    }
+}
+
+impl CaseGenerator {
+    fn generate_frames(&mut self, rng: &mut Gen) {
+        let scenario = rng.range(14);
+        let keyed = rng.one_in(2);
+        self.generate_frame_scenario(rng, scenario, keyed);
+    }
+
+    fn generate_frame_scenario(&mut self, rng: &mut Gen, scenario: usize, keyed: bool) {
+        let keys = if keyed {
+            if rng.one_in(2) { vec![U256::from(7), U256::MAX] } else { vec![U256::from(7)] }
+        } else {
+            vec![U256::ZERO]
+        };
+        let mut case = EvmCase {
+            spec: SpecId::BOGOTA,
+            block: CaseBlock { slot_num: 10_000, ..CaseBlock::generate(rng, SpecId::BOGOTA) },
+            features: FuzzFeatures::FRAME_TRANSACTION | FuzzFeatures::STORAGE,
+            accounts: vec![
+                CaseAccount {
+                    address: CALLER,
+                    balance: CALLER_BALANCE,
+                    code: Bytes::from_static(&[op::PUSH1, 3, op::PUSH0, op::PUSH0, op::APPROVE]),
+                    ..Default::default()
+                },
+                CaseAccount {
+                    address: TARGET,
+                    balance: U256::from(1_000_000),
+                    nonce: 1,
+                    code: Bytes::from_static(&[
+                        op::PUSH0,
+                        op::CALLDATALOAD,
+                        op::PUSH0,
+                        op::SSTORE,
+                        op::PUSH0,
+                        op::PUSH0,
+                        op::LOG0,
+                        op::STOP,
+                    ]),
+                    ..Default::default()
+                },
+                CaseAccount { address: NONCE_MANAGER, nonce: 1, ..Default::default() },
+                CaseAccount {
+                    address: FRAME_FAILURE,
+                    code: Bytes::from_static(&[op::PUSH0, op::PUSH0, op::REVERT]),
+                    ..Default::default()
+                },
+                CaseAccount {
+                    address: FRAME_ASSERTION,
+                    code: Bytes::from_static(&[
+                        op::PUSH0,
+                        op::PUSH1,
+                        1,
+                        op::TXTRACE,
+                        op::PUSH0,
+                        op::MSTORE,
+                        op::PUSH1,
+                        32,
+                        op::PUSH0,
+                        op::RETURN,
+                    ]),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        if keyed {
+            case.features.insert(FuzzFeatures::FRAME_KEYED_NONCE);
+        }
+        let mut write = generated_frame(FrameMode::Sender, TARGET, 0);
+        write.data = rng.small_word(255).to_be_bytes::<32>().to_vec().into();
+        let mut payload = TxEip8141 {
+            chain_id: 1,
+            sender: CALLER,
+            nonce_keys: Some(keys),
+            frames: vec![generated_frame(FrameMode::Verify, CALLER, 3), write.clone()],
+            ..Default::default()
+        };
+        payload.fees.max_fee_per_gas = U256::from(1);
+        let mut body_code = vec![
+            op::PUSH0,
+            op::TXPARAM,
+            op::POP,
+            op::PUSH1,
+            1,
+            op::PUSH1,
+            1,
+            op::FRAMEPARAM,
+            op::POP,
+            op::PUSH1,
+            1,
+            op::PUSH0,
+            op::FRAMEDATALOAD,
+            op::POP,
+            op::PUSH1,
+            1,
+            op::PUSH1,
+            32,
+            op::PUSH0,
+            op::PUSH0,
+            op::FRAMEDATACOPY,
+        ];
+        if rng.one_in(2) {
+            let witness_len = rng.range_inclusive(0, 64);
+            payload.signatures.push(FrameSignature {
+                signature: rng.bytes(witness_len).into(),
+                ..Default::default()
+            });
+            body_code.extend_from_slice(&[
+                op::PUSH1,
+                1,
+                op::PUSH0,
+                op::SIGPARAM,
+                op::POP,
+                op::PUSH0,
+                op::PUSH1,
+                4,
+                op::PUSH0,
+                op::PUSH1,
+                32,
+                op::SIGDATACOPY,
+            ]);
+        }
+        body_code.extend_from_slice(&case.accounts[1].code);
+        case.accounts[1].code = body_code.into();
+        let mut assertion_code = vec![op::PUSH0, op::PUSH1, 1, op::TXTRACE, op::PUSH0, op::MSTORE];
+        assertion_code.push(op::PUSH0);
+        assertion_code.push(op::PUSH20);
+        assertion_code.extend_from_slice(TARGET.as_slice());
+        assertion_code.extend_from_slice(&[op::PUSH1, 6, op::TXDIFF, op::POP]);
+        assertion_code.extend_from_slice(&[
+            op::PUSH0,
+            op::PUSH0,
+            op::PUSH0,
+            op::PUSH0,
+            op::EVENTDATACOPY,
+            op::PUSH1,
+            32,
+            op::PUSH0,
+            op::RETURN,
+        ]);
+        case.accounts[4].code = assertion_code.into();
+        match scenario {
+            0 => {}
+            1 => {
+                case.features.insert(FuzzFeatures::FRAME_ATOMIC);
+                payload.frames[1].flags = 4;
+                let mut restore = generated_frame(FrameMode::Sender, TARGET, 4);
+                restore.limits.state = 0;
+                payload.frames.extend([
+                    restore,
+                    generated_frame(FrameMode::Sender, FRAME_FAILURE, 4),
+                    write,
+                ]);
+            }
+            2 => {
+                case.features.insert(FuzzFeatures::FRAME_ASSERTION);
+                payload.frames.extend([
+                    generated_frame(FrameMode::PostTx, FRAME_ASSERTION, 0),
+                    generated_frame(FrameMode::PostTx, FRAME_FAILURE, 0),
+                    generated_frame(FrameMode::PostTx, FRAME_ASSERTION, 0),
+                ]);
+            }
+            3 | 4 => {
+                case.features.insert(FuzzFeatures::FRAME_NESTED_APPROVAL);
+                case.accounts.push(CaseAccount {
+                    address: FRAME_DELEGATE,
+                    code: Bytes::from_static(&[op::PUSH1, 3, op::PUSH0, op::PUSH0, op::APPROVE]),
+                    ..Default::default()
+                });
+                let mut code = vec![
+                    op::PUSH0,
+                    op::CALLDATALOAD,
+                    op::ISZERO,
+                    op::PUSH1,
+                    0,
+                    op::JUMPI,
+                    op::PUSH0,
+                    op::PUSH0,
+                    op::PUSH0,
+                    op::PUSH0,
+                    op::PUSH20,
+                ];
+                code.extend_from_slice(FRAME_DELEGATE.as_slice());
+                code.extend_from_slice(&[op::GAS, op::DELEGATECALL, op::POP]);
+                if scenario == 3 {
+                    code.push(op::STOP);
+                } else if rng.one_in(2) {
+                    code.extend_from_slice(&[op::PUSH0, op::PUSH0, op::REVERT]);
+                } else {
+                    code.push(op::INVALID);
+                }
+                code[4] = code.len().try_into().unwrap();
+                code.extend_from_slice(&[
+                    op::JUMPDEST,
+                    op::PUSH1,
+                    3,
+                    op::PUSH0,
+                    op::PUSH0,
+                    op::APPROVE,
+                ]);
+                case.accounts[0].code = code.into();
+                let mut approve = generated_frame(FrameMode::Default, CALLER, 3);
+                approve.data = U256::ONE.to_be_bytes::<32>().to_vec().into();
+                payload.frames[0] = approve;
+                if scenario == 4 {
+                    payload.frames.insert(1, generated_frame(FrameMode::Verify, CALLER, 3));
+                }
+            }
+            5 => {
+                case.features.insert(FuzzFeatures::FRAME_SPONSOR);
+                case.accounts[0].code =
+                    Bytes::from_static(&[op::PUSH1, 2, op::PUSH0, op::PUSH0, op::APPROVE]);
+                case.accounts.push(CaseAccount {
+                    address: FRAME_SPONSOR,
+                    balance: CALLER_BALANCE,
+                    code: Bytes::from_static(&[op::PUSH1, 1, op::PUSH0, op::PUSH0, op::APPROVE]),
+                    ..Default::default()
+                });
+                payload.frames[0].flags = 2;
+                payload.frames.insert(1, generated_frame(FrameMode::Verify, FRAME_SPONSOR, 1));
+            }
+            6 => {
+                let mut next = payload.clone();
+                next.nonce = 1;
+                next.frames[1].data = U256::from(99).to_be_bytes::<32>().to_vec().into();
+                case.extra_txs.push(frame_case_tx(next.clone()));
+                next.nonce = if rng.one_in(2) { 1 } else { 2 };
+                case.extra_txs.push(frame_case_tx(next));
+            }
+            7 => {
+                payload.frames[1].limits.state = 0;
+            }
+            8 => {
+                let mut restore = generated_frame(FrameMode::Sender, TARGET, 0);
+                restore.limits.state = 0;
+                write.limits.state = 0;
+                payload.frames.extend([restore, write]);
+            }
+            9 => {
+                case.features.insert(FuzzFeatures::FRAME_INVALID);
+                payload.frames[1].flags = rng.pick(&[8, 16, 128]);
+            }
+            10 => {
+                case.features.insert(FuzzFeatures::FRAME_INVALID);
+                payload.nonce_keys = Some(match rng.range(4) {
+                    0 => vec![],
+                    1 => vec![U256::ZERO, U256::ONE],
+                    2 => vec![U256::ONE, U256::ONE],
+                    _ => vec![U256::MAX, U256::ONE],
+                });
+            }
+            11 => {
+                case.features.insert(FuzzFeatures::FRAME_INVALID);
+                case.accounts[0].code =
+                    Bytes::from_static(&[op::PUSH1, 2, op::PUSH0, op::PUSH0, op::APPROVE]);
+                payload.frames[0].flags = 2;
+            }
+            12 => {
+                case.features.insert(FuzzFeatures::FRAME_INVALID);
+                payload.signatures.push(FrameSignature {
+                    scheme: SignatureScheme::Secp256k1,
+                    signature: Bytes::from_static(&[0]),
+                    ..Default::default()
+                });
+            }
+            _ => {
+                case.features.insert(FuzzFeatures::FRAME_RECENT_ROOT);
+                let age = rng.pick(&[1, 8191, 0, 8192]);
+                let slot = case.block.slot_num - age;
+                let source = [0x11; 32];
+                let mut tuple = source.to_vec();
+                tuple.extend_from_slice(&slot.to_be_bytes());
+                tuple.extend_from_slice(&[0x22; 32]);
+                let mut entry = RECENT_ROOT_ENTRY_DOMAIN.as_slice().to_vec();
+                entry.extend_from_slice(&tuple);
+                let mut key = RECENT_ROOT_STORAGE_DOMAIN.as_slice().to_vec();
+                key.extend_from_slice(&source);
+                key.extend_from_slice(&(slot % 8192).to_be_bytes());
+                case.accounts.push(CaseAccount {
+                    address: RECENT_ROOT_ADDRESS,
+                    code: RECENT_ROOT_CODE.clone(),
+                    storage: [(
+                        U256::from_be_bytes(alloy_primitives::keccak256(key).0),
+                        U256::from_be_bytes(alloy_primitives::keccak256(entry).0),
+                    )]
+                    .into_iter()
+                    .collect(),
+                    ..Default::default()
+                });
+                let mut verifier = generated_frame(FrameMode::Verify, RECENT_ROOT_ADDRESS, 0);
+                verifier.limits.state = 0;
+                verifier.data = tuple.into();
+                payload.frames.insert(0, verifier);
+            }
+        }
+        case.tx = frame_case_tx(payload);
+        self.case = case;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn frame_regression_case(scenario: usize, keyed: bool) -> EvmCase {
+        let mut generator = Self::default();
+        generator.generate_frame_scenario(&mut Gen::new(0), scenario, keyed);
+        generator.case
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -849,5 +1224,20 @@ mod tests {
         let decoded = serde_json::from_slice::<EvmCase>(&json).unwrap();
         assert_eq!(decoded, case);
         assert_eq!(serde_json::to_vec(&decoded).unwrap(), json);
+    }
+
+    #[test]
+    fn generated_frame_payloads_round_trip_with_the_explicit_sender() {
+        let mut generator = CaseGenerator::default();
+        for seed in 0..128 {
+            generator.generate_frames(&mut Gen::new(seed));
+            let case = &generator.case;
+            let encoded = serde_json::to_vec(case).unwrap();
+            let decoded: EvmCase = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(&decoded, case, "seed {seed}");
+            assert_eq!(decoded.tx.caller, Address::ZERO);
+            assert_eq!(decoded.tx.evm2().inner().as_eip8141().unwrap().sender, CALLER);
+            assert_eq!(serde_json::to_vec(&decoded).unwrap(), encoded);
+        }
     }
 }
