@@ -1,7 +1,7 @@
-# Frame transaction TODO
+# evm2 frame transaction TODO
 
 - [x] Bogota fork activation and type-6 transaction dispatch.
-- [x] Shared frame transaction, signature and receipt types.
+- [x] Frame transaction, signature and receipt type integration.
 - [x] Explicit payload sender throughout native execution.
 - [x] Full-width fee and nonce-key handling.
 - [x] EIP-8141 frame structure and signature validation.
@@ -79,35 +79,11 @@
 - [x] Raw type-6 transaction capture and export.
 - [ ] Exhaustive malformed-payload and first-error ordering regressions.
 - [ ] Complete custom-host, precompile and nested-inspector test coverage.
-- [ ] Full shared encoding, signing and receipt golden-vector suites.
-- [ ] Shared RPC request, builder, provider and sidecar round trips.
-- [ ] Shared compact transaction and receipt codecs.
-- [ ] Full official-corpus comparison against the reference node.
+- [ ] Transaction, signature, receipt and fixture serialization regression vectors.
+- [ ] Full official-corpus differential testing against pinned revm.
 - [ ] Frame transaction generation and comparison in the CLI fuzzer.
-- [ ] Native Alloy EVM transaction, database and result adapter.
-- [ ] Native Alloy block executor and receipt integration.
-- [ ] Reth EVM configuration and execution boundary.
-- [ ] Reth transaction-pool admission through executable-prefix validation.
-- [ ] Pool opcode restrictions and validation-resource limits.
-- [ ] Pool dependency tracking and head-change revalidation.
-- [ ] Keyed nonce-domain replacement and descendant invalidation.
-- [ ] Sponsor reservations and concurrent validation accounting.
-- [ ] Recent-root recognition, expiry metadata and reorg revalidation.
-- [ ] Factory CREATE/CREATE2 value restrictions during pool validation.
-- [ ] Unpaid validation-attempt limits during payload selection.
-- [ ] RPC submission, transaction lookup and receipt lookup.
-- [ ] Frame-aware estimation, simulation and access-list generation.
-- [ ] Production RPC trace integration.
-- [ ] Transaction gossip and pooled blob-sidecar handling.
-- [ ] Block import and payload construction with dual gas limits.
-- [ ] Persistent transaction, receipt and history storage.
-- [ ] Restart, historical retrieval, export/import and pruning support.
-- [ ] Serial fallback for frame-containing blocks in the migrated node.
-- [ ] Ordered parallel frame-block execution and BAL reconstruction.
-- [ ] Serial/parallel state, receipt, gas and error-order equivalence.
-- [ ] End-to-end sponsorship, keyed nonce, assertion and recent-root tests.
-- [ ] Hive and multi-client devnet qualification.
-- [ ] Reorg, restart and persisted-node RPC regression coverage.
+- [ ] Generated approval, atomic-group, nonce and assertion sequence tests.
+- [ ] Extend the BAL parallel example to frame transactions.
+- [ ] Serial/parallel frame state, receipt, gas and error-order equivalence tests.
 - [ ] Ordinary-transaction performance and allocation measurements.
-- [ ] Additional-platform JIT and AOT qualification.
-- [ ] Remove obsolete VM patches after downstream migration passes.
+- [ ] Additional-platform JIT and AOT CI coverage.
