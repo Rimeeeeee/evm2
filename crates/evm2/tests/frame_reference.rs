@@ -1,4 +1,4 @@
-//! Differential checks for docs/frame-transactions-protocol.toml.
+//! Differential checks against the pinned Bogota revm implementation.
 
 use alloy_consensus::{TxEip8141, transaction::Recovered};
 use alloy_eips::eip8141::{
@@ -19,6 +19,7 @@ use revm::{
     database::{CacheDB, EmptyDB},
     primitives::hardfork::SpecId as RevmSpec,
 };
+use revm_bogota as revm;
 use std::collections::BTreeMap;
 
 const SENDER: Address = Address::with_last_byte(0xa0);
@@ -31,6 +32,10 @@ struct Case {
     tx: TxEip8141,
     body: Bytes,
     other: Bytes,
+    sender_code: Bytes,
+    storage: Vec<(Address, U256, U256)>,
+    basefee: u64,
+    expected_valid: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -81,15 +86,15 @@ fn base_case(name: &str, body: &[u8], other: &[u8], suffix: Vec<Frame>) -> Case 
         },
         body: Bytes::copy_from_slice(body),
         other: Bytes::copy_from_slice(other),
+        sender_code: Bytes::from_static(&[0x60, 3, 0x5f, 0x5f, 0xaa]),
+        storage: Vec::new(),
+        basefee: 0,
+        expected_valid: true,
     }
 }
 
 fn initial(case: &Case) -> Vec<(Address, Bytes)> {
-    vec![
-        (SENDER, Bytes::from_static(&[0x60, 3, 0x5f, 0x5f, 0xaa])),
-        (BODY, case.body.clone()),
-        (OTHER, case.other.clone()),
-    ]
+    vec![(SENDER, case.sender_code.clone()), (BODY, case.body.clone()), (OTHER, case.other.clone())]
 }
 
 fn prestate(case: &Case) -> BTreeMap<Address, Account> {
@@ -110,6 +115,9 @@ fn prestate(case: &Case) -> BTreeMap<Address, Account> {
         NONCE_MANAGER,
         Account { nonce: 1, code_hash: alloy_primitives::KECCAK256_EMPTY, ..Default::default() },
     );
+    for &(address, key, value) in &case.storage {
+        accounts.get_mut(&address).unwrap().storage.insert(key, value);
+    }
     accounts
 }
 
@@ -124,9 +132,12 @@ fn native(case: &Case) -> Result<Outcome, String> {
                 .with_code(Bytecode::new_legacy(code)),
         );
     }
+    for &(address, key, value) in &case.storage {
+        db.insert_account_storage(&address, &key, &value);
+    }
     let mut evm = Evm::<BaseEvmTypes>::new(
         SpecId::BOGOTA,
-        BlockEnvExt::default(),
+        BlockEnvExt { basefee: U256::from(case.basefee), ..Default::default() },
         ethereum_tx_registry(SpecId::BOGOTA),
         db,
         Precompiles::base(SpecId::BOGOTA),
@@ -180,6 +191,9 @@ fn oracle(case: &Case) -> Result<Outcome, String> {
                 .with_code(revm::bytecode::Bytecode::new_legacy(code)),
         );
     }
+    for &(address, key, value) in &case.storage {
+        db.insert_account_storage(address, key, value).unwrap();
+    }
     let p = &case.tx;
     let frame_transaction = FrameTransaction {
         nonce_keys: p.nonce_keys.clone(),
@@ -210,6 +224,7 @@ fn oracle(case: &Case) -> Result<Outcome, String> {
             cfg.set_spec_and_mainnet_gas_params(RevmSpec::BOGOTA);
             cfg.enable_eip8250 = true;
         })
+        .modify_block_chained(|block| block.basefee = case.basefee)
         .with_db(db)
         .build_mainnet();
     let result = evm.transact(tx).map_err(|error| format!("{error:?}"))?;
@@ -258,7 +273,7 @@ fn oracle(case: &Case) -> Result<Outcome, String> {
     })
 }
 
-fn main() {
+fn cases() -> Vec<Case> {
     let mut cases = vec![
         base_case("payment", &[], &[], vec![]),
         base_case(
@@ -286,6 +301,7 @@ fn main() {
     ];
     for keys in [vec![], vec![0], vec![1], vec![1, 2], vec![0, 1]] {
         let mut case = base_case(&format!("nonce_keys_{keys:?}"), &[], &[], vec![]);
+        case.expected_valid = !keys.is_empty() && (keys.len() == 1 || !keys.contains(&0));
         case.tx.nonce_keys = Some(keys.into_iter().map(U256::from).collect());
         cases.push(case);
     }
@@ -346,13 +362,22 @@ fn main() {
             suffix,
         ));
     }
+    cases.extend(additional_cases());
+    cases
+}
+
+#[test]
+fn bogota_execution_matches_pinned_revm() {
+    let cases = cases();
     let mut failures = 0;
     for case in &cases {
         let native = native(case);
         let oracle = oracle(case);
         match (&native, &oracle) {
-            (Ok(a), Ok(b)) if a == b => println!("PASS {}", case.name),
-            (Err(_), Err(_)) => println!("INVALID {}: evm2={native:?}; revm={oracle:?}", case.name),
+            (Ok(a), Ok(b)) if case.expected_valid && a == b => println!("PASS {}", case.name),
+            (Err(_), Err(_)) if !case.expected_valid => {
+                println!("INVALID {}: evm2={native:?}; revm={oracle:?}", case.name);
+            }
             _ => {
                 failures += 1;
                 eprintln!("MISMATCH {}\nevm2: {native:#?}\nrevm: {oracle:#?}", case.name);
@@ -364,4 +389,111 @@ fn main() {
         cases.len()
     );
     assert_eq!(failures, 0);
+}
+
+fn additional_cases() -> Vec<Case> {
+    let store = [0x5f, 0x35, 0x5f, 0x55, 0x00];
+    let revert = [0x5f, 0x5f, 0xfd];
+    let mut cases = Vec::new();
+    for (cap, priority, basefee) in [(1, 1, 0), (9, 2, 3), (10, 0, 3), (3, 3, 3)] {
+        for assertion_fails in [false, true] {
+            let mut suffix = vec![frame(FrameMode::Sender, BODY)];
+            if assertion_fails {
+                suffix.push(frame(FrameMode::PostTx, OTHER));
+            }
+            let mut case = base_case(
+                &format!(
+                    "paid_cap_{cap}_priority_{priority}_base_{basefee}_assert_{assertion_fails}"
+                ),
+                &[0x60, 42, 0x5f, 0x55, 0x00],
+                &revert,
+                suffix,
+            );
+            case.basefee = basefee;
+            case.tx.fees.max_fee_per_gas = U256::from(cap);
+            case.tx.fees.max_priority_fee_per_gas = U256::from(priority);
+            cases.push(case);
+        }
+    }
+    for values in [vec![0], vec![0, 7], vec![0, 1], vec![0, 7, 0], vec![1, 0, 7], vec![1, 0]] {
+        let suffix = values
+            .iter()
+            .map(|value| {
+                let mut f = frame(FrameMode::Sender, BODY);
+                f.data = U256::from(*value).to_be_bytes::<32>().to_vec().into();
+                f.limits.state = 0;
+                f
+            })
+            .collect();
+        let mut case =
+            base_case(&format!("nonzero_original_refund_{values:?}"), &store, &[], suffix);
+        case.storage.push((BODY, U256::ZERO, U256::from(7)));
+        case.tx.fees.max_fee_per_gas = U256::from(3);
+        case.tx.fees.max_priority_fee_per_gas = U256::from(1);
+        cases.push(case);
+    }
+    for assertion_fails in [false, true] {
+        let mut payer = frame(FrameMode::Verify, OTHER);
+        payer.flags = 1;
+        let mut suffix = vec![payer, frame(FrameMode::Sender, BODY)];
+        if assertion_fails {
+            // APPROVE is forbidden in POST_TX, so the payer contract also supplies
+            // a deterministic failing assertion after its successful payment prefix.
+            suffix.push(frame(FrameMode::PostTx, OTHER));
+        }
+        let mut case = base_case(
+            &format!("external_payer_assert_{assertion_fails}"),
+            &[0x60, 42, 0x5f, 0x55, 0x00],
+            &[0x60, 1, 0x5f, 0x5f, 0xaa],
+            suffix,
+        );
+        case.sender_code = Bytes::from_static(&[0x60, 2, 0x5f, 0x5f, 0xaa]);
+        case.tx.fees.max_fee_per_gas = U256::from(9);
+        case.tx.fees.max_priority_fee_per_gas = U256::from(2);
+        case.basefee = 3;
+        cases.push(case);
+    }
+    let mut first = frame(FrameMode::Sender, BODY);
+    first.flags = 4;
+    let mut failing = frame(FrameMode::Sender, OTHER);
+    failing.flags = 4;
+    cases.push(base_case(
+        "atomic_storage_rollback_and_skip",
+        &[0x60, 42, 0x5f, 0x55, 0x00],
+        &revert,
+        vec![first.clone(), failing, frame(FrameMode::Sender, BODY)],
+    ));
+    let mut case = base_case(
+        "atomic_nonzero_original_refund_rollback",
+        &[0x5f, 0x5f, 0x55, 0x00],
+        &revert,
+        vec![first, frame(FrameMode::Sender, OTHER)],
+    );
+    case.storage.push((BODY, U256::ZERO, U256::from(7)));
+    cases.push(case);
+    cases.push(base_case(
+        "created_account_and_code_stream",
+        &[
+            0x63, 0x60, 0x01, 0x5f, 0xf3, 0x5f, 0x52, 0x60, 4, 0x60, 28, 0x5f, 0xf0, 0x5f, 0x52,
+            0x60, 32, 0x5f, 0xf3,
+        ],
+        &[],
+        vec![frame(FrameMode::Sender, BODY)],
+    ));
+    let mut destroy = vec![0x7f];
+    destroy.extend_from_slice(
+        &U256::from_be_slice(&[0x60, 2, 0x60, 10, 0x5f, 0x39, 0x60, 2, 0x5f, 0xf3, 0x5f, 0xff])
+            .to_be_bytes::<32>(),
+    );
+    destroy.extend_from_slice(&[
+        0x5f, 0x52, 0x60, 12, 0x60, 20, 0x5f, 0xf0, 0x5f, 0x52, 0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x5f,
+        0x51, 0x61, 0xc3, 0x50, 0xf1, 0x50, 0x00,
+    ]);
+    cases.push(base_case(
+        "created_then_selfdestructed_stream",
+        &destroy,
+        &[],
+        vec![frame(FrameMode::Sender, BODY)],
+    ));
+    cases
 }

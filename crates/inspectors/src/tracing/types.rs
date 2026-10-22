@@ -49,6 +49,10 @@ pub struct DecodedCallTrace {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CallTrace {
+    /// Synthetic root collecting the ordered frames of an EIP-8141 transaction.
+    pub frame_transaction_root: bool,
+    /// Whether this call initialized an interpreter, rather than stopping at entry.
+    pub entered_evm: bool,
     /// Ordered frame index for top-level frame transaction nodes.
     pub frame_index: Option<usize>,
     /// Protocol frame mode, encoded as 0..=3.
@@ -171,6 +175,9 @@ impl CallTrace {
 
     /// Returns the error message if it is an erroneous result.
     pub(crate) fn as_error_msg(&self, kind: TraceStyle) -> Option<String> {
+        if self.skipped {
+            return Some("frame skipped".to_string());
+        }
         self.status.and_then(|status| utils::fmt_error_msg(status, kind))
     }
 
@@ -305,7 +312,7 @@ impl CallTraceNode {
     /// Returns true if this is a call to a precompile
     #[inline]
     pub fn is_precompile(&self) -> bool {
-        self.trace.maybe_precompile.unwrap_or(false)
+        self.trace.maybe_precompile.unwrap_or(false) && self.trace.frame_index.is_none()
     }
 
     /// Returns the kind of call the trace belongs to
@@ -449,6 +456,10 @@ impl CallTraceNode {
             // STATICCALL frames don't have a value
             call_frame.value = None;
         }
+        if self.trace.frame_index.is_some() {
+            call_frame.execution_gas_used = Some(U256::from(self.trace.gas_used));
+            call_frame.state_gas_used = Some(U256::from(self.trace.state_gas_used));
+        }
 
         // we need to populate error and revert reason
         if !self.trace.success {
@@ -456,9 +467,10 @@ impl CallTraceNode {
                 call_frame.to = None;
             }
 
-            if !self
-                .status()
-                .is_some_and(|status| status.is_revert() || status == InstrStop::NonceOverflow)
+            if self.trace.frame_index.is_none()
+                && !self
+                    .status()
+                    .is_some_and(|status| status.is_revert() || status == InstrStop::NonceOverflow)
             {
                 call_frame.gas_used = U256::from(self.trace.gas_limit);
                 call_frame.output = None;

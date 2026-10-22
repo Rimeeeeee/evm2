@@ -220,7 +220,7 @@ const fn revm_spec(spec: SpecId) -> RevmSpecId {
         SpecId::OSAKA => RevmSpecId::OSAKA,
         SpecId::AMSTERDAM => RevmSpecId::AMSTERDAM,
         _ => panic!(
-            "the upstream revm fuzzer backend does not implement this fork; use validation/frame-oracle for Bogota"
+            "the upstream revm fuzzer backend does not implement this fork; run the evm2 frame_reference integration test for Bogota"
         ),
     }
 }

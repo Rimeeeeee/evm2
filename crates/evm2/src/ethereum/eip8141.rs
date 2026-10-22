@@ -1,7 +1,7 @@
 //! Bogota devnet 1 frame transaction preparation and ordered execution.
 //!
 //! The protocol identity and immutable oracle are recorded in
-//! `docs/frame-transactions-protocol.toml`. Newer draft signing, nonce and
+//! `docs/frame-transactions-implementation-todo.md`. Newer draft signing, nonce and
 //! assertion layouts must not be enabled under this fork.
 
 use super::{effective_gas_price, validate_chain_id, validate_gas_price, validate_priority_fee};
@@ -371,6 +371,14 @@ fn validate_structure(tx: &TxEip8141, placeholders: bool) -> HandlerResult<()> {
         }
     }
     for signature in &tx.signatures {
+        // The shared message enum can be constructed directly with the reserved zero digest.
+        // Its scalar/length validator does not check that invariant, including for arbitrary
+        // witnesses. Simulation placeholders waive cryptography only, never message validity.
+        if !signature.signs_transaction_hash()
+            && signature.explicit_message().is_none_or(|message| message.is_zero())
+        {
+            return Err(invalid("explicit signature message must be a non-zero digest"));
+        }
         if placeholders
             && signature.scheme != SignatureScheme::Arbitrary
             && signature.signature.is_empty()

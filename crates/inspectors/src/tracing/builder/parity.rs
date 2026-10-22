@@ -277,7 +277,16 @@ impl ParityTraceBuilder {
     ///
     /// Bytecode is included if it was recorded by the inspector.
     pub fn vm_trace(&self) -> VmTrace {
-        self.nodes.first().map(|node| self.make_vm_trace(node)).unwrap_or_default()
+        self.nodes
+            .first()
+            .map(|node| {
+                if node.trace.frame_transaction_root {
+                    self.make_frame_transaction_vm_trace(node)
+                } else {
+                    self.make_vm_trace(node)
+                }
+            })
+            .unwrap_or_default()
     }
 
     /// Returns a VM trace with the recorded bytecode.
@@ -347,6 +356,9 @@ impl ParityTraceBuilder {
                         instructions.push(self.make_instruction(step, delta, maybe_sub_call));
                     }
 
+                    if current.idx == start.idx {
+                        break instructions;
+                    }
                     match current.parent {
                         Some(parent) => {
                             // A call or creation that failed its precheck entered no frame.
@@ -366,6 +378,33 @@ impl ParityTraceBuilder {
         };
 
         VmTrace { code: start.trace.bytecode.clone().unwrap_or_default(), ops: instructions }
+    }
+
+    /// Represents each interpreted top-level frame as a synthetic operation containing its VM
+    /// trace.
+    fn make_frame_transaction_vm_trace(&self, root: &CallTraceNode) -> VmTrace {
+        let ops = root
+            .children
+            .iter()
+            .filter_map(|child| {
+                let node = &self.nodes[*child];
+                let trace = &node.trace;
+                trace.entered_evm.then(|| VmInstruction {
+                    pc: trace.frame_index.expect("top-level frame index"),
+                    cost: trace.gas_limit,
+                    ex: Some(VmExecutedOperation {
+                        used: trace.gas_limit.saturating_sub(trace.gas_used),
+                        push: Default::default(),
+                        mem: None,
+                        store: None,
+                    }),
+                    sub: Some(self.make_vm_trace(node)),
+                    op: None,
+                    idx: None,
+                })
+            })
+            .collect();
+        VmTrace { code: Default::default(), ops }
     }
 
     /// Creates a VM instruction from a [CallTraceStep] and a [VmTrace] for the subcall if there is

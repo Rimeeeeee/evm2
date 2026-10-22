@@ -127,6 +127,7 @@ struct FrameTracing {
     payload: TxEip8141,
     active: usize,
     nodes: Vec<Option<usize>>,
+    log_start: usize,
 }
 
 impl TracingInspector {
@@ -180,7 +181,11 @@ impl TracingInspector {
                 let mut steps = mem::take(&mut node.trace.steps);
                 // ensure steps are cleared
                 steps.clear();
-                reusable_step_vecs.push(steps);
+                // Synthetic roots and entries without interpreter steps allocate no buffer.
+                // Caching those empty Vec headers would grow this pool on every frame reset.
+                if steps.capacity() != 0 {
+                    reusable_step_vecs.push(steps);
+                }
             }
         }
 
@@ -258,7 +263,9 @@ impl TracingInspector {
     /// This allows setting it manually by consuming the execution result's gas for example.
     #[inline]
     pub fn set_transaction_gas_limit(&mut self, gas_limit: u64) {
-        if let Some(node) = self.traces.arena.first_mut() {
+        if let Some(node) = self.traces.arena.first_mut()
+            && !node.trace.frame_transaction_root
+        {
             node.trace.gas_limit = gas_limit;
         }
     }
@@ -294,7 +301,9 @@ impl TracingInspector {
     /// EVM's call entry point may not reflect the actual transaction sender.
     #[inline]
     pub fn set_transaction_caller(&mut self, caller: Address) {
-        if let Some(node) = self.traces.arena.first_mut() {
+        if let Some(node) = self.traces.arena.first_mut()
+            && !node.trace.frame_transaction_root
+        {
             node.trace.caller = caller;
         }
     }
@@ -406,7 +415,7 @@ impl TracingInspector {
         let depth = depth + usize::from(self.frame_transaction.is_some());
         // This will only be true if the inspector is configured to exclude precompiles and the call
         // is to a precompile
-        let push_kind = if maybe_precompile.unwrap_or(false) {
+        let push_kind = if maybe_precompile.unwrap_or(false) && frame_index.is_none() {
             // We don't want to track precompiles
             PushTraceKind::PushOnly
         } else {
@@ -423,6 +432,7 @@ impl TracingInspector {
             parent,
             push_kind,
             CallTrace {
+                frame_index,
                 depth,
                 address,
                 kind,
@@ -754,10 +764,12 @@ impl<T: EvmTypes> Inspector<T> for TracingInspector {
             payload: tx.clone(),
             active: 0,
             nodes: alloc::vec![None; tx.frames.len()],
+            log_start: self.log_count,
         });
         self.spec_id = Some(host.spec_id());
         self.features = host.version().features;
         self.traces.arena[0].trace = CallTrace {
+            frame_transaction_root: true,
             address: ENTRY_POINT,
             caller: tx.sender,
             gas_limit: evm2::ethereum::eip8141::FrameGas::calculate(tx, host.version())
@@ -829,14 +841,38 @@ impl<T: EvmTypes> Inspector<T> for TracingInspector {
             trace.state_gas_used = receipt.gas_used.state;
             trace.gas_used = receipt.gas_used.execution;
             trace.output = outcome.outputs[index].clone();
+            trace.success = receipt.status == FrameStatus::Success;
+            trace.skipped = receipt.status == FrameStatus::SkippedAtomicBatch;
+            trace.status = Some(outcome.stops[index]);
             trace.rolled_back = outcome.rolled_back[index];
             if trace.rolled_back {
                 for child in &mut self.traces.arena[node..end] {
+                    child.trace.rolled_back = true;
                     child.logs.clear();
                     child.ordering.retain(|member| !matches!(member, TraceMemberOrder::Log(_)));
                 }
             }
         }
+        // Atomic rollback can remove earlier logs after later calls have assigned their indices.
+        // Reindex surviving logs in emission order, retaining the caller's block-wide offset.
+        let mut visible = alloc::vec![true; self.traces.arena.len()];
+        let mut logs = Vec::new();
+        for node in self.traces.arena.iter().skip(1) {
+            visible[node.idx] = node.trace.success
+                && !node.trace.rolled_back
+                && node.parent.is_none_or(|parent| visible[parent]);
+            if visible[node.idx] {
+                logs.extend(
+                    node.logs.iter().enumerate().map(|(index, log)| (log.index, node.idx, index)),
+                );
+            }
+        }
+        logs.sort_unstable();
+        for (index, (_, node, log)) in logs.into_iter().enumerate() {
+            self.traces.arena[node].logs[log].index = (frames.log_start + index) as u64;
+        }
+        self.log_count = frames.log_start
+            + outcome.receipts.iter().map(|receipt| receipt.logs.len()).sum::<usize>();
         let root = &mut self.traces.arena[0].trace;
         root.gas_used = result.tx_gas_used();
         root.state_gas_used = result.state_gas_spent;
@@ -846,6 +882,7 @@ impl<T: EvmTypes> Inspector<T> for TracingInspector {
 
     #[inline]
     fn initialize_interp(&mut self, interp: &mut Interpreter<'_, '_, T>) {
+        self.last_trace().trace.entered_evm = true;
         if self.spec_id.is_none() {
             self.spec_id = Some(interp.spec());
         }
@@ -1095,3 +1132,6 @@ struct TraceStackEntry {
     trace_idx: usize,
     log_count: usize,
 }
+
+#[cfg(test)]
+mod memory_tests;

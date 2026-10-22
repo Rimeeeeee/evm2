@@ -7,7 +7,6 @@ mod binary;
 pub mod blockchaintest;
 #[cfg(feature = "jit")]
 mod compiled;
-pub mod conformance;
 mod discover;
 mod dump;
 mod env;
@@ -63,11 +62,11 @@ pub use types::{
 /// Runs all EEST harnesses.
 ///
 /// When `EVM2_ADDITIONAL_TESTS` is set, only that folder (or file) runs, as a
-/// single suite that detects each fixture's kind, so no test-name filter is
-/// required.
+/// explicit suites with interpreter, inspected, and enabled compiled backends.
+/// Each suite detects fixture kinds and runs every selected file.
 pub fn run() -> std::process::ExitCode {
     if let Some(path) = fixtures::additional_tests_path() {
-        return harness::run_json_harnesses(vec![additional::suite(path)]);
+        return harness::run_json_harnesses(additional::suites(path));
     }
 
     let mut suites = runner::suites();

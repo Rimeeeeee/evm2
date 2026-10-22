@@ -46,6 +46,8 @@ pub(crate) struct TestSuite {
     pub(crate) run_file: FileRunner,
     /// Optional batched file runner.
     pub(crate) run_files: Option<BatchRunner>,
+    /// Run every explicit file without normal ignore or compiled smoke-subset filtering.
+    pub(crate) exhaustive: bool,
 }
 
 /// Runs cargo-nextest JSON fixture harnesses in one test binary.
@@ -74,6 +76,9 @@ pub(crate) fn run_json_harnesses(suites: Vec<TestSuite>) -> ExitCode {
 
 fn collect_trials(args: &Arguments, suites: &[TestSuite]) -> Result<Vec<Trial>, String> {
     if suites.iter().all(|suite| suite.roots.is_empty()) {
+        if suites.iter().any(|suite| suite.exhaustive) {
+            return Err("no fixture roots configured for explicit corpus execution".into());
+        }
         return Ok(Vec::new());
     }
 
@@ -94,7 +99,7 @@ fn collect_trials(args: &Arguments, suites: &[TestSuite]) -> Result<Vec<Trial>, 
             let files = find_json_tests(std::slice::from_ref(&root.path), suite.should_descend)?;
             for path in files {
                 let name = test_name(&root.name, &root.path, &path);
-                let ignored = (suite.should_ignore)(&name);
+                let ignored = !suite.exhaustive && (suite.should_ignore)(&name);
                 let run_file = suite.run_file;
                 trials.push(Trial::test(name, move || run_file(path)).with_ignored_flag(ignored));
             }
@@ -126,7 +131,7 @@ fn exact_trial(suites: &[TestSuite], name: &str) -> Result<Option<Trial>, String
     // is the only path it can resolve to.
     let path = if root.path.is_file() { root.path.clone() } else { root.path.join(relative) };
     Ok(path.is_file().then(|| {
-        let ignored = (suite.should_ignore)(name);
+        let ignored = !suite.exhaustive && (suite.should_ignore)(name);
         let run_file = suite.run_file;
         Trial::test(name.to_string(), move || run_file(path)).with_ignored_flag(ignored)
     }))
@@ -137,14 +142,23 @@ fn batched_trial(suite: &TestSuite) -> Result<Option<Trial>, String> {
         return Ok(None);
     };
 
-    let subset = explicit_compiled_eest_subset()?;
+    let subset = if suite.exhaustive {
+        Some(CompiledEestSubset::All)
+    } else {
+        explicit_compiled_eest_subset()?
+    };
     let mut paths = Vec::new();
     for root in &suite.roots {
         let files = find_json_tests(std::slice::from_ref(&root.path), suite.should_descend)?;
         paths.extend(files.into_iter().filter(|path| {
             let name = test_name(&root.name, &root.path, path);
-            !(suite.should_ignore)(&name) && compiled_eest_subset_allows(subset, &name)
+            (suite.exhaustive || !(suite.should_ignore)(&name))
+                && compiled_eest_subset_allows(subset, &name)
         }));
+    }
+
+    if suite.exhaustive && paths.is_empty() {
+        return Err(format!("no JSON fixtures selected for {}", suite.name));
     }
 
     Ok((!paths.is_empty()).then(|| Trial::test(suite.name.to_string(), move || run_files(paths))))
@@ -244,6 +258,83 @@ pub(crate) fn compiled_roots(roots: Vec<TestRoot>, mode: CompiledMode) -> Vec<Te
             root
         })
         .collect()
+}
+
+#[cfg(test)]
+mod exhaustive_tests {
+    use super::*;
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    struct FixtureDir(PathBuf);
+
+    impl FixtureDir {
+        fn new() -> Self {
+            let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+            let path =
+                env::temp_dir().join(format!("evm2-explicit-{}-{nonce}", std::process::id()));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn fixture(&self) -> PathBuf {
+            self.0.join("eip8141_outside_smoke.json")
+        }
+    }
+
+    impl Drop for FixtureDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(self.fixture());
+            let _ = fs::remove_dir(&self.0);
+        }
+    }
+
+    fn suite(path: PathBuf) -> TestSuite {
+        TestSuite {
+            name: "additional::jit",
+            roots: vec![TestRoot { name: "additional::jit".into(), label: "explicit", path }],
+            should_descend: descend_all,
+            should_ignore: |_| true,
+            run_file: |_| Ok(()),
+            run_files: Some(|paths| {
+                assert_eq!(paths.len(), 1);
+                Ok(())
+            }),
+            exhaustive: true,
+        }
+    }
+
+    #[test]
+    fn exhaustive_batch_selects_files_outside_smoke_and_ignore_lists() {
+        let directory = FixtureDir::new();
+        fs::write(directory.fixture(), "{}").unwrap();
+        let suite = suite(directory.0.clone());
+        let name = test_name(&suite.roots[0].name, &directory.0, &directory.fixture());
+        assert!(!compiled_eest_subset_allows(None, &name));
+        assert!(batched_trial(&suite).unwrap().is_some());
+        assert!(exact_trial(&[suite], "additional::jit").unwrap().is_some());
+    }
+
+    #[test]
+    fn exhaustive_empty_root_fails_discovery_including_exact_selection() {
+        let directory = FixtureDir::new();
+        let suite = suite(directory.0.clone());
+        assert!(batched_trial(&suite).is_err());
+        assert!(exact_trial(&[suite], "additional::jit").is_err());
+    }
+
+    #[test]
+    fn exhaustive_single_file_and_exact_path_are_selectable() {
+        let directory = FixtureDir::new();
+        fs::write(directory.fixture(), "{}").unwrap();
+        let suite = suite(directory.fixture());
+        assert!(batched_trial(&suite).unwrap().is_some());
+        assert!(
+            exact_trial(&[suite], "additional::jit::eip8141_outside_smoke.json").unwrap().is_some()
+        );
+    }
 }
 
 #[cfg(all(test, feature = "jit"))]

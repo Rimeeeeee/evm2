@@ -9,7 +9,10 @@ use crate::tracing::{
             ReusableCallFrame, ReusableEvmDb, ReusableFrameResult, ReusableStepLog, StepInfo,
             StepSnapshot,
         },
-        builtins::{PrecompileList, register_builtins, to_serde_value},
+        builtins::{
+            PrecompileList, address_to_uint8_array, register_builtins, to_serde_value,
+            to_uint8_array,
+        },
     },
     tx_state::TxState,
     types::CallKind,
@@ -21,9 +24,13 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use alloy_consensus::{Transaction, transaction::Recovered};
+use alloy_consensus::{Transaction, TxEip8141, transaction::Recovered};
+use alloy_eips::eip8141::{ENTRY_POINT, Frame, FrameMode, FrameReceipt, FrameStatus};
 use alloy_primitives::{Address, Bytes, TxKind, U256, map::HashSet};
-use boa_engine::{Context, JsError, JsObject, JsResult, JsValue, Script, Source, js_string};
+use boa_engine::{
+    Context, JsError, JsObject, JsResult, JsValue, Script, Source, js_string,
+    object::builtins::JsArray,
+};
 use core::sync::atomic::{AtomicBool, Ordering};
 use evm2::{
     Evm, EvmTypes, EvmTypesHost, ExecutionError, Inspector, TxResultWithState,
@@ -66,9 +73,26 @@ struct PendingStep {
     active: bool,
 }
 
+/// Envelope metadata and lifecycle state for the synthetic transaction root.
+#[derive(Debug)]
+struct FrameTransactionContext {
+    payload: TxEip8141,
+    gas: evm2::ethereum::eip8141::FrameGas,
+    active: usize,
+    observed: bool,
+}
+
 /// A javascript inspector that will delegate inspector functions to javascript functions
 ///
 /// See also <https://geth.ethereum.org/docs/developers/evm-tracing/custom-tracer#custom-javascript-tracing>
+///
+/// Frame transactions expose a synthetic `FRAME` root and balanced `enter`/`exit` callbacks for
+/// every ordered frame, including default-account verification, entry failures and skipped frames.
+/// `getFrameIndex()` identifies top-level frames; nested calls return `undefined`. Notifications
+/// observe live execution. The result context's `frames` array supplies canonical final statuses,
+/// execution/state gas, output, logs, rollback and skip flags after atomic/assertion
+/// reconciliation. Errors from frame completion notifications are returned by result collection.
+/// Call [`Self::fuse`] before reusing the inspector, including after prefix simulation.
 pub struct JsInspector {
     ctx: Context,
     /// The original javascript code used to create this inspector.
@@ -121,6 +145,10 @@ pub struct JsInspector {
     pending_steps: Vec<PendingStep>,
     /// Optional cancellation signal shared with the caller.
     interrupt: Option<JsInspectorInterrupt>,
+    /// Frame metadata retained for result collection after the EVM releases its runtime.
+    frame_transaction: Option<FrameTransactionContext>,
+    /// Errors in notification hooks cannot change an already-finalized frame result.
+    frame_callback_error: Option<JsError>,
 }
 
 impl core::fmt::Debug for JsInspector {
@@ -213,6 +241,8 @@ impl JsInspector {
             precompiles_registered: false,
             pending_steps: Vec::new(),
             interrupt: None,
+            frame_transaction: None,
+            frame_callback_error: None,
         })
     }
 
@@ -264,6 +294,8 @@ impl JsInspector {
         self.call_stack.clear();
         self.precompiles_registered = false;
         self.pending_steps.clear();
+        self.frame_transaction = None;
+        self.frame_callback_error = None;
 
         Ok(())
     }
@@ -311,6 +343,9 @@ impl JsInspector {
         db: &mut dyn DynDatabase,
     ) -> Result<JsValue, JsInspectorError> {
         self.ensure_not_interrupted()?;
+        if let Some(error) = &self.frame_callback_error {
+            return Err(error.clone().into());
+        }
         let TxResultWithState { result, pending_state, .. } = res;
         let state = TxState::from_pending(pending_state);
 
@@ -336,7 +371,7 @@ impl JsInspector {
 
         let base_fee = block.basefee.try_into().unwrap_or(u64::MAX);
 
-        let ctx = JsEvmContext {
+        let mut ctx = JsEvmContext {
             r#type: match kind {
                 TxKind::Call(_) => "CALL",
                 TxKind::Create => "CREATE",
@@ -357,7 +392,113 @@ impl JsInspector {
             transaction_ctx: self.transaction_context,
             error,
         };
+        if let Some(frame) = &self.frame_transaction {
+            // The frame envelope has an explicit sender, independent of Recovered metadata.
+            ctx.r#type = "FRAME".to_string();
+            ctx.from = frame.payload.sender;
+            ctx.to = Some(ENTRY_POINT);
+            ctx.input = Bytes::new();
+            ctx.value = U256::ZERO;
+            ctx.gas = frame.gas.maximum;
+            ctx.intrinsic_gas = frame.gas.intrinsic;
+            ctx.gas_price = frame
+                .payload
+                .fees
+                .max_fee_per_gas
+                .min(block.basefee.saturating_add(frame.payload.fees.max_priority_fee_per_gas))
+                .saturating_to();
+        }
         let ctx = ctx.into_js_object(&mut self.ctx)?;
+        if let Some(frame) = &self.frame_transaction
+            && let Some(outcome) = &result.frame
+        {
+            let mut frames = Vec::with_capacity(outcome.receipts.len());
+            for (index, receipt) in outcome.receipts.iter().enumerate() {
+                let item = JsObject::with_object_proto(self.ctx.intrinsics());
+                item.set(js_string!("index"), index as u64, false, &mut self.ctx)?;
+                item.set(
+                    js_string!("mode"),
+                    u8::from(frame.payload.frames[index].mode),
+                    false,
+                    &mut self.ctx,
+                )?;
+                item.set(
+                    js_string!("target"),
+                    address_to_uint8_array(
+                        frame.payload.frames[index].resolved_target(frame.payload.sender),
+                        &mut self.ctx,
+                    )?,
+                    false,
+                    &mut self.ctx,
+                )?;
+                item.set(js_string!("status"), u8::from(receipt.status), false, &mut self.ctx)?;
+                item.set(js_string!("gasUsed"), receipt.gas_used.execution, false, &mut self.ctx)?;
+                item.set(js_string!("stateGasUsed"), receipt.gas_used.state, false, &mut self.ctx)?;
+                item.set(
+                    js_string!("output"),
+                    to_uint8_array(outcome.outputs[index].clone(), &mut self.ctx)?,
+                    false,
+                    &mut self.ctx,
+                )?;
+                item.set(
+                    js_string!("rolledBack"),
+                    outcome.rolled_back[index],
+                    false,
+                    &mut self.ctx,
+                )?;
+                item.set(
+                    js_string!("skipped"),
+                    receipt.status == FrameStatus::SkippedAtomicBatch,
+                    false,
+                    &mut self.ctx,
+                )?;
+                let mut logs = Vec::with_capacity(receipt.logs.len());
+                for log in &receipt.logs {
+                    let item = JsObject::with_object_proto(self.ctx.intrinsics());
+                    item.set(
+                        js_string!("address"),
+                        address_to_uint8_array(log.address, &mut self.ctx)?,
+                        false,
+                        &mut self.ctx,
+                    )?;
+                    item.set(
+                        js_string!("data"),
+                        to_uint8_array(log.data.data.clone(), &mut self.ctx)?,
+                        false,
+                        &mut self.ctx,
+                    )?;
+                    let topics = log
+                        .data
+                        .topics()
+                        .iter()
+                        .map(|topic| {
+                            to_uint8_array(Bytes::copy_from_slice(topic.as_slice()), &mut self.ctx)
+                                .map(JsValue::from)
+                        })
+                        .collect::<JsResult<Vec<_>>>()?;
+                    item.set(
+                        js_string!("topics"),
+                        JsArray::from_iter(topics, &mut self.ctx),
+                        false,
+                        &mut self.ctx,
+                    )?;
+                    logs.push(JsValue::from(item));
+                }
+                item.set(
+                    js_string!("logs"),
+                    JsArray::from_iter(logs, &mut self.ctx),
+                    false,
+                    &mut self.ctx,
+                )?;
+                frames.push(JsValue::from(item));
+            }
+            ctx.set(
+                js_string!("frames"),
+                JsArray::from_iter(frames, &mut self.ctx),
+                false,
+                &mut self.ctx,
+            )?;
+        }
         let result = self.reusable_db.with_changes_scope(&state, db, || {
             self.result_fn.call(&self.this, &[ctx.into(), self.reusable_db.value()], &mut self.ctx)
         });
@@ -423,6 +564,10 @@ impl JsInspector {
         gas_limit: u64,
     ) -> &CallStackItem {
         let call = CallStackItem {
+            frame_index: self
+                .frame_transaction
+                .as_ref()
+                .and_then(|frame| (self.call_stack.len() == 1).then_some(frame.active)),
             id: self.next_call_id,
             contract: Contract { caller, contract, value, input },
             kind,
@@ -518,6 +663,88 @@ impl JsInspector {
 }
 
 impl<T: EvmTypes> Inspector<T> for JsInspector {
+    fn frame_transaction_start(&mut self, tx: &TxEip8141, host: &mut T::Host<'_>) {
+        self.call_stack.clear();
+        self.pending_steps.clear();
+        self.frame_callback_error = None;
+        self.register_precompiles(host);
+        let gas = evm2::ethereum::eip8141::FrameGas::calculate(tx, host.version())
+            .expect("prepared frame gas");
+        self.frame_transaction =
+            Some(FrameTransactionContext { payload: tx.clone(), gas, active: 0, observed: false });
+        self.push_call(
+            ENTRY_POINT,
+            Bytes::new(),
+            U256::ZERO,
+            CallKind::Call,
+            tx.sender,
+            gas.maximum,
+        );
+    }
+
+    fn frame_start(&mut self, index: usize, _frame: &Frame, _host: &mut T::Host<'_>) {
+        let frame = self.frame_transaction.as_mut().expect("frame transaction started");
+        frame.active = index;
+        frame.observed = false;
+    }
+
+    fn frame_end(
+        &mut self,
+        index: usize,
+        receipt: &FrameReceipt,
+        output: &Bytes,
+        stop: InstrStop,
+        _host: &mut T::Host<'_>,
+    ) {
+        if self.is_interrupted() || self.frame_callback_error.is_some() {
+            return;
+        }
+        let frames = self.frame_transaction.as_ref().expect("frame transaction started");
+        if !frames.observed || frames.active != index {
+            // Default-account verification, entry failures and skips never enter call().
+            let frame = &frames.payload.frames[index];
+            let call = CallFrame {
+                frame_index: Some(index),
+                contract: Contract {
+                    caller: if frame.mode == FrameMode::Sender {
+                        frames.payload.sender
+                    } else {
+                        ENTRY_POINT
+                    },
+                    contract: frame.resolved_target(frames.payload.sender),
+                    value: frame.value,
+                    input: frame.data.clone(),
+                },
+                kind: if matches!(frame.mode, FrameMode::Verify | FrameMode::PostTx) {
+                    CallKind::StaticCall
+                } else {
+                    CallKind::Call
+                },
+                gas: frame.limits.execution,
+            };
+            if let Err(error) = self.try_enter(call) {
+                self.frame_callback_error = Some(error);
+                return;
+            }
+        }
+        let frame = FrameResult {
+            frame_index: Some(index),
+            gas_used: receipt.gas_used.execution,
+            output: output.clone(),
+            error: if receipt.status == FrameStatus::SkippedAtomicBatch {
+                Some("frame skipped".to_string())
+            } else {
+                utils::fmt_error_msg(stop, TraceStyle::Geth)
+            },
+        };
+        self.frame_callback_error = self.try_exit(frame).err();
+    }
+
+    fn frame_transaction_end(&mut self, _result: &evm2::TxResult<T>, _host: &mut T::Host<'_>) {
+        self.call_stack.clear();
+        self.pending_steps.clear();
+    }
+
     fn step(&mut self, interp: &mut Interpreter<'_, '_, T>) {
         if self.check_and_halt(interp) || self.step_fn.is_none() {
             return;
@@ -601,6 +828,11 @@ impl<T: EvmTypes> Inspector<T> for JsInspector {
             return None;
         }
         self.register_precompiles(interp.host());
+        if message.depth == 0
+            && let Some(frame) = &mut self.frame_transaction
+        {
+            frame.observed = true;
+        }
 
         // determine contract and caller based on the call scheme
         let (caller, contract) = match message.kind {
@@ -612,20 +844,29 @@ impl<T: EvmTypes> Inspector<T> for JsInspector {
 
         let value =
             if message.kind == MessageKind::DelegateCall { U256::ZERO } else { message.value };
+        let gas_limit = self
+            .frame_transaction
+            .as_ref()
+            .filter(|_| message.depth == 0)
+            .map_or(message.gas_limit, |frame| frame.payload.frames[frame.active].limits.execution);
         self.push_call(
             contract,
             message.input.clone(),
             value,
             message.kind.into(),
             caller,
-            message.gas_limit,
+            gas_limit,
         );
 
         let mut result = None;
         if self.can_call_enter() {
             let call = self.active_call();
-            let frame =
-                CallFrame { contract: call.contract.clone(), kind: call.kind, gas: call.gas_limit };
+            let frame = CallFrame {
+                contract: call.contract.clone(),
+                kind: call.kind,
+                gas: call.gas_limit,
+                frame_index: call.frame_index,
+            };
             result = self.try_enter(frame).err().map(js_error_to_revert);
         }
 
@@ -636,14 +877,15 @@ impl<T: EvmTypes> Inspector<T> for JsInspector {
     fn call_end(
         &mut self,
         interp: &mut Interpreter<'_, '_, T>,
-        _message: &Message<T>,
+        message: &Message<T>,
         result: &mut MessageResult<T>,
     ) {
         if self.check_interrupt(interp) {
             return;
         }
-        if self.can_call_exit() {
+        if self.can_call_exit() && !(message.depth == 0 && self.frame_transaction.is_some()) {
             let frame_result = FrameResult {
+                frame_index: self.active_call().frame_index,
                 gas_used: result.gas.spent(),
                 output: result.output.clone(),
                 error: utils::fmt_error_msg(result.stop, TraceStyle::Geth),
@@ -678,8 +920,12 @@ impl<T: EvmTypes> Inspector<T> for JsInspector {
         let mut result = None;
         if self.can_call_enter() {
             let call = self.active_call();
-            let frame =
-                CallFrame { contract: call.contract.clone(), kind: call.kind, gas: call.gas_limit };
+            let frame = CallFrame {
+                contract: call.contract.clone(),
+                kind: call.kind,
+                gas: call.gas_limit,
+                frame_index: call.frame_index,
+            };
             result = self.try_enter(frame).err().map(js_error_to_revert);
         }
 
@@ -698,6 +944,7 @@ impl<T: EvmTypes> Inspector<T> for JsInspector {
         }
         if self.can_call_exit() {
             let frame_result = FrameResult {
+                frame_index: self.active_call().frame_index,
                 gas_used: result.gas.spent(),
                 output: result.output.clone(),
                 error: utils::fmt_error_msg(result.stop, TraceStyle::Geth),
@@ -725,14 +972,19 @@ impl<T: EvmTypes> Inspector<T> for JsInspector {
         // new scope that is entered and immediately exited.
         if self.enter_fn.is_some() {
             let call = self.active_call();
-            let frame =
-                CallFrame { contract: call.contract.clone(), kind: call.kind, gas: call.gas_limit };
+            let frame = CallFrame {
+                contract: call.contract.clone(),
+                kind: call.kind,
+                gas: call.gas_limit,
+                frame_index: None,
+            };
             let _ = self.try_enter(frame);
         }
 
         // exit with empty frame result ref <https://github.com/ethereum/go-ethereum/blob/0004c6b229b787281760b14fb9460ffd9c2496f1/core/vm/instructions.go#L829-L829>
         if !self.is_interrupted() && self.exit_fn.is_some() {
-            let frame_result = FrameResult { gas_used: 0, output: Bytes::new(), error: None };
+            let frame_result =
+                FrameResult { gas_used: 0, output: Bytes::new(), error: None, frame_index: None };
             let _ = self.try_exit(frame_result);
         }
     }
@@ -861,6 +1113,7 @@ impl JsTracerObject {
 /// Represents an active call
 #[derive(Debug)]
 struct CallStackItem {
+    frame_index: Option<usize>,
     /// Unique across calls and transaction resets.
     id: u64,
     contract: Contract,

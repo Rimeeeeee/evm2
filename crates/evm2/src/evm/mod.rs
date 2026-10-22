@@ -241,6 +241,71 @@ pub struct Evm<'a, T: EvmTypesHost> {
     pub(crate) frame_tx: Option<frame::FrameTransactionRuntime>,
 }
 
+#[cfg(feature = "async")]
+impl<'a, T: EvmTypes<Tx = crate::ethereum::TxEnvelope>> Evm<'a, T> {
+    /// Executes and discards a frame validation prefix on an async host fiber.
+    ///
+    /// Async database and inspector operations may suspend while validating the prefix.
+    /// Dropping the future cancels execution and discards approvals, nonce writes, and
+    /// transaction scratch, just like the synchronous prefix API.
+    pub fn validate_frame_prefix_async<'fut>(
+        &'fut mut self,
+        tx: &'fut Recovered<T::Tx>,
+        prefix_end: usize,
+    ) -> impl Future<
+        Output = r#async::AsyncResult<
+            crate::ethereum::eip8141::FrameValidationResult,
+            registry::HandlerError,
+        >,
+    > + 'fut {
+        let stack = self.async_stack();
+        // SAFETY: The future exclusively borrows the EVM and its stack slot until dropped.
+        unsafe {
+            r#async::on_local_fiber_result_with_stack(stack, move || {
+                self.validate_frame_prefix(tx, prefix_end)
+            })
+        }
+    }
+
+    /// Executes a frame validation prefix on an async host fiber with a `Send` future.
+    ///
+    /// As with [`Self::transact_async_send`], first verify the current erased database,
+    /// precompiles, and optional inspector using [`Self::evm_is_send`] or
+    /// [`Self::evm_is_send_with_inspector`]. Cancellation discards all prefix effects.
+    pub fn validate_frame_prefix_async_send<'fut>(
+        &'fut mut self,
+        tx: &'fut Recovered<T::Tx>,
+        prefix_end: usize,
+    ) -> impl Future<
+        Output = r#async::AsyncResult<
+            crate::ethereum::eip8141::FrameValidationResult,
+            registry::HandlerError,
+        >,
+    > + Send
+    + 'fut
+    where
+        T::SpecId: Send,
+        T::EvmExt: Send,
+        T::MessageExt: Send,
+        T::MessageResultExt: Send,
+        T::TxEnvExt: Send,
+        T::TxResultExt: Send,
+        T::BlockEnvExt: Send,
+    {
+        self.assert_erased_send();
+        let stack = self.async_stack();
+        let evm = SendEvmRef { evm: self };
+        // SAFETY: The future owns the exclusive EVM borrow and its erased fields were
+        // checked above. The reusable stack remains borrowed until the future is dropped.
+        unsafe {
+            r#async::on_fiber_result_with_stack(stack, move || {
+                let SendEvmRef { evm } = evm;
+                evm.validate_frame_prefix(tx, prefix_end)
+            })
+        }
+    }
+}
+
 impl<'a, T: EvmTypes> Evm<'a, T> {
     /// Creates an EVM for `spec_id` with the provided transaction registry, database, and
     /// precompile provider.
@@ -415,7 +480,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     const fn enter_execution(&mut self) -> ExecutionGuard<'_, 'a, T> {
         let was_running = self.running;
         self.running = true;
-        ExecutionGuard { evm: self, was_running }
+        ExecutionGuard { evm: self, was_running, discard_on_drop: false }
     }
 
     /// Returns the transaction handler registry.
@@ -840,11 +905,12 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         &mut self,
         mut result: TxResult<T>,
     ) -> HandlerResult<ExecutedTx<'_, 'a, T>> {
-        if let Err(error) = self.state.finalize_transaction(self.execution_config.version()) {
-            self.state.clear_transaction_state();
-            return Err(error.into());
-        }
-        result.logs = self.state.take_logs();
+        let mut guard = self.enter_execution();
+        guard.discard_on_drop = true;
+        guard.evm.state.finalize_transaction(guard.evm.execution_config.version())?;
+        result.logs = guard.evm.state.take_logs();
+        guard.discard_on_drop = false;
+        drop(guard);
         Ok(ExecutedTx::from_result(self, result, true))
     }
 
@@ -960,17 +1026,32 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
 struct ExecutionGuard<'guard, 'evm, T: EvmTypesHost> {
     evm: &'guard mut Evm<'evm, T>,
     was_running: bool,
+    discard_on_drop: bool,
 }
 
 impl<'guard, 'evm, T: EvmTypesHost> Drop for ExecutionGuard<'guard, 'evm, T> {
     #[inline]
     fn drop(&mut self) {
         self.evm.running = self.was_running;
-        if !self.was_running && self.evm.frame_tx.is_some() {
-            self.evm.frame_tx = None;
+        if !self.was_running {
             self.evm.current_frame = None;
-            self.evm.state.clear_transaction_state();
+            if self.discard_on_drop || self.evm.frame_tx.is_some() {
+                self.evm.frame_tx = None;
+                self.evm.state.clear_transaction_state();
+            }
         }
+    }
+}
+
+/// Restores the enclosing interpreter before the active interpreter can be dropped on unwind.
+struct CurrentFrameGuard<'guard, 'evm, T: EvmTypesHost> {
+    evm: &'guard mut Evm<'evm, T>,
+    previous: Option<NonNull<Interpreter<'static, 'static, T>>>,
+}
+
+impl<T: EvmTypesHost> Drop for CurrentFrameGuard<'_, '_, T> {
+    fn drop(&mut self) {
+        self.evm.current_frame = self.previous;
     }
 }
 
@@ -1025,8 +1106,10 @@ impl<'a, T: EvmTypes<Tx: Typed2718>> Evm<'a, T> {
     /// or execution configuration while the transaction is being executed.
     pub fn transact(&mut self, tx: &Recovered<T::Tx>) -> HandlerResult<ExecutedTx<'_, 'a, T>> {
         let handler = self.registry.try_get_by_type(tx.ty())?;
-        let guard = self.enter_execution();
+        let mut guard = self.enter_execution();
+        guard.discard_on_drop = true;
         let result = handler.execute(tx, guard.evm);
+        guard.discard_on_drop = false;
         drop(guard);
         match result {
             Ok(result) => self.finish_executed_tx(result),
@@ -1058,11 +1141,10 @@ impl<'a, T: EvmTypes<Tx: Typed2718>> Evm<'a, T> {
     /// For frame transactions this checks preparation only. Executable payment/approval
     /// validation requires the Ethereum type family's `validate_frame_prefix()`.
     pub fn validate_tx(&mut self, tx: &Recovered<T::Tx>) -> HandlerResult<()> {
-        let result =
-            self.registry.try_get_by_type(tx.ty()).and_then(|handler| handler.validate(tx, self));
-        self.state.clear_transaction_state();
-        self.frame_tx = None;
-        result
+        let handler = self.registry.try_get_by_type(tx.ty())?;
+        let mut guard = self.enter_execution();
+        guard.discard_on_drop = true;
+        handler.validate(tx, guard.evm)
     }
 
     /// Dispatches the transaction to the handler registered for its EIP-2718 type byte on an async
@@ -1103,7 +1185,14 @@ impl<'a, T: EvmTypes<Tx: Typed2718>> Evm<'a, T> {
     + Send
     + 'fut
     where
-        T::Tx: Sync,
+        T::SpecId: Send,
+        T::Tx: Send + Sync,
+        T::EvmExt: Send,
+        T::MessageExt: Send,
+        T::MessageResultExt: Send,
+        T::TxEnvExt: Send,
+        T::TxResultExt: Send,
+        T::BlockEnvExt: Send,
     {
         self.assert_erased_send();
         let stack = self.async_stack();
@@ -1533,21 +1622,22 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
             // interpreter run.
             unsafe { trustme::decouple_lt_mut(inspector) }
         });
-        let prev_frame = guard
+        let previous = guard
             .evm
             .current_frame
             .replace(NonNull::from(&mut *interp_ref).cast::<Interpreter<'static, 'static, T>>());
-        let interpreter_runner = guard.evm.interpreter_runner.clone();
+        let frame_guard = CurrentFrameGuard { evm: guard.evm, previous };
+        let interpreter_runner = frame_guard.evm.interpreter_runner.clone();
         let stop = if let Some(inspector) = inspector {
-            interp_ref.run_inspect(guard.evm, inspector)
+            interp_ref.run_inspect(frame_guard.evm, inspector)
         } else if let Some(runner) = interpreter_runner
-            && let Some(stop) = runner.run(interp_ref, guard.evm)
+            && let Some(stop) = runner.run(interp_ref, frame_guard.evm)
         {
             interp_ref.finish_run(stop)
         } else {
-            interp_ref.run(guard.evm)
+            interp_ref.run(frame_guard.evm)
         };
-        guard.evm.current_frame = prev_frame;
+        drop(frame_guard);
         guard.evm.interpreter_pool.push(interp);
         stop
     }

@@ -24,6 +24,7 @@ pub(crate) fn suites() -> Vec<TestSuite> {
             should_ignore,
             run_file: run_file_jit,
             run_files: Some(run_files_jit),
+            exhaustive: false,
         });
         suites.push(TestSuite {
             name: "statetests::aot",
@@ -32,6 +33,7 @@ pub(crate) fn suites() -> Vec<TestSuite> {
             should_ignore,
             run_file: run_file_aot,
             run_files: Some(run_files_aot),
+            exhaustive: false,
         });
         suites
     }
@@ -50,6 +52,7 @@ fn suite() -> TestSuite {
         should_ignore,
         run_file,
         run_files: None,
+        exhaustive: false,
     }
 }
 

@@ -3,7 +3,10 @@
 use super::Evm;
 use crate::{
     EvmTypes, HostError,
-    ethereum::eip7906::{TxDiffParam, TxTraceParam},
+    ethereum::eip7906::{
+        ACCOUNT_BALANCE_CHANGED, ACCOUNT_CODE_HASH_CHANGED, ACCOUNT_NONCE_CHANGED,
+        ACCOUNT_STORAGE_CHANGED, TxDiffParam, TxTraceParam,
+    },
     interpreter::{Host, InstrStop},
 };
 use alloc::vec::Vec;
@@ -28,22 +31,28 @@ impl FrameDiff {
             let after = a.current.cloned().unwrap_or_default();
             let mut flags = 0;
             if before.nonce != after.nonce {
-                flags |= 1;
+                flags |= ACCOUNT_NONCE_CHANGED;
             }
             if before.balance != after.balance {
-                flags |= 2;
+                flags |= ACCOUNT_BALANCE_CHANGED;
                 diff.balances.push((a.address, before.balance, after.balance));
             }
             for (&key, slot) in &a.storage.slots {
                 if slot.value.original != slot.value.current {
-                    flags |= 4;
+                    flags |= ACCOUNT_STORAGE_CHANGED;
                     diff.slots.push((a.address, key, slot.value.original, slot.value.current));
                 }
             }
             if before.code_hash != after.code_hash {
-                flags |= 8;
+                flags |= ACCOUNT_CODE_HASH_CHANGED;
             }
-            if a.created && after.code_hash != KECCAK256_EMPTY {
+            // The reference view observes net code installation, including host code
+            // changes, rather than the account-lifetime CREATE marker. Delegation
+            // designators change the code hash but are not deployed contracts.
+            if before.code_hash == KECCAK256_EMPTY
+                && after.code_hash != KECCAK256_EMPTY
+                && !after.code.as_ref().is_some_and(|code| code.is_eip7702())
+            {
                 diff.deployments.push((a.address, U256::from_be_bytes(after.code_hash.0)));
             }
             if flags != 0 {
@@ -191,5 +200,110 @@ impl<T: EvmTypes> Evm<'_, T> {
             return None;
         }
         self.state.logs().get(usize::try_from(index).ok()?).map(|l| l.data.data.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        BaseEvmTypes, Precompiles, SpecId,
+        bytecode::Bytecode,
+        env::BlockEnvExt,
+        ethereum::ethereum_tx_registry,
+        evm::{AccountInfo, InMemoryDB, frame::FrameTransactionRuntime},
+    };
+    use alloc::sync::Arc;
+    use alloy_eips::eip8141::{Frame, FrameMode};
+
+    #[test]
+    fn deployment_view_uses_net_code_installation_and_excludes_delegation() {
+        let deployed = Address::with_last_byte(0xa1);
+        let delegated = Address::with_last_byte(0xa2);
+        let replaced = Address::with_last_byte(0xa3);
+        let unchanged = Address::with_last_byte(0xa4);
+        let code = Bytecode::new_legacy(Bytes::from_static(&[0x00]));
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(&replaced, AccountInfo::default().with_code(code.clone()));
+        db.insert_account_info(&unchanged, AccountInfo::default().with_code(code.clone()));
+        let mut host = Evm::<BaseEvmTypes>::new(
+            SpecId::BOGOTA,
+            BlockEnvExt::default(),
+            ethereum_tx_registry(SpecId::BOGOTA),
+            db,
+            Precompiles::base(SpecId::BOGOTA),
+        );
+        host.state.account(&deployed).unwrap().set_code_slow(code.clone());
+        host.state.account(&delegated).unwrap().set_code_slow(Bytecode::new_eip7702(deployed));
+        host.state
+            .account(&replaced)
+            .unwrap()
+            .set_code_slow(Bytecode::new_legacy(Bytes::from_static(&[0x5f, 0x00])));
+        host.state.account(&unchanged).unwrap();
+
+        let diff = FrameDiff::capture(&host);
+        assert_eq!(diff.deployments, [(deployed, U256::from_be_bytes(code.hash_slow().0))]);
+        assert_eq!(
+            diff.flags,
+            [
+                (deployed, ACCOUNT_CODE_HASH_CHANGED),
+                (delegated, ACCOUNT_CODE_HASH_CHANGED),
+                (replaced, ACCOUNT_CODE_HASH_CHANGED),
+            ]
+        );
+    }
+
+    #[test]
+    fn unaffordable_diff_reads_do_not_load_accounts_and_successful_reads_warm_independently() {
+        let address = Address::with_last_byte(0x90);
+        let slot = U256::from(9);
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(&address, AccountInfo::default().with_balance(U256::from(11)));
+        db.insert_account_storage(&address, &slot, &U256::from(33));
+        let mut host = Evm::<BaseEvmTypes>::new(
+            SpecId::BOGOTA,
+            BlockEnvExt::default(),
+            ethereum_tx_registry(SpecId::BOGOTA),
+            db,
+            Precompiles::base(SpecId::BOGOTA),
+        );
+        let mut runtime = FrameTransactionRuntime::new(address);
+        runtime.payload = Arc::new(alloy_consensus::TxEip8141 {
+            frames: alloc::vec![Frame { mode: FrameMode::PostTx, ..Default::default() }],
+            ..Default::default()
+        });
+        host.frame_tx = Some(runtime);
+        let address = U256::from_be_slice(address.as_slice());
+        for (selector, third) in [(0, slot), (2, U256::ZERO)] {
+            assert_eq!(
+                host.frame_diff_value(U256::from(selector), address, third, true),
+                Err(HostError::Halt(InstrStop::OutOfGas))
+            );
+            assert_eq!(host.state.transaction_account_changes().count(), 0);
+        }
+        assert_eq!(
+            host.frame_diff_value(U256::ZERO, address, slot, false).unwrap(),
+            (U256::from(33), true)
+        );
+        assert_eq!(
+            host.frame_diff_value(U256::from(1), address, slot, true).unwrap(),
+            (U256::from(33), false)
+        );
+        // A storage lookup does not make the containing account warm.
+        assert_eq!(
+            host.frame_diff_value(U256::from(2), address, U256::ZERO, true),
+            Err(HostError::Halt(InstrStop::OutOfGas))
+        );
+        assert_eq!(
+            host.frame_diff_value(U256::from(3), address, U256::ZERO, false).unwrap(),
+            (U256::from(11), true)
+        );
+        assert_eq!(
+            host.frame_diff_value(U256::from(2), address, U256::ZERO, true).unwrap(),
+            (U256::from(11), false)
+        );
+        // Live lookups do not add unchanged accounts or slots to the captured view.
+        assert_eq!(host.frame_trace_value(U256::ZERO, U256::ZERO), Some(U256::ZERO));
+        assert_eq!(host.frame_trace_value(U256::from(1), U256::ZERO), Some(U256::ZERO));
     }
 }

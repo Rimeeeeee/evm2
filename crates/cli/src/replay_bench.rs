@@ -243,7 +243,7 @@ impl ReplayFixture {
         assert!(spec.enables(SpecId::MERGE), "replay corpus must be post-merge");
         assert!(
             spec < SpecId::BOGOTA,
-            "the CLI's upstream revm comparison does not implement Bogota; use validation/frame-oracle for the pinned frame reference"
+            "the CLI's upstream revm comparison does not implement Bogota; run the evm2 frame_reference integration test for the pinned reference"
         );
         Self { name: name.clone(), spec, suite: BlockchainTest([(name, case)].into()) }
     }

@@ -12,7 +12,10 @@ use evm2::{
     ethereum::{TxEnvelope, ethereum_tx_registry},
     evm::{AccountInfo, InMemoryDB},
 };
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 fn run(backend: Option<&JitBackend>, state: u64, revert: bool) -> TxResultWithState {
     let sender = Address::with_last_byte(0xa0);
@@ -96,6 +99,10 @@ fn run(backend: Option<&JitBackend>, state: u64, revert: bool) -> TxResultWithSt
 
 #[test]
 fn native_frames_match_interpreter_with_jit_aot_and_reloaded_artifacts() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_test_writer()
+        .try_init();
     for aot in [false, true] {
         let store = Arc::new(RuntimeArtifactStore::new().unwrap()) as Arc<dyn ArtifactStore>;
         let config = RuntimeConfig {
@@ -126,13 +133,69 @@ fn native_frames_match_interpreter_with_jit_aot_and_reloaded_artifacts() {
                         "aot={aot}, reload={reload}, state={state}, revert={revert}"
                     );
                     assert_eq!(compiled.pending_state, interpreted.pending_state);
+                    let stats = backend.stats();
                     assert!(
-                        backend.stats().lookup_hits >= before + 3,
-                        "every root must actually execute compiled code"
+                        stats.lookup_hits >= before + 3,
+                        "every root must actually execute compiled code: aot={aot}, \
+                         reload={reload}, state={state}, revert={revert}, \
+                         previous_hits={before}, stats={stats:?}"
                     );
-                    assert_eq!(backend.stats().compilations_failed, 0);
+                    assert_eq!(stats.compilations_failed, 0);
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn repeated_frames_reuse_compilations_and_release_cleared_programs() {
+    for aot in [false, true] {
+        let store = Arc::new(RuntimeArtifactStore::new().unwrap()) as Arc<dyn ArtifactStore>;
+        let backend = JitBackend::new(RuntimeConfig {
+            enabled: true,
+            blocking: true,
+            aot,
+            single_error: false,
+            store: aot.then(|| store.clone()),
+            tuning: RuntimeTuning { jit_worker_count: 1, ..Default::default() },
+            ..Default::default()
+        })
+        .unwrap();
+        // These two transactions contain four unique bytecodes: validation, body and the two
+        // assertion endings. Fresh EVM instances and reverted state must not create new keys.
+        for revert in [false, true] {
+            let _ = run(Some(&backend), 300_000, revert);
+        }
+        let warm = backend.stats();
+        assert_eq!(warm.resident_entries, 4);
+        assert_eq!(warm.compilations_succeeded, 4);
+        assert_eq!(warm.compilations_failed, 0);
+        for repeat in 0..32 {
+            let _ = run(Some(&backend), if repeat % 2 == 0 { 0 } else { 300_000 }, repeat % 3 == 0);
+            let stats = backend.stats();
+            assert_eq!(stats.lookup_hits, warm.lookup_hits + (repeat + 1) * 3);
+            assert_eq!(stats.resident_entries, warm.resident_entries);
+            assert_eq!(stats.compilations_dispatched, warm.compilations_dispatched);
+            assert_eq!(stats.compilations_failed, 0);
+            assert_eq!(stats.pending_jobs, 0);
+        }
+
+        let program = backend
+            .get_compiled(alloy_primitives::keccak256([0x60, 3, 0x5f, 0x5f, 0xaa]), SpecId::BOGOTA)
+            .unwrap();
+        let program_lifetime = Arc::downgrade(&program);
+        drop(program);
+        backend.clear_all();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if backend.stats().resident_entries == 0
+                && program_lifetime.upgrade().is_none()
+                && store.load_all().unwrap().is_empty()
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "frame programs retained after clearing aot={aot}");
+            std::thread::sleep(Duration::from_millis(2));
         }
     }
 }
