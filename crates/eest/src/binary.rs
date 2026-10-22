@@ -10,12 +10,19 @@ use alloy_primitives::{Address, B256, Bytes, U256};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Binary fixture identity; schema changes require regeneration.
+const BINARY_FORMAT: [u8; 5] = *b"EV2F\x01";
+
 pub(crate) fn to_vec(suite: &BlockchainTest) -> Result<Vec<u8>, postcard::Error> {
-    postcard::to_allocvec(&BlockchainTestRef::new(suite))
+    postcard::to_allocvec(&(BINARY_FORMAT, BlockchainTestRef::new(suite)))
 }
 
 pub(crate) fn from_bytes(bytes: &[u8]) -> Result<BlockchainTest, postcard::Error> {
-    postcard::from_bytes::<BlockchainTestWire>(bytes).map(Into::into)
+    let (format, suite) = postcard::from_bytes::<([u8; 5], BlockchainTestWire)>(bytes)?;
+    if format != BINARY_FORMAT {
+        return Err(postcard::Error::DeserializeBadEncoding);
+    }
+    Ok(suite.into())
 }
 
 #[derive(Serialize)]
@@ -109,6 +116,10 @@ impl<'a> DecodedBlockRef<'a> {
 
 #[derive(Deserialize, Serialize)]
 struct TransactionWire {
+    frames: Option<Vec<crate::tx::TestFrame>>,
+    signatures: Vec<crate::tx::TestFrameSignature>,
+    nonce_keys: Option<Vec<U256>>,
+    txbytes: Option<Bytes>,
     transaction_type: Option<U256>,
     sender: Option<Address>,
     data: Bytes,
@@ -133,6 +144,10 @@ struct TransactionWire {
 impl TransactionWire {
     fn new(tx: &Transaction) -> Self {
         Self {
+            txbytes: tx.txbytes.clone(),
+            frames: tx.frames.clone(),
+            signatures: tx.signatures.clone(),
+            nonce_keys: tx.nonce_keys.clone(),
             transaction_type: tx.transaction_type,
             sender: tx.sender,
             data: tx.data.clone(),
@@ -162,6 +177,10 @@ impl TransactionWire {
 impl From<TransactionWire> for Transaction {
     fn from(value: TransactionWire) -> Self {
         Self {
+            txbytes: value.txbytes,
+            frames: value.frames,
+            signatures: value.signatures,
+            nonce_keys: value.nonce_keys,
             transaction_type: value.transaction_type,
             sender: value.sender,
             data: value.data,

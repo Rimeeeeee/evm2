@@ -6,7 +6,7 @@ use alloy_consensus::{
     EthereumTxEnvelope, Header, TxEip4844,
     transaction::{Transaction as _, to_eip155_value},
 };
-use alloy_eips::{eip2930::AccessList, eip7702::SignedAuthorization};
+use alloy_eips::{Encodable2718, eip2930::AccessList, eip7702::SignedAuthorization};
 use alloy_primitives::{Address, B256, Bytes, FixedBytes, U256};
 use evm2::SpecId;
 use evm2_eest::{
@@ -96,6 +96,7 @@ fn network(capture: &CapturedCase) -> Result<ForkSpec, CaptureError> {
         SpecId::PRAGUE => Ok(ForkSpec::Prague),
         SpecId::OSAKA => Ok(ForkSpec::Osaka),
         SpecId::AMSTERDAM => Ok(ForkSpec::Amsterdam),
+        SpecId::BOGOTA => Ok(ForkSpec::Bogota),
         _ => Err(CaptureError::UnsupportedSpec(first.spec_id)),
     }
 }
@@ -213,9 +214,28 @@ fn export_header(header: &Header) -> BlockHeader {
 }
 
 fn export_transaction(tx: &EthereumTxEnvelope<TxEip4844>, signer: Address) -> Transaction {
-    let signature = tx.signature();
+    if let Some(frame) = tx.as_eip8141() {
+        return Transaction {
+            txbytes: Some(tx.encoded_2718().into()),
+            transaction_type: Some(U256::from(6)),
+            sender: Some(frame.sender),
+            nonce: U256::from(frame.nonce),
+            chain_id: Some(U256::from(frame.chain_id)),
+            max_fee_per_gas: Some(frame.fees.max_fee_per_gas),
+            max_priority_fee_per_gas: Some(frame.fees.max_priority_fee_per_gas),
+            max_fee_per_blob_gas: Some(frame.fees.max_fee_per_blob_gas),
+            blob_versioned_hashes: frame.blob_versioned_hashes.clone(),
+            hash: Some(*tx.tx_hash()),
+            ..Default::default()
+        };
+    }
+    let signature = tx.signature().expect("frame envelopes were handled above");
     let tx_type = tx_type(tx);
     Transaction {
+        txbytes: None,
+        frames: None,
+        signatures: Vec::new(),
+        nonce_keys: None,
         transaction_type: Some(U256::from(tx_type)),
         sender: Some(signer),
         data: tx.input().clone(),
@@ -249,6 +269,7 @@ const fn tx_type(tx: &EthereumTxEnvelope<TxEip4844>) -> u8 {
         EthereumTxEnvelope::Eip1559(_) => 2,
         EthereumTxEnvelope::Eip4844(_) => 3,
         EthereumTxEnvelope::Eip7702(_) => 4,
+        EthereumTxEnvelope::Eip8141(_) => 6,
     }
 }
 

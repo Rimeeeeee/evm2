@@ -1,0 +1,141 @@
+# Protocol identity for all frame implementation and conformance work.
+manifest_version = 1
+target = "bogota-devnet-1"
+engine_spec = "BOGOTA"
+parent_spec = "AMSTERDAM"
+eips = [8141, 8250, 8272, 7906]
+newer_draft_enabled = false
+
+[activation]
+# The embedding chain supplies its activation timestamp; no mainnet activation is implied.
+source = "chain genesis bogotaTime; pinned Reth falls back to amsterdamTime"
+engine_selection = "caller selects SpecId::BOGOTA at the chain activation"
+keyed_schema = "EIP8250 is enabled with BOGOTA; explicit feature control for custom versions"
+
+[sources]
+evm2_base = "185be4b37d44f22cf81f71cf0568ea710b54a66d"
+reth = "paradigmxyz/reth-oss@7bde440574a2afef4f718f32c02b03320f8d57c1"
+revm = "Soubhik-10/revm@b2109aeb7a69505617c629538e9014bd20148e5c"
+alloy = "Rimeeeeee/alloy@1ff4bf799bc78b0913561fa3e44bc65d0444c638"
+eip_primitives = "Soubhik-10/eips@921ddebb486507d74808239b51e180e7600196d1"
+adapter = "Soubhik-10/evm@5c35db18a87dd6122b7d1c0ab690d275fe13fa3a"
+reth_core = "Soubhik-10/reth-core@c42b71acb8e12de6b2b01238bbc1ce739510bdd3"
+inspectors = "Soubhik-10/revm-inspectors@b736efa83f749ad15190ec3fbc3c95c6ca42d3cc"
+excluded_draft = "ethereum/EIPs@46005d745a5d921702f12d64a1b85e712e2b6051"
+oracle_transitive_alloy = "Rimeeeeee/alloy@066ec9e2c4cfb523cfd8e4a9646c583b3aa6daaf; revm-only dependency in validation/frame-oracle/Cargo.lock"
+inkwell = "TheDan64/inkwell@c9d9734ae17dbaf1d9902dab3b8ee9d2041781ff"
+arkworks = "DaniPopes/algebra@a71d9795e2e527cd0c80e6831bd957134de30d22"
+reth_retained_policy = "d8defd3f746c7bf84f43c2e348fe67d9978aca4a; inventory in docs/frame-transactions-implementation-review.md"
+
+[envelope]
+type = 6
+owner = "alloy-consensus / alloy-eip8141"
+pre_keyed = "chain_id, nonce, sender, frames, signatures, fees, blob_versioned_hashes"
+post_keyed = "chain_id, nonce_keys, nonce, sender, frames, signatures, fees, blob_versioned_hashes"
+outer_signature = false
+sender = "explicit payload sender; generic Recovered metadata is not authoritative"
+chain_id_bits = 64 # Limitation of the selected shared ChainId and Version contracts.
+fee_bits = 256
+frame_count = [1, 64]
+empty_target = "resolve to explicit sender"
+empty_signature_message = "canonical transaction signature hash"
+signing_transformation = "replace each empty-message signature byte string with empty RLP string"
+signature_data_gas = "actual signer/message/signature bytes under active gas parameters"
+
+[nonces]
+absent_keys = "legacy pre-EIP8250 schema only"
+legacy_keys = ["0"]
+empty_keys_valid = false
+zero_key_may_mix = false
+max_keys = 16
+ordering = "strictly increasing, unique U256 keys"
+sequence_bits = 64
+max_sequence_valid = false
+update = "check every lane before execution; payment approval advances all selected lanes atomically"
+legacy_update = "increment current account nonce at payment approval"
+protocol_storage_access = "record BAL access without ordinary EVM warming"
+
+[modes]
+default = 0
+verify = 1
+sender = 2
+post_tx = 3
+execution_scope = 2
+payment_scope = 1
+atomic_successor_flag = 4
+caller = "SENDER uses payload sender; all other modes use ENTRY_POINT"
+origin = "frame caller across every nested depth"
+post_tx_static = true
+
+[opcodes]
+APPROVE = 170
+TXPARAM = 176
+FRAMEDATALOAD = 177
+FRAMEDATACOPY = 178
+FRAMEPARAM = 179
+SIGPARAM = 180
+SIGDATACOPY = 181
+TXTRACE = 182
+TXDIFF = 183
+EVENTDATACOPY = 184
+
+[selectors]
+txparam = "0:type,1:nonce,2:sender,3:priority_fee,4:max_fee,5:blob_cap,6:max_cost,7:blob_count,8:signature_hash,9:frame_count,10:current_index,11:signature_count,12:state_left,13:legacy_nonce,14:key_count,15:keys_hash,16:first_key"
+frameparam = "0:target,1:execution_limit,2:mode,3:flags,4:data_len,5:status,6:scope,7:atomic,8:value,9:state_limit,10:execution_used,11:state_used"
+sigparam = "0:signer,1:scheme,2:message,3:arbitrary_data_len"
+txtrace = "00:balances_count,01:slots_count,02:deployments_count,03:balance_address,04:balance_before,05:balance_after,06:slot_address,07:slot_key,08:slot_before,09:slot_after,0a:deployed_address,0b:deployed_codehash,0c:events_count,0d:event_address,0e:topic_count,0f:topic0,10:topic1,11:topic2,12:topic3,13:data_len,14:precharge,15:payer"
+txdiff_source = "crates/evm2/src/ethereum/eip7906.rs: TxDiffParam"
+full_width_operands = true
+live_reads = "TXDIFF account/storage lookups retain host reads and warmth; indexed queries use captured data"
+
+[gas]
+isolated_state = true
+intrinsic_base = 12000
+per_frame = 475
+external_value_transfer = 6000
+execution_reservation = "max(intrinsic + sum(frame.execution), floor)"
+state_reservation = "sum(frame.state)"
+maximum_gas = "execution_reservation + state_reservation"
+maximum_payment = "maximum_gas * max_fee + blob_gas * block_blob_base_fee, checked U256"
+fee_gas = "max(total_spent - capped_refund - net_state, floor) + net_state"
+block_execution = "max(total_spent - net_state, floor), before refund"
+block_state = "net_state"
+cross_frame_refill = "reduce original owner's state usage; do not fund restoring frame"
+refund = "signed per-frame deltas, clamp and cap once after rollback"
+
+[rollback]
+nested = "restore state, approvals and state-gas ownership on failure or inspector override"
+frame = "fresh memory/return data; transient storage reset; transaction originals retained"
+atomic = "rollback group state/logs/refunds/ownership/warmth; retain executed statuses and execution gas; skip remainder"
+assertion = "restore checkpoint after first successful payer-setting frame; preserve prefix payment and nonce; skip remaining assertions"
+invalid = "discard whole transaction scratch"
+prefix = "validate complete structure/signatures; execute only requested payable prefix; discard all writes"
+bal = "read/access evidence survives write rollback"
+finalization = "settle once and delay account destruction until assertions finish"
+
+[recent_root]
+kind = "ordinary deployed contract"
+address = "0x8272d9679689ea2f307140cdf9002d27dc00ffff"
+runtime_hash = "0xda160390a838ee04013b2ff3abf4decc9aa3cc6c2f59dd90ca176c2b850be4e3"
+runtime_bytes = 320
+runtime_status = "provisional pinned fork runtime; not a normative final EIP runtime"
+ring_length = 8192
+usable_window = 8191
+maximum_references = 16
+tuple_bytes = 72
+slot_source = "actual payload slot; pool uses canonical head slot + 1"
+
+[qualification]
+fixture_release = "ethereum/execution-specs tests-bogota-devnet@v1.1.1"
+fixture_source = "9c98e61e17c7659d744a3eed2da621ff65793abf"
+fixture_archive = "fixtures_bogota-devnet.tar.gz"
+fixture_archive_sha256 = "2b7e0cbfa221f09235212880fc6e2d8ad1189fd1865344491488a8d9c762efa6"
+toolchain_windows = "rustc 1.100.0-nightly (2026-09-24)"
+toolchain_linux = "rustc 1.101.0-nightly (2026-10-07), LLVM 23.1.4"
+node_integration = "not qualified"
+compiled_parity = "419 files / 1481 cases pass on JIT and AOT in WSL Linux; no nonempty-bytecode fallback"
+interpreter_parity = "same 419 files / 1481 cases pass on auto, tco, packed, single_return, unpacked and inspected dispatch"
+fixture_files = 419
+fixture_cases = 1481
+parallel_frame_blocks = false
+setdelegate = "not supplied by pinned VM; separate deployment requirement, not enabled here"

@@ -7,6 +7,7 @@ mod binary;
 pub mod blockchaintest;
 #[cfg(feature = "jit")]
 mod compiled;
+pub mod conformance;
 mod discover;
 mod dump;
 mod env;
@@ -52,7 +53,7 @@ pub use fixture_io::{
     write_blockchain as write_blockchain_fixture,
 };
 pub use runner::run as run_statetests;
-pub use tx::{AccessListItem, TestAuthorization};
+pub use tx::{AccessListItem, TestAuthorization, TestFrame, TestFrameSignature};
 pub use types::{
     AccountInfo as StateTestAccountInfo, Env as StateTestEnv, SpecName as StateTestSpecName,
     Test as StateTestPost, TestSuite as StateTestSuite, TestUnit as StateTestUnit,

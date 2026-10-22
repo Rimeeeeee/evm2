@@ -161,9 +161,19 @@ pub struct DecodedBlock {
 }
 
 /// Transaction structure.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Transaction {
+    /// Ordered frame payload from the official Bogota fixture format.
+    pub frames: Option<Vec<crate::tx::TestFrame>>,
+    /// Protocol signatures and witnesses.
+    #[serde(default)]
+    pub signatures: Vec<crate::tx::TestFrameSignature>,
+    /// Optional EIP-8250 nonce keys.
+    pub nonce_keys: Option<Vec<U256>>,
+    /// Canonical EIP-2718 bytes; authoritative when present, including type 6 payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub txbytes: Option<Bytes>,
     /// Transaction type.
     #[serde(rename = "type")]
     pub transaction_type: Option<U256>,
@@ -323,6 +333,10 @@ pub enum ForkSpec {
     BPO2ToAmsterdamAtTime15k,
     /// Amsterdam.
     Amsterdam,
+    /// Bogota devnet 1.
+    Bogota,
+    /// Amsterdam to Bogota at timestamp 15000.
+    AmsterdamToBogotaAtTime15k,
 }
 
 impl ForkSpec {

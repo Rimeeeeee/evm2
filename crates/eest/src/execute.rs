@@ -11,7 +11,10 @@ use crate::{
         insert_account_with_storage, parse_bytecode, storage_for_root, system_contract_has_code,
     },
     trace::{self, Eip3155Tracer},
-    tx::{TxFields, build_recovered_tx, recover_address, rpc_access_list, signed_authorizations},
+    tx::{
+        TxFields, build_recovered_tx, build_recovered_tx_bytes, recover_address, rpc_access_list,
+        signed_authorizations,
+    },
     types::{AccountInfo, Env, Test, TestSuite, TestUnit, TransactionParts, TxPartIndices},
 };
 use alloy_eips::{eip4844, eip7691};
@@ -164,7 +167,7 @@ pub fn execute_str_with_filter(
     Ok(summary)
 }
 
-fn execute_str_with_resources(
+pub(crate) fn execute_str_with_resources(
     path: &Path,
     input: &str,
     config: ExecuteConfig,
@@ -173,7 +176,7 @@ fn execute_str_with_resources(
     db_stats_counts: &mut DbStatsCounts,
 ) -> Result<ExecuteSummary, TestError> {
     let suite: TestSuite =
-        serde_json::from_str(input).map_err(|err| TestError::unknown(path, err.into()))?;
+        fixture_io::parse_json(input).map_err(|err| TestError::unknown(path, err.into()))?;
     let mut summary = ExecuteSummary::default();
     for (name, unit) in suite.0 {
         if !test_filter.matches(&name) {
@@ -183,6 +186,7 @@ fn execute_str_with_resources(
         execute_unit(path, &name, unit, config, resources, db_stats_counts)?;
         summary.executed += 1;
     }
+    resources.verify_backend().map_err(|error| TestError::unknown(path, error.into()))?;
     Ok(summary)
 }
 
@@ -204,7 +208,14 @@ fn execute_unit(
         }
         let block = parse_block(&unit.env, spec);
         for post in posts {
-            let tx = match build_tx(&unit.transaction, &post.indexes, unit.env.current_chain_id) {
+            let built = if let Some(bytes) =
+                post.txbytes.as_ref().filter(|bytes| bytes.first() == Some(&6))
+            {
+                build_recovered_tx_bytes(bytes).map_err(Into::into)
+            } else {
+                build_tx(&unit.transaction, &post.indexes, unit.env.current_chain_id)
+            };
+            let tx = match built {
                 Ok(tx) => tx,
                 Err(_) if post.expect_exception.is_some() => {
                     continue;
@@ -615,6 +626,9 @@ fn build_tx(
         authorization_list: signed_authorizations(raw.authorization_list.as_deref())?,
         blob_versioned_hashes: raw.blob_versioned_hashes.clone(),
         max_fee_per_blob_gas: raw.max_fee_per_blob_gas,
+        frames: raw.frames.clone(),
+        signatures: raw.signatures.clone(),
+        nonce_keys: raw.nonce_keys.clone(),
     })?)
 }
 

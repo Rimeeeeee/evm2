@@ -786,6 +786,7 @@ mod spec_serde {
             SpecId::PRAGUE => "PRAGUE",
             SpecId::OSAKA => "OSAKA",
             SpecId::AMSTERDAM => "AMSTERDAM",
+            SpecId::BOGOTA => "BOGOTA",
             _ => "CANCUN",
         }
     }
@@ -807,6 +808,7 @@ mod spec_serde {
             "PRAGUE" => Some(SpecId::PRAGUE),
             "OSAKA" => Some(SpecId::OSAKA),
             "AMSTERDAM" => Some(SpecId::AMSTERDAM),
+            "BOGOTA" => Some(SpecId::BOGOTA),
             _ => None,
         }
     }

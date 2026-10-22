@@ -332,6 +332,34 @@ macro_rules! delegate {
 }
 
 impl<T: EvmTypes> Inspector<T> for DebugInspector {
+    fn frame_transaction_start(&mut self, tx: &alloy_consensus::TxEip8141, host: &mut T::Host<'_>) {
+        delegate!(self => inspector.frame_transaction_start(tx, host))
+    }
+
+    fn frame_start(
+        &mut self,
+        index: usize,
+        frame: &alloy_eips::eip8141::Frame,
+        host: &mut T::Host<'_>,
+    ) {
+        delegate!(self => inspector.frame_start(index, frame, host))
+    }
+
+    fn frame_end(
+        &mut self,
+        index: usize,
+        receipt: &alloy_eips::eip8141::FrameReceipt,
+        output: &alloy_primitives::Bytes,
+        stop: evm2::interpreter::InstrStop,
+        host: &mut T::Host<'_>,
+    ) {
+        delegate!(self => inspector.frame_end(index, receipt, output, stop, host))
+    }
+
+    fn frame_transaction_end(&mut self, result: &evm2::TxResult<T>, host: &mut T::Host<'_>) {
+        delegate!(self => inspector.frame_transaction_end(result, host))
+    }
+
     fn initialize_interp(&mut self, interp: &mut Interpreter<'_, '_, T>) {
         delegate!(self => inspector.initialize_interp(interp))
     }

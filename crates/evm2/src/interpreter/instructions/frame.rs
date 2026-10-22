@@ -1,0 +1,126 @@
+//! Bogota frame introspection, approval and assertion instructions.
+
+use crate::{
+    EvmTypesHost,
+    ethereum::eip7906::TxDiffParam,
+    interpreter::{Host, InstrStop, Result, Word, private::GasInstructionCx},
+    utils::{WordExt, b256_to_word, read_word_padded},
+};
+use alloy_primitives::Bytes;
+use evm2_macros::instruction;
+
+#[instruction(dynamic_gas)]
+pub fn approve(cx: _, [offset, len, scope]: [Word]) -> Result {
+    if cx.state.host().is_post_tx_frame() {
+        return Err(InstrStop::StateChangeDuringStaticCall);
+    }
+    let len = len.to_usize()?;
+    let output = if len == 0 {
+        0..0
+    } else {
+        let offset = offset.to_usize()?;
+        let end = offset.checked_add(len).ok_or(InstrStop::MemoryOOG)?;
+        if end > u32::MAX as usize {
+            return Err(InstrStop::MemoryLimitOOG);
+        }
+        cx.state.resize_memory(cx.gas, offset, len)?;
+        offset as u32..end as u32
+    };
+    let address = cx.state.message().destination;
+    let left = cx.gas.reservoir();
+    let charge =
+        cx.state.host().approve_frame(address, *scope, left).map_err(|e| cx.state.fail(e))?;
+    cx.gas.spend_state(charge)?;
+    cx.state.set_output(output);
+    Err(InstrStop::Return)
+}
+
+#[instruction(dynamic_gas)]
+pub fn txparam(cx: _, [param]: [Word]) -> Result<out> {
+    let left = cx.gas.reservoir();
+    *out = cx.state.host().frame_tx_param(*param, left).ok_or(InstrStop::OpcodeNotFound)?;
+}
+
+#[instruction]
+pub fn framedataload(cx: _, [offset, index]: [Word]) -> Result<out> {
+    let data = cx.state.host().frame_data(*index).ok_or(InstrStop::OpcodeNotFound)?;
+    *out = b256_to_word(read_word_padded(&data, offset.to_usize_saturated()));
+}
+
+fn copy_data<T: EvmTypesHost>(
+    cx: GasInstructionCx<'_, '_, '_, T>,
+    memory: &Word,
+    offset: &Word,
+    len: &Word,
+    data: Bytes,
+    checked: bool,
+) -> Result {
+    let len = len.to_usize()?;
+    let data_offset = offset.to_usize_saturated();
+    if checked && data_offset.checked_add(len).is_none_or(|end| end > data.len()) {
+        return Err(InstrStop::OutOfOffset);
+    }
+    cx.gas.spend(cx.state.gas_params().copy_cost(len))?;
+    if len != 0 {
+        let memory = memory.to_usize()?;
+        cx.state.resize_memory(cx.gas, memory, len)?;
+        cx.state.0.memory.set_data(memory, data_offset, len, &data);
+    }
+    Ok(())
+}
+
+#[instruction(dynamic_gas)]
+pub fn framedatacopy(cx: _, [memory, offset, len, index]: [Word]) -> Result {
+    let data = cx.state.host().frame_data(*index).ok_or(InstrStop::OpcodeNotFound)?;
+    copy_data(cx, memory, offset, len, data, false)
+}
+
+#[instruction]
+pub fn frameparam(cx: _, [index, param]: [Word]) -> Result<out> {
+    *out = cx.state.host().frame_param(*index, *param).ok_or(InstrStop::OpcodeNotFound)?;
+}
+
+#[instruction]
+pub fn sigparam(cx: _, [index, param]: [Word]) -> Result<out> {
+    *out =
+        cx.state.host().frame_signature_param(*index, *param).ok_or(InstrStop::OpcodeNotFound)?;
+}
+
+#[instruction(dynamic_gas)]
+pub fn sigdatacopy(cx: _, [memory, offset, len, index]: [Word]) -> Result {
+    let data = cx.state.host().frame_signature_bytes(*index).ok_or(InstrStop::OpcodeNotFound)?;
+    copy_data(cx, memory, offset, len, data, false)
+}
+
+#[instruction]
+pub fn txtrace(cx: _, [param, index]: [Word]) -> Result<out> {
+    *out = cx.state.host().txtrace(*param, *index).ok_or(InstrStop::OpcodeNotFound)?;
+}
+
+#[instruction(dynamic_gas)]
+pub fn txdiff(cx: _, [param, in2, in3]: [Word]) -> Result<out> {
+    let selector = u8::try_from(*param)
+        .ok()
+        .and_then(|p| TxDiffParam::try_from(p).ok())
+        .ok_or(InstrStop::OpcodeNotFound)?;
+    let cold = if selector.is_storage_lookup() {
+        u64::from(cx.state.gas_params().get(crate::version::GasId::ColdStorageAdditionalCost))
+    } else if selector.is_account_lookup() {
+        cx.state.gas_params().cold_account_additional_cost()
+    } else {
+        0
+    };
+    let skip = cx.gas.remaining() < cold;
+    let (value, is_cold) =
+        cx.state.host().txdiff(*param, *in2, *in3, skip).map_err(|e| cx.state.fail(e))?;
+    if is_cold {
+        cx.gas.spend(cold)?;
+    }
+    *out = value;
+}
+
+#[instruction(dynamic_gas)]
+pub fn eventdatacopy(cx: _, [index, memory, offset, len]: [Word]) -> Result {
+    let data = cx.state.host().event_data(*index).ok_or(InstrStop::OpcodeNotFound)?;
+    copy_data(cx, memory, offset, len, data, true)
+}

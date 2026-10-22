@@ -374,6 +374,11 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
         self.tracked.present.as_ref()
     }
 
+    /// Returns the account at the start of this transaction, before any frame writes.
+    pub const fn original(&self) -> Option<&AccountInfo> {
+        self.tracked.original.as_ref()
+    }
+
     /// Returns whether the account currently exists in the overlay.
     #[inline]
     pub const fn exists(&self) -> bool {

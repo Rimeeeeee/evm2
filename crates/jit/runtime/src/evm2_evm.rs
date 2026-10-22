@@ -612,3 +612,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, feature = "llvm"))]
+mod frame_tests;

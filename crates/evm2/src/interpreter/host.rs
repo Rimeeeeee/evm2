@@ -178,6 +178,83 @@ pub trait Host<T: EvmTypesHost> {
         message: &mut Message<T>,
     ) -> Result<MessageResult<T>, ExecutionError>;
 
+    /// Whether the active transaction uses independent frame budgets.
+    fn frame_transaction_active(&self) -> bool {
+        false
+    }
+
+    /// Reads a transaction parameter under the selected frame protocol.
+    fn frame_tx_param(&self, _param: Word, _state_left: u64) -> Option<Word> {
+        None
+    }
+
+    /// Reads one frame's immutable calldata.
+    fn frame_data(&self, _index: Word) -> Option<Bytes> {
+        None
+    }
+
+    /// Reads frame metadata or a completed frame's outcome.
+    fn frame_param(&self, _index: Word, _param: Word) -> Option<Word> {
+        None
+    }
+
+    /// Reads protocol signature metadata.
+    fn frame_signature_param(&self, _index: Word, _param: Word) -> Option<Word> {
+        None
+    }
+
+    /// Reads an arbitrary application signature witness.
+    fn frame_signature_bytes(&self, _index: Word) -> Option<Bytes> {
+        None
+    }
+
+    /// Whether the current top-level frame is a read-only assertion.
+    fn is_post_tx_frame(&self) -> bool {
+        false
+    }
+
+    /// Atomically applies approval and returns its state-gas charge.
+    fn approve_frame(
+        &mut self,
+        _address: Address,
+        _scope: Word,
+        _state_left: u64,
+    ) -> Result<u64, HostError> {
+        Err(InstrStop::OpcodeNotFound.into())
+    }
+
+    /// Journals a storage charge/refill and returns the spendable refill for this frame.
+    fn frame_sstore_gas(
+        &mut self,
+        _address: Address,
+        _key: Word,
+        _charge: u64,
+        refill: u64,
+    ) -> u64 {
+        refill
+    }
+
+    /// Reads a recorded transaction trace value in POST_TX mode.
+    fn txtrace(&mut self, _param: Word, _index: Word) -> Option<Word> {
+        None
+    }
+
+    /// Performs a Bogota diff lookup, returning its value and cold-access indicator.
+    fn txdiff(
+        &mut self,
+        _param: Word,
+        _in2: Word,
+        _in3: Word,
+        _skip_cold: bool,
+    ) -> Result<(Word, bool), HostError> {
+        Err(InstrStop::OpcodeNotFound.into())
+    }
+
+    /// Reads one recorded event's data in POST_TX mode.
+    fn event_data(&self, _index: Word) -> Option<Bytes> {
+        None
+    }
+
     /// Registers the current contract for self-destruction.
     fn selfdestruct(
         &mut self,

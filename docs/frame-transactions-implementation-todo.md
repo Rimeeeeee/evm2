@@ -1,20 +1,20 @@
 # Frame transactions: full implementation TODO
 
-Prepared 22 October 2026. This is an implementation backlog, not a claim that frame transactions have been implemented or tested.
+Prepared 22 October 2026; implementation status updated in the local `D:\evm2` checkout. Checked implementation items below have local engine evidence. The complete migration is still unfinished; see [the implementation review](frame-transactions-implementation-review.md) for files, contracts, test results and remaining external work. No changes have been pushed.
 
 ## Checkout and scope
 
 - [x] Clone the linked `Rimeeeeee/evm2` fork and check out `bogota-plan`.
-- [x] Replace the former local personal-fork checkout, as requested. The working repository is `C:\Users\soubh\Desktop\Sreth\evm2`; `origin` is `https://github.com/Rimeeeeee/evm2.git`.
+- [x] Replace the former local personal-fork checkout, as requested. The implementation workspace is now `D:\evm2` on `bogota-plan`, starting at `1fb7124`; `origin` is `https://github.com/Rimeeeeee/evm2.git`.
 - [x] Read both proposal documents and inspect the relevant evm2 interfaces and pinned revm frame executor, nonce helpers, and assertion selectors.
 
 Proposal commit: `ea45b124061e3f4de6dde8c7b4556c577340d324`. Its implementation base is `185be4b37d44f22cf81f71cf0568ea710b54a66d`, also the upstream `main` SHA observed during this review. The proposal commit adds documentation only. The base supports transaction types 0–4 and Amsterdam building blocks; it has no native implementation of the four frame EIPs.
 
-**Planning assumption:** deliver exact Bogota devnet 1 compatibility first. A later coordinated draft update has a separate checklist. Finalize that choice in P00 before implementing protocol behavior. Never mix the two interpretations under one fork identity.
+**Selected target:** exact Bogota devnet 1 compatibility, recorded in `frame-transactions-protocol.toml`. A later coordinated draft update has a separate conditional checklist. Never mix the two interpretations under one fork identity.
 
 “Full implementation” here includes EIP-8141 execution, EIP-8250 nonces, EIP-7906 assertions, EIP-8272 integration, interpreter/JIT/AOT parity, inspectors, the Alloy adapter, and Reth admission/RPC/storage/block integration. Engine completion and an interoperable node are separate gates. Frame-containing blocks may use the existing serial fallback at the first node release; enabling BAL parallel execution has its own gate.
 
-All unchecked items are future work. Paths below are repository-relative within the named component. New module/API names are proposals, not existing interfaces. Keep implementation in the normal Ethereum type family, follow revm semantics, and update consumers directly without transitional compatibility wrappers.
+Unchecked items are not fully completed or qualified; some have partial engine work documented in the implementation review. Paths below are repository-relative within the named component. Use the implementation review for current module/API names; unchecked downstream API names remain proposals. Keep implementation in the normal Ethereum type family, follow revm semantics, and update consumers directly without transitional compatibility wrappers.
 
 ## Protocol versions that must stay separate
 
@@ -50,12 +50,12 @@ The removed personal checkout had candidate work at `Soubhik-10/evm2@c4d675af51b
 
 Owner: all components. Dependencies: none.
 
-- [ ] **P00.01** Record the selected chain target, fork activation, envelope schema before/after keyed nonces, opcode bytes, selector tables, signing transformation, and nonce semantics in one checked-in protocol manifest.
-- [ ] **P00.02** Pin the reference node, all patched dependency revisions, fixture release/archive checksums, deployed contract runtimes, and test-tool revisions. Keep live branch heads out of conformance comparisons.
+- [x] **P00.01** Record the selected chain target, fork activation, envelope schema before/after keyed nonces, opcode bytes, selector tables, signing transformation, and nonce semantics in one checked-in protocol manifest.
+- [x] **P00.02** Pin the reference node, all patched dependency revisions, fixture release/archive checksums, deployed contract runtimes, and test-tool revisions. Keep live branch heads out of conformance comparisons.
 - [ ] **P00.03** Agree the native full-execution, executable-prefix, result, state-stream, and inspector contracts with the Alloy adapter. Distinguish protocol invalidity, valid execution failure, and database/fatal errors.
-- [ ] **P00.04** Specify rollback invariants for nested calls, top-level frames, atomic groups, assertion-body rollback, invalid transactions, prefix simulation, and EVM reuse. Include approvals, gas ownership, logs, warmth, and BAL access records.
-- [ ] **P00.05** Confirm whether EIP-7819 `SETDELEGATE` is required by the deployment target. Neither the proposal's evm2 base nor its pinned revm guarantees that opcode; track it separately if required.
-- [ ] **P00.06** Inventory later Reth mempool-policy fixes against the pinned devnet branch. Select which policy fixes to retain without silently changing consensus behavior.
+- [x] **P00.04** Specify rollback invariants for nested calls, top-level frames, atomic groups, assertion-body rollback, invalid transactions, prefix simulation, and EVM reuse. Include approvals, gas ownership, logs, warmth, and BAL access records.
+- [x] **P00.05** Confirm whether EIP-7819 `SETDELEGATE` is required by the deployment target. Neither the proposal's evm2 base nor its pinned revm guarantees that opcode; track it separately if required.
+- [x] **P00.06** Inventory later Reth mempool-policy fixes against the pinned devnet branch. Select which policy fixes to retain without silently changing consensus behavior.
 
 Acceptance: every later package names the same protocol manifest; unresolved API choices are resolved before their consumers are written.
 
@@ -82,12 +82,12 @@ Owner: evm2. Dependencies: P00, P01.
 
 Files: `crates/evm2/src/{spec_id.rs,ethereum/mod.rs,version/features.rs,version/mod.rs,version/opcode_config.rs,evm/registry.rs,evm/tx.rs,evm/env.rs,evm/config.rs}` and `Cargo.toml`. Proposed orchestration module: `ethereum/eip8141.rs`.
 
-- [ ] **P02.01** Add the selected Bogota spec/configuration, parsing/display, variant counts, generic dispatch macros, version inheritance, opcode activation, and relevant precompile schedule. Prove Amsterdam and older behavior stays unchanged.
-- [ ] **P02.02** Add the native frame envelope variant, conversions, accessors, and type-6 registry entry using `prepare` plus `execute`. Gate keyed-schema activation explicitly rather than inferring it from a nonempty payload.
-- [ ] **P02.03** Audit `Transaction` delegation for scalar target/input/nonce/gas and narrow fee fields. Ensure the handler reads the original frame payload; no canonical fee or reservation depends on a truncated generic accessor.
-- [ ] **P02.04** Add prepared frame context containing validated payload/hash, intrinsic/floor gas, execution/state reservations, effective price, blob charge, and transaction-start legacy nonce. Do not reuse ordinary sender precharge/nonce-bump preparation.
-- [ ] **P02.05** Add native typed frame outcome data: payer/precharge, all ordered receipts and outputs, actual gas dimensions, assertion failure classification, and common transaction status. Preserve result extension mapping and commit/discard/detach APIs.
-- [ ] **P02.06** Add deterministic invalid-transaction errors for schema, structure, signatures, approval, nonce, arithmetic, and missing payer. Preserve database/host failures as fatal errors instead of ordinary frame reverts.
+- [x] **P02.01** Add the selected Bogota spec/configuration, parsing/display, variant counts, generic dispatch macros, version inheritance, opcode activation, and relevant precompile schedule. Prove Amsterdam and older behavior stays unchanged.
+- [x] **P02.02** Add the native frame envelope variant, conversions, accessors, and type-6 registry entry using `prepare` plus `execute`. Gate keyed-schema activation explicitly rather than inferring it from a nonempty payload.
+- [x] **P02.03** Audit `Transaction` delegation for scalar target/input/nonce/gas and narrow fee fields. Ensure the handler reads the original frame payload; no canonical fee or reservation depends on a truncated generic accessor.
+- [x] **P02.04** Add prepared frame context containing validated payload/hash, intrinsic/floor gas, execution/state reservations, effective price, blob charge, and transaction-start legacy nonce. Do not reuse ordinary sender precharge/nonce-bump preparation.
+- [x] **P02.05** Add native typed frame outcome data: payer/precharge, all ordered receipts and outputs, actual gas dimensions, assertion failure classification, and common transaction status. Preserve result extension mapping and commit/discard/detach APIs.
+- [x] **P02.06** Add deterministic invalid-transaction errors for schema, structure, signatures, approval, nonce, arithmetic, and missing payer. Preserve database/host failures as fatal errors instead of ordinary frame reverts.
 - [ ] **P02.07** Check complete static structure and signatures before state-dependent reads where the baseline requires it. Add multi-error/read-order regressions, including missing or malformed BAL data.
 - [ ] **P02.08** Integrate standard `BaseEvmTypes`, sync/async entrypoints where supported, configuration overrides, and custom precompiles. Do not require a private Reth-only EVM family for standard frame execution.
 
@@ -99,14 +99,14 @@ Owner: evm2 state/host. Dependencies: P02.
 
 Files: `crates/evm2/src/evm/{mod.rs,state/mod.rs,state/journal.rs,state/account.rs,state/tracked.rs}`. Proposed modules: `evm/frame.rs` and an in-flight diff module.
 
-- [ ] **P03.01** Store immutable payload separately from mutable current-frame context, approval state, payer/precharge, legacy nonce snapshot, ordered outcomes, and state-gas ownership records.
-- [ ] **P03.02** Journal approval effects at nested call boundaries. Commit them only on successful child/root return; parent revert, exceptional halt, or inspector override must undo the matching effects.
-- [ ] **P03.03** Define coordinated state/runtime checkpoints for a frame, an atomic group, and the execution-body boundary. Each rollback restores approval and receipt/gas ownership mutations as well as account/storage state.
-- [ ] **P03.04** Preserve transaction-start account/storage originals across top-level frames. Earlier accepted transactions in the EVM overlay must be part of this transaction's prestate.
-- [ ] **P03.05** Reset frame memory, return-data state, and transient storage at the protocol boundary; retain transaction-shared persistent state, originals, and warmth according to the chosen revision.
-- [ ] **P03.06** Implement the baseline's warmth rollback rules separately from BAL access recording. Atomic rollback restores the proper warmth snapshot while access evidence needed by BAL remains available.
-- [ ] **P03.07** Clear frame runtime, checkpoints, ownership/diff caches, and interpreter frame stacks on success, error, discard, dropped transaction handles, and prefix exits. Test a normal transaction immediately after each path.
-- [ ] **P03.08** Delay final account destruction and transaction-original cleanup until assertions finish. Preserve existing state-stream ownership instead of committing directly into the backing database.
+- [x] **P03.01** Store immutable payload separately from mutable current-frame context, approval state, payer/precharge, legacy nonce snapshot, ordered outcomes, and state-gas ownership records.
+- [x] **P03.02** Journal approval effects at nested call boundaries. Commit them only on successful child/root return; parent revert, exceptional halt, or inspector override must undo the matching effects.
+- [x] **P03.03** Define coordinated state/runtime checkpoints for a frame, an atomic group, and the execution-body boundary. Each rollback restores approval and receipt/gas ownership mutations as well as account/storage state.
+- [x] **P03.04** Preserve transaction-start account/storage originals across top-level frames. Earlier accepted transactions in the EVM overlay must be part of this transaction's prestate.
+- [x] **P03.05** Reset frame memory, return-data state, and transient storage at the protocol boundary; retain transaction-shared persistent state, originals, and warmth according to the chosen revision.
+- [x] **P03.06** Implement the baseline's warmth rollback rules separately from BAL access recording. Atomic rollback restores the proper warmth snapshot while access evidence needed by BAL remains available.
+- [x] **P03.07** Clear frame runtime, checkpoints, ownership/diff caches, and interpreter frame stacks on success, error, discard, dropped transaction handles, and prefix exits. Test a normal transaction immediately after each path.
+- [x] **P03.08** Delay final account destruction and transaction-original cleanup until assertions finish. Preserve existing state-stream ownership instead of committing directly into the backing database.
 
 Acceptance: targeted rollback tests compare state, approvals, logs, warmth, ownership, and access records after every exit class.
 
@@ -131,16 +131,16 @@ block execution used = max(total spent - net state used, F)   # before refund
 block state used = net state used
 ```
 
-- [ ] **P04.01** Add an isolated-state gas mode/constructor for frame execution. State exhaustion must fail even with abundant execution gas; preserve ordinary EIP-8037 reservoir spill for ordinary transactions.
-- [ ] **P04.02** Propagate pool mode, budgets, returned gas, and rollback through nested CALL/CREATE, stipends, account creation, code deposit, delegation handling, and precompile/early-failure paths.
-- [ ] **P04.03** Compute intrinsic gas, signature work, calldata/nonce pricing, value costs, floor, and reservation from the selected revision. Check sums/products and apply the transaction cap to the correct execution reservation dimension.
-- [ ] **P04.04** Track the frame that funded each state-growth charge. A later slot restoration reduces that owner's attributed usage; it must not create spendable state gas for the restoring frame.
-- [ ] **P04.05** Journal ownership/refill changes across nested calls, frame failures, atomic groups, and assertion rollback. Cover charge/restore/recreate sequences and reverted restorations across different top-level frames.
-- [ ] **P04.06** Preserve signed refund deltas across frames, remove rolled-back contributions, and clamp/cap once at transaction settlement. Test a later frame reversing an earlier refund.
-- [ ] **P04.07** Debit maximum gas times the full-width max fee plus blob gas at the block blob base fee when payment is approved. Enforce the blob fee cap separately; reject checked-payment overflow.
-- [ ] **P04.08** Settle once at effective gas price; return excess to the payer and apply beneficiary/base-fee/blob accounting under the inherited rules. Assertions observe precharge before final settlement.
+- [x] **P04.01** Add an isolated-state gas mode/constructor for frame execution. State exhaustion must fail even with abundant execution gas; preserve ordinary EIP-8037 reservoir spill for ordinary transactions.
+- [x] **P04.02** Propagate pool mode, budgets, returned gas, and rollback through nested CALL/CREATE, stipends, account creation, code deposit, delegation handling, and precompile/early-failure paths.
+- [x] **P04.03** Compute intrinsic gas, signature work, calldata/nonce pricing, value costs, floor, and reservation from the selected revision. Check sums/products and apply the transaction cap to the correct execution reservation dimension.
+- [x] **P04.04** Track the frame that funded each state-growth charge. A later slot restoration reduces that owner's attributed usage; it must not create spendable state gas for the restoring frame.
+- [x] **P04.05** Journal ownership/refill changes across nested calls, frame failures, atomic groups, and assertion rollback. Cover charge/restore/recreate sequences and reverted restorations across different top-level frames.
+- [x] **P04.06** Preserve signed refund deltas across frames, remove rolled-back contributions, and clamp/cap once at transaction settlement. Test a later frame reversing an earlier refund.
+- [x] **P04.07** Debit maximum gas times the full-width max fee plus blob gas at the block blob base fee when payment is approved. Enforce the blob fee cap separately; reject checked-payment overflow.
+- [x] **P04.08** Settle once at effective gas price; return excess to the payer and apply beneficiary/base-fee/blob accounting under the inherited rules. Assertions observe precharge before final settlement.
 - [ ] **P04.09** Make fee/receipt gas explicitly frame-aware in native results and every adapter/RPC/estimation consumer. Test `spent=180000, state=100000, floor=100000, refund=0` produces fee gas `200000`.
-- [ ] **P04.10** Test execution-only and state-only exhaustion, zero budgets, floor-binding payment, refunds, custom schedules, and maximum U256 fee arithmetic. Compare pre-refund block capacity separately from charged fee gas.
+- [x] **P04.10** Test execution-only and state-only exhaustion, zero budgets, floor-binding payment, refunds, custom schedules, and maximum U256 fee arithmetic. Compare pre-refund block capacity separately from charged fee gas.
 
 Acceptance: one authoritative reservation/settlement calculation agrees across engine, prefix exposure, block admission, receipt building, and RPC.
 
@@ -151,15 +151,15 @@ Owner: evm2. Dependencies: P02–P04; uses P06–P10 as those packages land.
 Files: proposed `crates/evm2/src/ethereum/eip8141.rs`; existing `evm/mod.rs` message execution and state APIs. Reference: pinned revm `crates/handler/src/eip8141.rs`.
 
 - [ ] **P05.01** Validate frame count `1..=64`, modes, address encodings, reserved flag bits, scope restrictions, allowed values, expiry fields, blob fields, atomic links, and trailing assertion shape before execution. Preserve baseline validation ordering.
-- [ ] **P05.02** Resolve empty targets to the explicit sender. Set caller and frame-wide `ORIGIN` for DEFAULT/VERIFY/SENDER/POST_TX modes, including every nested depth; prevent SENDER execution before execution approval.
-- [ ] **P05.03** Warm only the initial protocol-required accounts. Charge each frame target's entry access before subsequent balance/code/delegation reads; do not prewarm all targets or `ENTRY_POINT`.
-- [ ] **P05.04** Execute each frame with fresh frame-local resources and its declared independent budgets through existing message execution. Reuse active precompiles, ordinary code, delegation resolution, and eligible default-account verification.
-- [ ] **P05.05** Preserve protocol order for access charges, affordability, value transfer/account growth, code resolution, and dispatch. Test insufficient entry gas/funds, empty code, delegated code, and fatal database failures.
-- [ ] **P05.06** Make any failed VERIFY invalidate and discard the whole transaction. Treat ordinary frame revert/halt as frame failure with the correct gas and continuation rules; require a payer before successful finalization.
-- [ ] **P05.07** Implement atomic groups using the flag that links a frame to its successor. Reject invalid terminal/VERIFY/assertion/scope combinations. Failure rolls back the whole group and skips its unexecuted remainder.
-- [ ] **P05.08** Emit one receipt/output position per declared frame. Preserve already executed frames' statuses/execution gas after group rollback, clear the prescribed logs/state gas/refunds, and emit status-2 zero-gas skipped entries.
-- [ ] **P05.09** Capture the body checkpoint immediately after the first successful payer-setting frame. Share the same canonical loop with full execution and executable-prefix simulation.
-- [ ] **P05.10** Finalize fees, delayed destruction, state streams, receipt gas attribution, and runtime cleanup once. Never implement frames by repeatedly calling ordinary `transact()`.
+- [x] **P05.02** Resolve empty targets to the explicit sender. Set caller and frame-wide `ORIGIN` for DEFAULT/VERIFY/SENDER/POST_TX modes, including every nested depth; prevent SENDER execution before execution approval.
+- [x] **P05.03** Warm only the initial protocol-required accounts. Charge each frame target's entry access before subsequent balance/code/delegation reads; do not prewarm all targets or `ENTRY_POINT`.
+- [x] **P05.04** Execute each frame with fresh frame-local resources and its declared independent budgets through existing message execution. Reuse active precompiles, ordinary code, delegation resolution, and eligible default-account verification.
+- [x] **P05.05** Preserve protocol order for access charges, affordability, value transfer/account growth, code resolution, and dispatch. Test insufficient entry gas/funds, empty code, delegated code, and fatal database failures.
+- [x] **P05.06** Make any failed VERIFY invalidate and discard the whole transaction. Treat ordinary frame revert/halt as frame failure with the correct gas and continuation rules; require a payer before successful finalization.
+- [x] **P05.07** Implement atomic groups using the flag that links a frame to its successor. Reject invalid terminal/VERIFY/assertion/scope combinations. Failure rolls back the whole group and skips its unexecuted remainder.
+- [x] **P05.08** Emit one receipt/output position per declared frame. Preserve already executed frames' statuses/execution gas after group rollback, clear the prescribed logs/state gas/refunds, and emit status-2 zero-gas skipped entries.
+- [x] **P05.09** Capture the body checkpoint immediately after the first successful payer-setting frame. Share the same canonical loop with full execution and executable-prefix simulation.
+- [x] **P05.10** Finalize fees, delayed destruction, state streams, receipt gas attribution, and runtime cleanup once. Never implement frames by repeatedly calling ordinary `transact()`.
 
 Acceptance: a mixed multi-frame transaction matches the reference for validity, ordered outcomes, state, gas, and error ordering, including atomic failures and entry failures.
 
@@ -169,13 +169,13 @@ Owner: evm2. Dependencies: P01–P05.
 
 Files: proposed `ethereum/eip8141.rs`, `interpreter/instructions/frame.rs`, frame runtime, host implementation; existing secp256k1/P-256 crypto modules.
 
-- [ ] **P06.01** Validate every protocol signature before frames, including entries unused by a selected prefix. Implement exact scheme lengths, signer resolution, message rules, curve checks, and low-s constraints.
-- [ ] **P06.02** Preserve ARBITRARY witnesses for application verification; enforce their protocol structure without inventing protocol cryptographic verification. Test unused malformed signatures still fail.
-- [ ] **P06.03** Implement eligible default-account verification/self-payment/sponsorship from the baseline. Preserve differences among empty accounts, contract senders, active precompiles, and EIP-7702 delegation.
-- [ ] **P06.04** Implement APPROVE operand order, memory expansion, return bytes, allowed scope, current/resolved target checks, and successful exit of the current EVM call.
-- [ ] **P06.05** Apply execution approval, payer assignment, nonce consumption, state-gas charges, and precharge atomically at the correct approval point. Test missing/insufficient payment and repeated/partial approval scopes.
-- [ ] **P06.06** Support the VERIFY static-context exception only where the selected protocol permits it. POST_TX/assertion mode receives no approval exception; ordinary static calls retain their restrictions.
-- [ ] **P06.07** Prove a successful nested approval survives a successful parent, and disappears when that child/parent/root frame reverts or halts. Include returned data, empty data, and nested delegation cases.
+- [x] **P06.01** Validate every protocol signature before frames, including entries unused by a selected prefix. Implement exact scheme lengths, signer resolution, message rules, curve checks, and low-s constraints.
+- [x] **P06.02** Preserve ARBITRARY witnesses for application verification; enforce their protocol structure without inventing protocol cryptographic verification. Test unused malformed signatures still fail.
+- [x] **P06.03** Implement eligible default-account verification/self-payment/sponsorship from the baseline. Preserve differences among empty accounts, contract senders, active precompiles, and EIP-7702 delegation.
+- [x] **P06.04** Implement APPROVE operand order, memory expansion, return bytes, allowed scope, current/resolved target checks, and successful exit of the current EVM call.
+- [x] **P06.05** Apply execution approval, payer assignment, nonce consumption, state-gas charges, and precharge atomically at the correct approval point. Test missing/insufficient payment and repeated/partial approval scopes.
+- [x] **P06.06** Support the VERIFY static-context exception only where the selected protocol permits it. POST_TX/assertion mode receives no approval exception; ordinary static calls retain their restrictions.
+- [x] **P06.07** Prove a successful nested approval survives a successful parent, and disappears when that child/parent/root frame reverts or halts. Include returned data, empty data, and nested delegation cases.
 - [ ] **P06.08** Keep signature-placeholder allowances in explicit simulation configuration. They must be disabled for block import, payload validation, and public propagation.
 
 Acceptance: default-code and bytecode verification produce equivalent approval facts and rollback behavior where the protocol defines equivalence.
@@ -196,12 +196,12 @@ Files: `crates/evm2/src/interpreter/{opcode.rs,host.rs,instructions/mod.rs}`, pr
 | SIGPARAM | `0xb4` | Complete signature selector/index table |
 | SIGDATACOPY | `0xb5` | Signature bytes, source range, expansion and copy gas |
 
-- [ ] **P07.01** Add metadata, stack effects, static/dynamic gas, names, fork mapping, exports, and explicit host methods for every instruction in the table.
-- [ ] **P07.02** Implement every selector from the pinned protocol tables, including empty target/signer interpretation, current frame context, full-width fees, and transaction-start legacy nonce.
-- [ ] **P07.03** Check full U256 indices/selectors/offsets and checked range addition before narrowing. Test oversized operands, invalid selectors, empty data, exact-end access, and zero-length copies with invalid sources.
-- [ ] **P07.04** Implement each instruction's own padding/bounds rules; do not assume all copies behave like CALLDATACOPY. Charge memory/copy gas in the baseline's order.
-- [ ] **P07.05** Define behavior outside a frame transaction and before activation. Include ordinary transactions at the newer fork, nested calls, and static execution.
-- [ ] **P07.06** Add per-opcode positive/negative vectors and parity tests across all interpreter dispatch tables. Add EIP-7906 instructions through P10 and compiled translations through P12.
+- [x] **P07.01** Add metadata, stack effects, static/dynamic gas, names, fork mapping, exports, and explicit host methods for every instruction in the table.
+- [x] **P07.02** Implement every selector from the pinned protocol tables, including empty target/signer interpretation, current frame context, full-width fees, and transaction-start legacy nonce.
+- [x] **P07.03** Check full U256 indices/selectors/offsets and checked range addition before narrowing. Test oversized operands, invalid selectors, empty data, exact-end access, and zero-length copies with invalid sources.
+- [x] **P07.04** Implement each instruction's own padding/bounds rules; do not assume all copies behave like CALLDATACOPY. Charge memory/copy gas in the baseline's order.
+- [x] **P07.05** Define behavior outside a frame transaction and before activation. Include ordinary transactions at the newer fork, nested calls, and static execution.
+- [x] **P07.06** Add per-opcode positive/negative vectors and parity tests across all interpreter dispatch tables. Add EIP-7906 instructions through P10 and compiled translations through P12.
 
 Acceptance: the complete selector/operand/gas table is executable and tested; no instruction silently truncates a U256 operand.
 
@@ -211,13 +211,13 @@ Owner: evm2, consumed by Alloy/Reth. Dependencies: P05–P07, P09 when keyed non
 
 Files: `crates/evm2/src/evm/{mod.rs,registry.rs,inspector.rs}`, proposed frame executor. Proposed API name: `validate_frame_prefix`.
 
-- [ ] **P08.01** Add an API that validates the complete static payload/signatures, executes the requested policy-selected prefix, and stops at successful payment approval using the canonical frame loop.
-- [ ] **P08.02** Reject empty/out-of-bounds prefixes, unsuccessful prefix frames, missing payer, and a caller's requested boundary that disagrees with the actual payable boundary. Execute no frame after payment approval.
-- [ ] **P08.03** Return payer, maximum exposure, actual exclusive prefix boundary, sender approval, signature work, execution gas, and state gas in native typed metadata.
-- [ ] **P08.04** Discard state, precharge, nonce consumption, approvals, and runtime on success and all error paths. Leave accepted prior state intact and test EVM reuse immediately afterwards.
+- [x] **P08.01** Add an API that validates the complete static payload/signatures, executes the requested policy-selected prefix, and stops at successful payment approval using the canonical frame loop.
+- [x] **P08.02** Reject empty/out-of-bounds prefixes, unsuccessful prefix frames, missing payer, and a caller's requested boundary that disagrees with the actual payable boundary. Execute no frame after payment approval.
+- [x] **P08.03** Return payer, maximum exposure, actual exclusive prefix boundary, sender approval, signature work, execution gas, and state gas in native typed metadata.
+- [x] **P08.04** Discard state, precharge, nonce consumption, approvals, and runtime on success and all error paths. Leave accepted prior state intact and test EVM reuse immediately afterwards.
 - [ ] **P08.05** Preserve configured precompiles and inspector hooks, including synthetic default verification, early entry failures, nested/reverted calls, and fatal errors. Keep policy observations even when the observed call reverts.
-- [ ] **P08.06** Keep policy shape/bans supplied by Reth. Use interpreted execution for admission until a compiled backend can prove equivalent per-opcode observation; a missing hook must never silently permit admission.
-- [ ] **P08.07** Document that existing `validate_tx()` performs preparation only and does not replace executable validation. Test full/prefix preparation and exposure calculations agree exactly.
+- [x] **P08.06** Keep policy shape/bans supplied by Reth. Use interpreted execution for admission until a compiled backend can prove equivalent per-opcode observation; a missing hook must never silently permit admission.
+- [x] **P08.07** Document that existing `validate_tx()` performs preparation only and does not replace executable validation. Test full/prefix preparation and exposure calculations agree exactly.
 
 Acceptance: prefix simulation is read-only to its caller yet reports the same payer/approval/gas facts as the corresponding beginning of full execution.
 
@@ -227,16 +227,16 @@ Owner: evm2 state/host plus shared EIP helpers. Dependencies: P01–P06.
 
 Files: proposed `crates/evm2/src/ethereum/eip8250.rs`, frame host/runtime, `evm/state/` protocol-storage operations; EIPs `crates/eip8141/src/nonce.rs`. Reference: pinned revm `context/src/context.rs` and `context/src/journal.rs`.
 
-- [ ] **P09.01** Match schema presence to activation. For Bogota, reject empty key lists, accept `[0]` as legacy, forbid zero combined with other keys, require sorted unique keys, enforce at most 16, and reject maximum sequence.
-- [ ] **P09.02** Use the shared sender/key storage-key and key-set-hash helpers. Read every selected domain against transaction prestate before any frame executes; reject any mismatch before consuming a domain.
-- [ ] **P09.03** Snapshot the transaction-start legacy nonce for introspection even with keyed lanes. Do not increment legacy or keyed nonces during preparation.
-- [ ] **P09.04** At payment approval, determine all first-use charges and ensure the active frame's state pool can fund the entire set. Atomically update every selected domain, payer precharge, and approval metadata.
-- [ ] **P09.05** Increment the current legacy account nonce when consuming the legacy domain; prior deploy/CREATE activity may have changed it. Consume keyed sequences exactly as the selected Bogota schema requires.
-- [ ] **P09.06** Implement protocol storage reads/writes that record BAL evidence without accidentally warming ordinary user SLOAD/SSTORE access. Keep nonce storage in the deployed `NONCE_MANAGER` account.
-- [ ] **P09.07** Obtain keyed access and first-use state costs from the active schedule. Cross-check the pinned schedule's 12,100 execution and 97,920 first-use state gas and the legacy account-creation charge.
-- [ ] **P09.08** Preserve successfully approved nonce consumption across later assertion-body rollback; undo it with an approving call/frame rollback or whole-transaction invalidity. Cover partial-funding failure with no surviving key writes.
+- [x] **P09.01** Match schema presence to activation. For Bogota, reject empty key lists, accept `[0]` as legacy, forbid zero combined with other keys, require sorted unique keys, enforce at most 16, and reject maximum sequence.
+- [x] **P09.02** Use the shared sender/key storage-key and key-set-hash helpers. Read every selected domain against transaction prestate before any frame executes; reject any mismatch before consuming a domain.
+- [x] **P09.03** Snapshot the transaction-start legacy nonce for introspection even with keyed lanes. Do not increment legacy or keyed nonces during preparation.
+- [x] **P09.04** At payment approval, determine all first-use charges and ensure the active frame's state pool can fund the entire set. Atomically update every selected domain, payer precharge, and approval metadata.
+- [x] **P09.05** Increment the current legacy account nonce when consuming the legacy domain; prior deploy/CREATE activity may have changed it. Consume keyed sequences exactly as the selected Bogota schema requires.
+- [x] **P09.06** Implement protocol storage reads/writes that record BAL evidence without accidentally warming ordinary user SLOAD/SSTORE access. Keep nonce storage in the deployed `NONCE_MANAGER` account.
+- [x] **P09.07** Obtain keyed access and first-use state costs from the active schedule. Cross-check the pinned schedule's 12,100 execution and 97,920 first-use state gas and the legacy account-creation charge.
+- [x] **P09.08** Preserve successfully approved nonce consumption across later assertion-body rollback; undo it with an approving call/frame rollback or whole-transaction invalidity. Cover partial-funding failure with no surviving key writes.
 - [ ] **P09.09** Add nonce selectors/calldata pricing and tests for first/subsequent use, overlaps/disjoint sets, block ordering, delegation/deployment effects, custom schedules, and unchanged cold-access costs after protocol reads.
-- [ ] **P09.10** Coordinate genesis/deployment of the ordinary nonce-manager contract. Do not install it as a VM precompile or add unrequested fork-boundary state writes/checks.
+- [x] **P09.10** Coordinate genesis/deployment of the ordinary nonce-manager contract. Do not install it as a VM precompile or add unrequested fork-boundary state writes/checks.
 
 Acceptance: replay-domain state, approval rollback, gas, and BAL records match the Bogota baseline; draft single-use semantics remain in P21.
 
@@ -246,17 +246,17 @@ Owner: evm2 state/runtime/interpreter. Dependencies: P03–P07, P09.
 
 Files: proposed frame/diff modules, `evm/state/{mod.rs,account.rs,tracked.rs}`, `evm/tx.rs`, `interpreter/{host.rs,opcode.rs,instructions/frame.rs}`, and version tables.
 
-- [ ] **P10.01** Implement contiguous trailing `PostTx` mode-3 frames. Enforce read-only execution throughout nested subtrees and reject atomic groups containing or crossing into the suffix.
-- [ ] **P10.02** On assertion revert/halt, restore the body boundary after the payer-setting frame. Retain validation-prefix effects, payer/nonce approval and payment obligations; remove the body's prescribed state/log/refund/output effects.
-- [ ] **P10.03** Preserve executed frames' statuses and execution gas under the baseline's rollback rules. Keep the failed assertion's outcome and skip remaining assertions with status 2, zero gas, empty logs/outputs.
-- [ ] **P10.04** Build transaction-prestate/net-change views from the in-flight overlay and captured originals. Use accepted prior state and BAL-positioned prestate; never substitute the older backing database or post-finalization `account_changes()`.
-- [ ] **P10.05** Implement Bogota `TXTRACE` selectors `0x00..0x15`: balances, storage slots, deployments, events/topics/data lengths, actual precharge, and payer. Reproduce the selected baseline's enumeration and lifecycle rules.
-- [ ] **P10.06** Implement Bogota `TXDIFF=0xb7` and its complete selector table. Preserve live account/storage query host reads, warmth and gas where specified; transaction-local index/count queries must follow their separate rules.
-- [ ] **P10.07** Implement Bogota `EVENTDATACOPY=0xb8`, exact event/source bounds, checked U256 range addition, memory expansion, and copy gas. Add zero-length, overflow, bad-index, and end-of-buffer vectors.
-- [ ] **P10.08** Define deterministic numeric address/slot ordering, net-change collapse, return-to-original omission, nonexistence, deployment, delegation-byte hashing, nonce changes, and SELFDESTRUCT observation under the selected tables.
-- [ ] **P10.09** Include canonical protocol transfer logs and precharge in the proper observation view; assertions execute before final fee refund/reward and delayed destruction cleanup. Keep event emission order.
-- [ ] **P10.10** Retain canonical consensus event data even when optional debug/log output collection is disabled. Avoid live reads for operations defined only over captured data, and preserve BAL access records after rolled-back writes.
-- [ ] **P10.11** Cache derived sorted/indexed views at the assertion boundary and invalidate them on rollback or relevant mutation. Do not re-sort the complete transaction diff on every indexed instruction.
+- [x] **P10.01** Implement contiguous trailing `PostTx` mode-3 frames. Enforce read-only execution throughout nested subtrees and reject atomic groups containing or crossing into the suffix.
+- [x] **P10.02** On assertion revert/halt, restore the body boundary after the payer-setting frame. Retain validation-prefix effects, payer/nonce approval and payment obligations; remove the body's prescribed state/log/refund/output effects.
+- [x] **P10.03** Preserve executed frames' statuses and execution gas under the baseline's rollback rules. Keep the failed assertion's outcome and skip remaining assertions with status 2, zero gas, empty logs/outputs.
+- [x] **P10.04** Build transaction-prestate/net-change views from the in-flight overlay and captured originals. Use accepted prior state and BAL-positioned prestate; never substitute the older backing database or post-finalization `account_changes()`.
+- [x] **P10.05** Implement Bogota `TXTRACE` selectors `0x00..0x15`: balances, storage slots, deployments, events/topics/data lengths, actual precharge, and payer. Reproduce the selected baseline's enumeration and lifecycle rules.
+- [x] **P10.06** Implement Bogota `TXDIFF=0xb7` and its complete selector table. Preserve live account/storage query host reads, warmth and gas where specified; transaction-local index/count queries must follow their separate rules.
+- [x] **P10.07** Implement Bogota `EVENTDATACOPY=0xb8`, exact event/source bounds, checked U256 range addition, memory expansion, and copy gas. Add zero-length, overflow, bad-index, and end-of-buffer vectors.
+- [x] **P10.08** Define deterministic numeric address/slot ordering, net-change collapse, return-to-original omission, nonexistence, deployment, delegation-byte hashing, nonce changes, and SELFDESTRUCT observation under the selected tables.
+- [x] **P10.09** Include canonical protocol transfer logs and precharge in the proper observation view; assertions execute before final fee refund/reward and delayed destruction cleanup. Keep event emission order.
+- [x] **P10.10** Retain canonical consensus event data even when optional debug/log output collection is disabled. Avoid live reads for operations defined only over captured data, and preserve BAL access records after rolled-back writes.
+- [x] **P10.11** Cache derived sorted/indexed views at the assertion boundary and invalidate them on rollback or relevant mutation. Do not re-sort the complete transaction diff on every indexed instruction.
 - [ ] **P10.12** Port the pinned revm assertion/journal tests and add combined payer/deploy/keyed-nonce/slot-restoration/atomic/assertion cases. Prove enabling or disabling inspectors never changes the assertion result.
 
 Acceptance: assertion outcome and surviving state match the selected protocol independently of debug tracing, with exact receipt, gas, and event behavior.
@@ -267,8 +267,8 @@ Owner: shared EIPs, ordinary evm2 execution, Reth environment/pool, chain deploy
 
 Files: Alloy `crates/eips/src/eip8272.rs`; evm2 `evm/env.rs`, existing `interpreter/instructions/block.rs`; Reth `ethereum/node/src/frame_validation.rs`, pool `validate/{frame_policy.rs,frame_inspector.rs}` and dependency tracking.
 
-- [ ] **P11.01** Preserve canonical verifier address/runtime/code hash, domain-separated hashes, 8,192-entry ring, 8,191 usable window, 16-reference maximum, and 72-byte tuple encoding with the published reference vector.
-- [ ] **P11.02** Execute the verifier as an ordinary deployed contract/VERIFY frame. Reuse STATICCALL/storage/gas and existing SLOTNUM; add neither a new envelope field nor a special precompile/opcode.
+- [x] **P11.01** Preserve canonical verifier address/runtime/code hash, domain-separated hashes, 8,192-entry ring, 8,191 usable window, 16-reference maximum, and 72-byte tuple encoding with the published reference vector.
+- [x] **P11.02** Execute the verifier as an ordinary deployed contract/VERIFY frame. Reuse STATICCALL/storage/gas and existing SLOTNUM; add neither a new envelope field nor a special precompile/opcode.
 - [ ] **P11.03** Propagate actual payload `slotNumber` into block execution. Pool simulation uses canonical-head slot plus one; payload inclusion revalidates using the actual payload slot, never timestamp-derived or wall-clock slot estimates.
 - [ ] **P11.04** In Reth, recognize optional expiry then optional recent-root verification before deployment/account validation. Validate shape before sender lookup; apply exact-runtime, exact-top-level-address, declared-SLOAD/SLOTNUM policy exceptions only.
 - [ ] **P11.05** Record slot/hash/first-expired-slot and code/deployment dependencies. Revalidate changes on both sides of reorgs, including removal without a replacement write, and remove metadata atomically on replacement/eviction.
@@ -282,15 +282,15 @@ Owner: evm2 JIT/interpreter. Dependencies: P04–P10. Follow `crates/jit/AGENTS.
 
 Files: `crates/jit/codegen/src/{bytecode/,compiler/mod.rs,compiler/translate/mod.rs,lib.rs}`, `builtins/src/{lib.rs,gas.rs}`, `context/src/lib.rs`, `runtime/src/{evm2_evm.rs,runtime/storage.rs}`.
 
-- [ ] **P12.01** Register new fork/opcode metadata in analysis and all interpreter dispatch forms. Classify APPROVE as a returning/halting instruction with correct stack/gas/control-flow effects, including invalid pre-fork execution.
-- [ ] **P12.02** Implement compiled translations/builtins for every frame and selected assertion opcode. Maintain identical full-width operand checks, host interaction, memory safety, gas order, and stop reasons.
-- [ ] **P12.03** Supply current frame context, payload, approvals and dynamic origin to compiled code. The same code hash must execute correctly in VERIFY, SENDER, DEFAULT and assertion contexts.
-- [ ] **P12.04** Port isolated gas and ownership hooks to compiled SSTORE/CALL/CREATE/account creation/code deposit paths. Test ordinary bytecode containing no frame opcode inside a frame transaction; it still requires frame gas semantics.
-- [ ] **P12.05** Audit cached environment pointers and field offsets in the shared execution context. Refresh correctly between top-level frames and after memory changes; preserve nested-call lifetimes.
-- [ ] **P12.06** Update cache/spec identity and bump ABI version when layouts or generated-code semantics change. Reject old persisted artifacts and test cache reuse across fork boundaries and frame modes.
-- [ ] **P12.07** Implement or explicitly constrain inspection support. Keep public-prefix execution interpreted until compiled opcode observation covers reverted calls and all policy hooks; do not count fallback as full compiled parity.
-- [ ] **P12.08** Run the same semantic corpus through `auto`, `tco`, `packed`, `single_return`, `unpacked`, JIT and AOT. Record platform-unavailable backends as untested and run them on supported CI workers.
-- [ ] **P12.09** Test cold/warm compiled caches, persisted AOT reload, approval exits, huge operands, static mode, state-only exhaustion and body rollback. Remove temporary opcode-based fallback only after these gates pass.
+- [x] **P12.01** Register new fork/opcode metadata in analysis and all interpreter dispatch forms. Classify APPROVE as a returning/halting instruction with correct stack/gas/control-flow effects, including invalid pre-fork execution.
+- [x] **P12.02** Implement compiled translations/builtins for every frame and selected assertion opcode. Maintain identical full-width operand checks, host interaction, memory safety, gas order, and stop reasons.
+- [x] **P12.03** Supply current frame context, payload, approvals and dynamic origin to compiled code. The same code hash must execute correctly in VERIFY, SENDER, DEFAULT and assertion contexts.
+- [x] **P12.04** Port isolated gas and ownership hooks to compiled SSTORE/CALL/CREATE/account creation/code deposit paths. Test ordinary bytecode containing no frame opcode inside a frame transaction; it still requires frame gas semantics.
+- [x] **P12.05** Audit cached environment pointers and field offsets in the shared execution context. Refresh correctly between top-level frames and after memory changes; preserve nested-call lifetimes.
+- [x] **P12.06** Update cache/spec identity and bump ABI version when layouts or generated-code semantics change. Reject old persisted artifacts and test cache reuse across fork boundaries and frame modes.
+- [x] **P12.07** Implement or explicitly constrain inspection support. Keep public-prefix execution interpreted until compiled opcode observation covers reverted calls and all policy hooks; do not count fallback as full compiled parity.
+- [x] **P12.08** Run the same semantic corpus through `auto`, `tco`, `packed`, `single_return`, `unpacked`, JIT and AOT. Record platform-unavailable backends as untested and run them on supported CI workers.
+- [x] **P12.09** Test cold/warm compiled caches, persisted AOT reload, approval exits, huge operands, static mode, state-only exhaustion and body rollback. Remove temporary opcode-based fallback only after these gates pass.
 
 Acceptance: compiled execution actually handles frame transactions and matches interpreter state, receipts, outputs, gas dimensions, and errors.
 
@@ -300,9 +300,9 @@ Owner: evm2 core hooks, `evm2-inspectors`, Reth trace callers. Dependencies: P05
 
 Files: `crates/evm2/src/evm/{inspector.rs,mod.rs}`; `crates/inspectors/src/tracing/{mod.rs,types.rs,builder/geth.rs,builder/parity.rs}`, JS/debug/mux tracer paths.
 
-- [ ] **P13.01** Expose frame index/mode/target and lifecycle hooks for code, precompiles, synthetic default verification, entry failure, nested calls, and execution completion.
-- [ ] **P13.02** Add the synthetic transaction root and ordered top-level frame nodes with correct depth, caller/origin, output, execution/state gas, and log attribution.
-- [ ] **P13.03** Reconcile final canonical receipts with trace nodes for skipped, early-failed, atomic-rolled-back and assertion-rolled-back frames. Final receipt attribution can change after a frame finishes.
+- [x] **P13.01** Expose frame index/mode/target and lifecycle hooks for code, precompiles, synthetic default verification, entry failure, nested calls, and execution completion.
+- [x] **P13.02** Add the synthetic transaction root and ordered top-level frame nodes with correct depth, caller/origin, output, execution/state gas, and log attribution.
+- [x] **P13.03** Reconcile final canonical receipts with trace nodes for skipped, early-failed, atomic-rolled-back and assertion-rolled-back frames. Final receipt attribution can change after a frame finishes.
 - [ ] **P13.04** Wire final-result reconciliation into every adapter/RPC trace path, not just inspector unit tests. The proposal found no production caller for the reference inspector's finalization method; verify the new path end to end.
 - [ ] **P13.05** Port Geth, parity, JS, opcode/debug and mux behavior. Keep optional debug truncation independent of consensus assertion/event data and keep admission-policy observation complete.
 - [ ] **P13.06** Add RPC-level trace tests for default VERIFY, sponsored payment, precompile entry failure, nested reverted approval, skipped atomic frames and assertion rollback; compare nodes/logs with canonical outcomes.
@@ -398,14 +398,14 @@ Owner: evm2/EEST/CLI, node integration tests. Dependencies: P00–P17; build alo
 
 Files: `crates/eest/src/{tx.rs,types.rs,forks.rs,compiled.rs,blockchaintest/}`, `crates/eest/tests/eest.rs`, `crates/cli/src/` replay/capture/fuzzer paths, fixture setup scripts, `.config/nextest.toml`, `.github/workflows/ci.yml`.
 
-- [ ] **P19.01** Add Bogota fork naming/mapping and frame fields to state/blockchain fixture parsers, including raw transaction bytes, signatures, dual gas, nonce schema and expected exceptions. Reject unsupported formats explicitly.
+- [x] **P19.01** Add Bogota fork naming/mapping and frame fields to state/blockchain fixture parsers, including raw transaction bytes, signatures, dual gas, nonce schema and expected exceptions. Reject unsupported formats explicitly.
 - [ ] **P19.02** Extend CLI replay/capture/export and fuzz transaction generation/conversion so type 6 can be reproduced and compared; remove exhaustive-match assumptions that only types 0–4 exist.
-- [ ] **P19.03** Pin revision-matched valid/invalid fixtures and golden signing/encoding vectors. Separate Bogota and newer-draft corpora; a draft vector is not evidence that the old baseline is wrong.
+- [x] **P19.03** Pin revision-matched valid/invalid fixtures and golden signing/encoding vectors. Separate Bogota and newer-draft corpora; a draft vector is not evidence that the old baseline is wrong.
 - [ ] **P19.04** Build a reproducible differential runner against the locked revm/node: compare validity/errors, surviving account/storage state, payer, ordered receipts/outputs/logs, gas/refunds/reservations and roots.
 - [ ] **P19.05** Port existing reference executor, journal, inspected-prefix, frame-adapter, provider/network, trace and Reth end-to-end tests. Link each high-risk invariant to concrete regression cases.
 - [ ] **P19.06** Add generated sequences for approvals/reverts, atomic links, nonce sets, cross-frame state restoration and assertion lifecycle. Minimize and retain any discovered mismatch as a fixed regression.
-- [ ] **P19.07** Enable interpreter, inspected, JIT and AOT discovery of the same frame corpus. Record counts, fixture SHA, skipped cases and backend availability; use full compiled subsets for qualification.
-- [ ] **P19.08** Add CI jobs that run the new corpus rather than silently inheriting the default EEST exclusion or only a compiled smoke subset. Check supported no-default-feature/serde/custom-host configurations touched by the change.
+- [x] **P19.07** Enable interpreter, inspected, JIT and AOT discovery of the same frame corpus. Record counts, fixture SHA, skipped cases and backend availability; use full compiled subsets for qualification.
+- [x] **P19.08** Add CI jobs that run the new corpus rather than silently inheriting the default EEST exclusion or only a compiled smoke subset. Check supported no-default-feature/serde/custom-host configurations touched by the change.
 
 Acceptance: reproducible failures identify the exact protocol revision, fixture, execution backend and differing consensus data.
 
@@ -413,14 +413,14 @@ Acceptance: reproducible failures identify the exact protocol revision, fixture,
 
 Owner: all components. Dependencies: P00–P19; P18 parallel items only for a parallel-support claim.
 
-- [ ] **P20.01** Run formatting, workspace lint/docs, targeted unit/integration suites, all interpreter dispatch variants and actual JIT/AOT execution on supported platforms. Record unavailable platforms/backends as outstanding work.
+- [x] **P20.01** Run formatting, workspace lint/docs, targeted unit/integration suites, all interpreter dispatch variants and actual JIT/AOT execution on supported platforms. Record unavailable platforms/backends as outstanding work.
 - [ ] **P20.02** Run full revision-matched frame EEST state/blockchain suites and compare with the pinned baseline. Explain every skip; parser rejection or interpreter fallback cannot masquerade as compiled conformance.
 - [ ] **P20.03** Run Hive/devnet block import and payload production across clients. Compare invalid-block rejection, roots, receipts, fee/block gas, blobs, slots, and first-error ordering.
 - [ ] **P20.04** Prove public admission/mining, private consensus-valid policy failures, reorg/revalidation, sponsorship, keyed nonces, assertions and recent roots through RPC and persisted node state.
 - [ ] **P20.05** Run ordinary-transaction regression suites through Amsterdam and older forks; measure ordinary execution and diff-query/allocation overhead for changed hot paths. Avoid adding frame costs when frame support is inactive.
 - [ ] **P20.06** Review simulation flag isolation, placeholder rejection, fatal database propagation, whole-transaction cleanup, and no stale runtime after dropped/discarded/error handles.
 - [ ] **P20.07** Remove obsolete VM/inspector patches only after migrated consumers pass; retain shared protocol-type patches until upstream versions contain them. Publish final dependency/fork/fixture pins and known limits.
-- [ ] **P20.08** Attach qualification evidence to each component change: commands, revisions, counts, results, root/gas comparisons, serial/parallel scope, and remaining exceptions. Leave any unproven acceptance checkbox open.
+- [x] **P20.08** Attach qualification evidence to each component change: commands, revisions, counts, results, root/gas comparisons, serial/parallel scope, and remaining exceptions. Leave any unproven acceptance checkbox open.
 
 Useful verification commands after implementation exists (these were not run for this planning document):
 
@@ -485,7 +485,7 @@ These are change packages, not calendar estimates. Keep fixes for each new behav
 | 12 | Ordered BAL parallel enablement | Remaining P18, separately qualified |
 | Optional protocol update | Newer-draft signing/nonces/assertions | P21 with revised manifest and qualification |
 
-First concrete implementation deliverable: P00 manifest plus P01 golden vectors and P02 native result/API contracts. Gas/rollback architecture should be reviewed before building downstream node conversions around it.
+The initial landing order above remains the review guide. The local native engine implementation and evidence are now available in the implementation review; shared external suites and downstream adapter/node conversions still have unchecked acceptance work.
 
 ## Evidence and references
 
@@ -497,4 +497,4 @@ First concrete implementation deliverable: P00 manifest plus P01 golden vectors 
 - [Pinned nonce helpers](https://github.com/Soubhik-10/eips/blob/921ddebb486507d74808239b51e180e7600196d1/crates/eip8141/src/nonce.rs) and [shared constants](https://github.com/Soubhik-10/eips/blob/921ddebb486507d74808239b51e180e7600196d1/crates/eip8141/src/constants.rs): legacy `[0]`, sorted key limits, hashing and protocol constants were inspected directly.
 - [Newer-draft EIP snapshot](https://github.com/ethereum/EIPs/tree/46005d745a5d921702f12d64a1b85e712e2b6051/EIPS): EIP-8141/8250/8272/7906 revision cited by the proposal; used here for the separately identified update scope.
 
-Verification performed for this task: checkout/remote/commit and proposal-base checks, source inspection, and checklist/path validation. No Rust implementation, compilation, unit tests, EEST, Hive or devnet runs were performed.
+The original planning commit performed source/checklist validation only. Current implementation and executed verification are recorded in [frame-transactions-implementation-review.md](frame-transactions-implementation-review.md). Hive/devnet and migrated-node qualification remain open.

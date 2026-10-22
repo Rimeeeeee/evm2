@@ -2,7 +2,7 @@
 
 pub(crate) mod env;
 mod error;
-mod execute;
+pub(crate) mod execute;
 mod hook;
 mod runner;
 mod types;

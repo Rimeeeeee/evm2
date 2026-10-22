@@ -1090,6 +1090,50 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
                 goto_return!(no_branch);
             }
 
+            op::APPROVE => {
+                let sp = self.sp_after_inputs();
+                self.sync_diverging_stack_effect();
+                self.call_fallible_builtin(Builtin::Approve, &[self.ecx, sp]);
+                self.bcx.unreachable();
+                goto_return!(no_branch);
+            }
+            op::TXPARAM => {
+                let sp = self.sp_after_inputs();
+                self.call_fallible_builtin(Builtin::Txparam, &[self.ecx, sp]);
+            }
+            op::FRAMEDATALOAD => {
+                let sp = self.sp_after_inputs();
+                self.call_fallible_builtin(Builtin::Framedataload, &[self.ecx, sp]);
+            }
+            op::FRAMEDATACOPY => {
+                let sp = self.sp_after_inputs();
+                self.call_fallible_builtin(Builtin::Framedatacopy, &[self.ecx, sp]);
+            }
+            op::FRAMEPARAM => {
+                let sp = self.sp_after_inputs();
+                self.call_fallible_builtin(Builtin::Frameparam, &[self.ecx, sp]);
+            }
+            op::SIGPARAM => {
+                let sp = self.sp_after_inputs();
+                self.call_fallible_builtin(Builtin::Sigparam, &[self.ecx, sp]);
+            }
+            op::SIGDATACOPY => {
+                let sp = self.sp_after_inputs();
+                self.call_fallible_builtin(Builtin::Sigdatacopy, &[self.ecx, sp]);
+            }
+            op::TXTRACE => {
+                let sp = self.sp_after_inputs();
+                self.call_fallible_builtin(Builtin::Txtrace, &[self.ecx, sp]);
+            }
+            op::TXDIFF => {
+                let sp = self.sp_after_inputs();
+                self.call_fallible_builtin(Builtin::Txdiff, &[self.ecx, sp]);
+            }
+            op::EVENTDATACOPY => {
+                let sp = self.sp_after_inputs();
+                self.call_fallible_builtin(Builtin::Eventdatacopy, &[self.ecx, sp]);
+            }
+
             _ => unreachable!("unimplemented instruction: {data:?}"),
         }
 

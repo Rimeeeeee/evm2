@@ -82,8 +82,15 @@ pub struct AccountInfo {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransactionParts {
+    /// Ordered frame payload from the official Bogota fixture format.
+    pub frames: Option<Vec<crate::tx::TestFrame>>,
+    /// Frame protocol signatures and witnesses.
+    #[serde(default)]
+    pub signatures: Vec<crate::tx::TestFrameSignature>,
+    /// Optional EIP-8250 nonce keys.
+    pub nonce_keys: Option<Vec<U256>>,
     /// Explicit transaction type.
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default, deserialize_with = "deserialize_transaction_type")]
     pub tx_type: Option<u8>,
     /// Explicit transaction chain id. When present it overrides the environment chain id, so a
     /// fixture can model a transaction whose chain id differs from the network's (expected to be
@@ -181,6 +188,8 @@ pub enum SpecName {
     Osaka,
     /// Amsterdam.
     Amsterdam,
+    /// Bogota devnet 1.
+    Bogota,
 }
 
 impl SpecName {
@@ -207,6 +216,7 @@ impl SpecName {
             Self::Prague => Some(SpecId::PRAGUE),
             Self::Osaka => Some(SpecId::OSAKA),
             Self::Amsterdam => Some(SpecId::AMSTERDAM),
+            Self::Bogota => Some(SpecId::BOGOTA),
             // Skip Constantinople due to the pre-Petersburg reentrancy bug.
             Self::Constantinople => None,
         }
@@ -287,6 +297,16 @@ where
             _ => serde_json::from_value(value).map_err(de::Error::custom),
         })
         .collect()
+}
+
+fn deserialize_transaction_type<'de, D>(deserializer: D) -> Result<Option<u8>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<U256>::deserialize(deserializer)?
+        .map(u8::try_from)
+        .transpose()
+        .map_err(de::Error::custom)
 }
 
 #[cfg(test)]

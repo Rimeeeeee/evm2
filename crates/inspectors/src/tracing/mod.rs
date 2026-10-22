@@ -12,7 +12,8 @@ use crate::{
     },
 };
 use alloc::{boxed::Box, vec::Vec};
-use alloy_consensus::{Transaction, transaction::Recovered};
+use alloy_consensus::{Transaction, TxEip8141, transaction::Recovered};
+use alloy_eips::eip8141::{ENTRY_POINT, Frame, FrameMode, FrameReceipt, FrameStatus};
 use alloy_primitives::{Address, B256, Bytes, Log, TxKind, U256};
 use alloy_rpc_types_trace::parity::StorageDelta;
 use core::{mem, ops::Range};
@@ -113,10 +114,19 @@ pub struct TracingInspector {
     ///
     /// This is filled during execution.
     features: EvmFeatures,
+    /// Active frame-transaction trace bookkeeping.
+    frame_transaction: Option<FrameTracing>,
     /// Pool of reusable _empty_ step vectors to reduce allocations.
     ///
     /// All `Vec<CallTraceStep>` are always empty but may have capacity.
     reusable_step_vecs: Vec<Vec<CallTraceStep>>,
+}
+
+#[derive(Clone, Debug)]
+struct FrameTracing {
+    payload: TxEip8141,
+    active: usize,
+    nodes: Vec<Option<usize>>,
 }
 
 impl TracingInspector {
@@ -156,6 +166,7 @@ impl TracingInspector {
             last_journal_len,
             spec_id,
             features,
+            frame_transaction,
             // kept
             config,
             budget,
@@ -173,6 +184,7 @@ impl TracingInspector {
             }
         }
 
+        *frame_transaction = None;
         traces.clear();
         trace_stack.clear();
         *log_count = 0;
@@ -387,6 +399,11 @@ impl TracingInspector {
         gas_limit: u64,
         maybe_precompile: Option<bool>,
     ) {
+        let frame_index = self
+            .frame_transaction
+            .as_ref()
+            .and_then(|frames| (depth == 0).then_some(frames.active));
+        let depth = depth + usize::from(self.frame_transaction.is_some());
         // This will only be true if the inspector is configured to exclude precompiles and the call
         // is to a precompile
         let push_kind = if maybe_precompile.unwrap_or(false) {
@@ -419,6 +436,9 @@ impl TracingInspector {
                 ..Default::default()
             },
         );
+        if let Some(index) = frame_index {
+            self.frame_transaction.as_mut().unwrap().nodes[index] = Some(trace_idx);
+        }
         self.trace_stack.push(TraceStackEntry { trace_idx, log_count: self.log_count });
     }
 
@@ -729,6 +749,101 @@ impl TracingInspector {
 }
 
 impl<T: EvmTypes> Inspector<T> for TracingInspector {
+    fn frame_transaction_start(&mut self, tx: &TxEip8141, host: &mut T::Host<'_>) {
+        self.frame_transaction = Some(FrameTracing {
+            payload: tx.clone(),
+            active: 0,
+            nodes: alloc::vec![None; tx.frames.len()],
+        });
+        self.spec_id = Some(host.spec_id());
+        self.features = host.version().features;
+        self.traces.arena[0].trace = CallTrace {
+            address: ENTRY_POINT,
+            caller: tx.sender,
+            gas_limit: evm2::ethereum::eip8141::FrameGas::calculate(tx, host.version())
+                .expect("prepared frame gas")
+                .maximum,
+            ..Default::default()
+        };
+    }
+
+    fn frame_start(&mut self, index: usize, _frame: &Frame, _host: &mut T::Host<'_>) {
+        self.frame_transaction.as_mut().unwrap().active = index;
+    }
+
+    fn frame_end(
+        &mut self,
+        index: usize,
+        receipt: &FrameReceipt,
+        output: &Bytes,
+        stop: InstrStop,
+        _host: &mut T::Host<'_>,
+    ) {
+        let frames = self.frame_transaction.as_mut().unwrap();
+        frames.active = index;
+        let frame = frames.payload.frames[index].clone();
+        let sender = frames.payload.sender;
+        let node = if let Some(node) = frames.nodes[index] {
+            node
+        } else {
+            self.start_trace_on_call(
+                0,
+                frame.resolved_target(sender),
+                frame.data.clone(),
+                frame.value,
+                if matches!(frame.mode, FrameMode::Verify | FrameMode::PostTx) {
+                    CallKind::StaticCall
+                } else {
+                    CallKind::Call
+                },
+                if frame.mode == FrameMode::Sender { sender } else { ENTRY_POINT },
+                frame.limits.execution,
+                None,
+            );
+            self.pop_trace().trace_idx
+        };
+        let trace = &mut self.traces.arena[node].trace;
+        trace.frame_index = Some(index);
+        trace.frame_mode = Some(frame.mode.into());
+        trace.gas_limit = frame.limits.execution;
+        trace.gas_used = receipt.gas_used.execution;
+        trace.state_gas_used = receipt.gas_used.state;
+        trace.output = output.clone();
+        trace.status = Some(stop);
+        trace.success = receipt.status == FrameStatus::Success;
+        trace.skipped = receipt.status == FrameStatus::SkippedAtomicBatch;
+    }
+
+    fn frame_transaction_end(&mut self, result: &evm2::TxResult<T>, _host: &mut T::Host<'_>) {
+        let outcome = result.frame.as_ref().expect("native frame outcome");
+        let frames = self.frame_transaction.as_ref().unwrap();
+        for (index, receipt) in outcome.receipts.iter().enumerate() {
+            let node = frames.nodes[index].expect("every frame has a trace node");
+            let end = frames.nodes[index + 1..]
+                .iter()
+                .flatten()
+                .next()
+                .copied()
+                .unwrap_or(self.traces.arena.len());
+            let trace = &mut self.traces.arena[node].trace;
+            trace.state_gas_used = receipt.gas_used.state;
+            trace.gas_used = receipt.gas_used.execution;
+            trace.output = outcome.outputs[index].clone();
+            trace.rolled_back = outcome.rolled_back[index];
+            if trace.rolled_back {
+                for child in &mut self.traces.arena[node..end] {
+                    child.logs.clear();
+                    child.ordering.retain(|member| !matches!(member, TraceMemberOrder::Log(_)));
+                }
+            }
+        }
+        let root = &mut self.traces.arena[0].trace;
+        root.gas_used = result.tx_gas_used();
+        root.state_gas_used = result.state_gas_spent;
+        root.success = result.status;
+        root.status = Some(result.stop);
+    }
+
     #[inline]
     fn initialize_interp(&mut self, interp: &mut Interpreter<'_, '_, T>) {
         if self.spec_id.is_none() {

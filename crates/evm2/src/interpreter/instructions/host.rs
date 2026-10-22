@@ -72,12 +72,14 @@ pub fn sstore(cx: _, [key, value]: [Word]) -> Result {
     // new != 0) also consumes state gas from the reservoir before spilling into
     // execution gas.
     if cx.state.feature(EvmFeatures::EIP8037) {
-        cx.gas.spend_state(cx.state.gas_params().sstore_state_gas(&state_load))?;
+        let charged = cx.state.gas_params().sstore_state_gas(&state_load);
+        cx.gas.spend_state(charged)?;
 
         // EIP-8037: a 0→x→0 storage restoration returns the state gas charged for
         // the initial 0→x transition directly to the reservoir, rather than
         // routing it through the capped refund counter below.
         let refill = cx.state.gas_params().sstore_state_gas_refill(&state_load);
+        let refill = cx.state.host().frame_sstore_gas(*destination, *key, charged, refill);
         cx.gas.refill_reservoir(refill);
     }
 

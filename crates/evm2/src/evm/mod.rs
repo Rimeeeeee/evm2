@@ -171,7 +171,10 @@ pub use db::{
 };
 
 mod tx;
-pub use tx::{ExecutedTx, TxResult, TxResultExt, TxResultWithState};
+pub use tx::{ExecutedTx, FrameTransactionResult, TxResult, TxResultExt, TxResultWithState};
+
+pub(crate) mod frame;
+mod frame_diff;
 
 mod state;
 #[cfg(feature = "account-ext")]
@@ -235,6 +238,7 @@ pub struct Evm<'a, T: EvmTypesHost> {
     #[derive_where(skip)]
     async_stack: r#async::FiberStack,
     evm_send: bool,
+    pub(crate) frame_tx: Option<frame::FrameTransactionRuntime>,
 }
 
 impl<'a, T: EvmTypes> Evm<'a, T> {
@@ -353,6 +357,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
             #[cfg(feature = "async")]
             async_stack: r#async::FiberStack::default(),
             evm_send: false,
+            frame_tx: None,
         }
     }
 
@@ -815,7 +820,9 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     /// Precompiles and handlers that emit logs should check this before building them.
     #[inline]
     pub const fn logs_observed(&self) -> bool {
-        self.feature(EvmFeatures::LOG_COLLECTION) || self.inspector.is_some()
+        self.feature(EvmFeatures::LOG_COLLECTION)
+            || self.inspector.is_some()
+            || self.frame_tx.is_some()
     }
 
     /// Notifies the inspector and records an emitted log if [`EvmFeatures::LOG_COLLECTION`] is
@@ -823,7 +830,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     #[inline]
     pub fn log(&mut self, log: Log) {
         self.inspect_log(&log);
-        if self.feature(EvmFeatures::LOG_COLLECTION) {
+        if self.feature(EvmFeatures::LOG_COLLECTION) || self.frame_tx.is_some() {
             self.state.log(log);
         }
     }
@@ -907,6 +914,24 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         self.interpreter_runner.take()
     }
 
+    /// Invokes a frame lifecycle hook while preventing inspector mutation.
+    pub(crate) fn inspect_frame(&mut self, f: impl FnOnce(&mut dyn Inspector<T>, &mut Self)) {
+        let guard = self.enter_execution();
+        if let Some(inspector) = guard.evm.inspector.as_deref_mut() {
+            // SAFETY: the execution guard prevents replacing the boxed inspector.
+            let inspector = unsafe { &mut *(inspector as *mut dyn Inspector<T>) };
+            f(inspector, guard.evm);
+        }
+    }
+
+    /// Runs executable-prefix validation with the normal execution mutation guard.
+    pub(crate) fn simulate_frames<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        assert!(!self.running, "prefix validation cannot interrupt active execution");
+        let runner = self.interpreter_runner.take();
+        let guard = FrameSimulationGuard { execution: self.enter_execution(), runner };
+        f(guard.execution.evm)
+    }
+
     /// Returns the active EVM version.
     #[inline]
     pub const fn version(&self) -> &crate::Version {
@@ -941,6 +966,26 @@ impl<'guard, 'evm, T: EvmTypesHost> Drop for ExecutionGuard<'guard, 'evm, T> {
     #[inline]
     fn drop(&mut self) {
         self.evm.running = self.was_running;
+        if !self.was_running && self.evm.frame_tx.is_some() {
+            self.evm.frame_tx = None;
+            self.evm.current_frame = None;
+            self.evm.state.clear_transaction_state();
+        }
+    }
+}
+
+struct FrameSimulationGuard<'guard, 'evm, T: EvmTypesHost> {
+    execution: ExecutionGuard<'guard, 'evm, T>,
+    runner: Option<Arc<dyn InterpreterRunner<T>>>,
+}
+
+impl<T: EvmTypesHost> Drop for FrameSimulationGuard<'_, '_, T> {
+    fn drop(&mut self) {
+        let evm = &mut self.execution.evm;
+        evm.interpreter_runner = self.runner.take();
+        evm.frame_tx = None;
+        evm.current_frame = None;
+        evm.state.clear_transaction_state();
     }
 }
 
@@ -987,6 +1032,7 @@ impl<'a, T: EvmTypes<Tx: Typed2718>> Evm<'a, T> {
             Ok(result) => self.finish_executed_tx(result),
             Err(err) => {
                 self.state.clear_transaction_state();
+                self.frame_tx = None;
                 Err(err)
             }
         }
@@ -1009,10 +1055,13 @@ impl<'a, T: EvmTypes<Tx: Typed2718>> Evm<'a, T> {
     /// responsibility.
     ///
     /// Uses the active validation rules; callers must configure any pool-specific relaxations.
+    /// For frame transactions this checks preparation only. Executable payment/approval
+    /// validation requires the Ethereum type family's `validate_frame_prefix()`.
     pub fn validate_tx(&mut self, tx: &Recovered<T::Tx>) -> HandlerResult<()> {
         let result =
             self.registry.try_get_by_type(tx.ty()).and_then(|handler| handler.validate(tx, self));
         self.state.clear_transaction_state();
+        self.frame_tx = None;
         result
     }
 
@@ -1095,6 +1144,9 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         tx_env: &TxEnv<T>,
         message: &mut Message<T>,
     ) -> Result<MessageResult<T>, ExecutionError> {
+        if let Some(result) = self.execute_default_frame(message)? {
+            return Ok(result);
+        }
         let mut result = match message.kind {
             MessageKind::Create | MessageKind::Create2 => {
                 self.execute_create_message(tx_env, message)
@@ -1395,6 +1447,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     ) -> Result<MessageResult<T>, ExecutionError> {
         let mut gas =
             GasTracker::new_with_execution_gas_and_reservoir(message.gas_limit, message.reservoir);
+        gas.set_isolated_state(self.frame_tx.is_some());
         let execution = self.execute_precompile(message, &mut gas);
         let (stop, output) = match execution {
             Ok(_) | Err(PrecompileError::Revert(_)) if gas.remaining() > message.gas_limit => {
@@ -1654,15 +1707,84 @@ impl<'a, T: EvmTypes> Host<T> for Evm<'a, T> {
         message: &mut Message<T>,
     ) -> Result<MessageResult<T>, ExecutionError> {
         let checkpoint = self.state.checkpoint();
+        if let Some(rt) = &mut self.frame_tx {
+            rt.enter_scope();
+        }
         let result = if self.inspector.is_some() {
             self.execute_message_inspected(tx_env, message)
         } else {
             self.execute_message_impl(tx_env, message)
         };
-        if result.is_err() {
+        if let Some(rt) = &mut self.frame_tx {
+            let success = result.as_ref().is_ok_and(|r| r.stop.is_success());
+            rt.exit_scope(success);
+            if !success {
+                self.state.rollback(checkpoint, self.features);
+            }
+        } else if result.is_err() {
             self.state.rollback(checkpoint, self.features);
         }
         result
+    }
+
+    fn frame_transaction_active(&self) -> bool {
+        self.frame_tx.is_some()
+    }
+    fn frame_tx_param(&self, param: Word, state_left: u64) -> Option<Word> {
+        self.frame_tx.as_ref()?.tx_param(param, state_left)
+    }
+    fn frame_data(&self, index: Word) -> Option<Bytes> {
+        self.frame_tx
+            .as_ref()?
+            .payload
+            .frames
+            .get(usize::try_from(index).ok()?)
+            .map(|f| f.data.clone())
+    }
+    fn frame_param(&self, index: Word, param: Word) -> Option<Word> {
+        self.frame_tx.as_ref()?.param(index, param)
+    }
+    fn frame_signature_param(&self, index: Word, param: Word) -> Option<Word> {
+        self.frame_tx.as_ref()?.signature_param(index, param)
+    }
+    fn frame_signature_bytes(&self, index: Word) -> Option<Bytes> {
+        let sig = self.frame_tx.as_ref()?.payload.signatures.get(usize::try_from(index).ok()?)?;
+        (sig.scheme == alloy_eips::eip8141::SignatureScheme::Arbitrary)
+            .then(|| sig.signature.clone())
+    }
+    fn is_post_tx_frame(&self) -> bool {
+        self.frame_tx.as_ref().is_some_and(|rt| rt.is_post_tx())
+    }
+    fn approve_frame(
+        &mut self,
+        address: Address,
+        scope: Word,
+        state_left: u64,
+    ) -> Result<u64, HostError> {
+        self.apply_frame_approval(address, scope, state_left)
+    }
+    fn frame_sstore_gas(&mut self, address: Address, key: Word, charge: u64, refill: u64) -> u64 {
+        if let Some(rt) = &mut self.frame_tx {
+            rt.record_sstore_state_gas(address, key, charge);
+            rt.refill_sstore_state_gas(address, key, refill)
+        } else {
+            refill
+        }
+    }
+    fn txtrace(&mut self, param: Word, index: Word) -> Option<Word> {
+        self.frame_trace_value(param, index)
+    }
+    fn txdiff(
+        &mut self,
+        param: Word,
+        in2: Word,
+        in3: Word,
+        skip: bool,
+    ) -> Result<(Word, bool), HostError> {
+        self.frame_diff_value(param, in2, in3, skip)
+    }
+    fn event_data(&self, index: Word) -> Option<Bytes> {
+        self.frame_event_data(index)
     }
 
     fn selfdestruct(

@@ -1,4 +1,8 @@
 use crate::{binary, blockchaintest::BlockchainTest};
+use alloy_primitives::Bytes;
+use alloy_rlp::{Header, PayloadView};
+use serde::de::DeserializeOwned;
+use serde_json::{Value, json};
 use std::{
     fs::{self, File},
     io::{self, BufWriter, Read, Write},
@@ -59,7 +63,7 @@ pub fn read_blockchain(path: &Path) -> Result<BlockchainTest, FixtureReadError> 
         Ok(binary::from_bytes(&bytes)?)
     } else {
         let input = read_to_string(path)?;
-        Ok(serde_json::from_str(&input)?)
+        Ok(parse_json(&input)?)
     }
 }
 
@@ -117,4 +121,93 @@ fn stem_has_extension(path: &Path, extension: &str) -> bool {
     path.file_stem().is_some_and(|stem| {
         Path::new(stem).extension().is_some_and(|candidate| candidate == extension)
     })
+}
+
+/// Reads canonical frame bytes instead of the fixture's explanatory transaction metadata.
+/// Invalid fixtures deliberately contain values outside Rust's integer/address types. Keeping
+/// their wire payload authoritative lets the actual decoder reject them without narrowing them.
+pub(crate) fn parse_json<T: DeserializeOwned>(input: &str) -> Result<T, serde_json::Error> {
+    let mut value: Value = serde_json::from_str(input)?;
+    if let Some(cases) = value.as_object_mut() {
+        for case in cases.values_mut() {
+            if let Some(posts) = case.get("post").and_then(Value::as_object) {
+                let posts =
+                    posts.values().filter_map(Value::as_array).flatten().collect::<Vec<_>>();
+                if !posts.is_empty()
+                    && posts.iter().all(|post| {
+                        post.get("txbytes")
+                            .and_then(Value::as_str)
+                            .is_some_and(|s| s.starts_with("0x06"))
+                    })
+                {
+                    case["transaction"] = json!({
+                        "data": ["0x"], "gasLimit": ["0x0"], "nonce": "0x0", "value": ["0x0"]
+                    });
+                }
+            }
+            if let Some(blocks) = case.get_mut("blocks").and_then(Value::as_array_mut) {
+                for block in blocks {
+                    let wire = block
+                        .get("rlp")
+                        .and_then(Value::as_str)
+                        .and_then(|s| s.parse::<Bytes>().ok())
+                        .and_then(|bytes| block_transaction_bytes(&bytes).ok());
+                    for field in ["transactions", "rlp_decoded"] {
+                        let transactions = if field == "transactions" {
+                            block.get_mut(field)
+                        } else {
+                            block.get_mut(field).and_then(|decoded| decoded.get_mut("transactions"))
+                        };
+                        if let Some(transactions) = transactions.and_then(Value::as_array_mut) {
+                            for (index, transaction) in transactions.iter_mut().enumerate() {
+                                let bytes =
+                                    wire.as_ref().and_then(|txs| txs.get(index)).cloned().or_else(
+                                        || {
+                                            transaction.get("txbytes").cloned().and_then(|v| {
+                                                serde_json::from_value::<Bytes>(v).ok()
+                                            })
+                                        },
+                                    );
+                                if let Some(bytes) = bytes.filter(|bytes| bytes.first() == Some(&6))
+                                {
+                                    *transaction = json!({
+                                        "txbytes": bytes, "type": "0x6", "data": "0x", "gasLimit": "0x0",
+                                        "nonce": "0x0", "r": "0x0", "s": "0x0", "v": "0x0", "value": "0x0"
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    serde_json::from_value(value)
+}
+
+/// Extracts transaction wire bytes from the block body, without accepting network wrappers.
+pub(crate) fn block_transaction_bytes(bytes: &[u8]) -> Result<Vec<Bytes>, alloy_rlp::Error> {
+    let mut input = bytes;
+    let PayloadView::List(fields) = Header::decode_raw(&mut input)? else {
+        return Err(alloy_rlp::Error::UnexpectedString);
+    };
+    if !input.is_empty() {
+        return Err(alloy_rlp::Error::Custom("trailing block bytes"));
+    }
+    let mut transactions = *fields.get(1).ok_or(alloy_rlp::Error::InputTooShort)?;
+    let PayloadView::List(transactions) = Header::decode_raw(&mut transactions)? else {
+        return Err(alloy_rlp::Error::UnexpectedString);
+    };
+    transactions
+        .into_iter()
+        .map(|bytes| {
+            let mut payload = bytes;
+            let header = Header::decode(&mut payload)?;
+            Ok(Bytes::copy_from_slice(if header.list {
+                bytes
+            } else {
+                &payload[..header.payload_length]
+            }))
+        })
+        .collect()
 }

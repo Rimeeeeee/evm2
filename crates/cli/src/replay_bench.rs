@@ -241,6 +241,10 @@ impl ReplayFixture {
         assert_canonical(&name, &case);
         let spec = fork_to_spec_id(case.network);
         assert!(spec.enables(SpecId::MERGE), "replay corpus must be post-merge");
+        assert!(
+            spec < SpecId::BOGOTA,
+            "the CLI's upstream revm comparison does not implement Bogota; use validation/frame-oracle for the pinned frame reference"
+        );
         Self { name: name.clone(), spec, suite: BlockchainTest([(name, case)].into()) }
     }
 
@@ -591,6 +595,7 @@ fn fork_to_spec_id(fork: ForkSpec) -> SpecId {
         ForkSpec::Prague => SpecId::PRAGUE,
         ForkSpec::Osaka => SpecId::OSAKA,
         ForkSpec::Amsterdam => SpecId::AMSTERDAM,
+        ForkSpec::Bogota => SpecId::BOGOTA,
         other => panic!("replay fixture fork {other:?} is not supported"),
     }
 }

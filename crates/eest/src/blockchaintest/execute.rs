@@ -20,7 +20,10 @@ use crate::{
     forks::is_fork_skipped,
     state::{insert_account_with_storage, parse_bytecode},
     trace::{self, Eip3155Tracer},
-    tx::{TxFields, build_recovered_tx, rpc_access_list, signed_authorizations},
+    tx::{
+        TxFields, build_recovered_tx, build_recovered_tx_bytes, rpc_access_list,
+        signed_authorizations,
+    },
 };
 use alloy_consensus::{Eip658Value, Receipt, ReceiptEnvelope, Transaction as _, TxType};
 use alloy_eip7928::{BlockAccessList, validate_block_access_list};
@@ -154,7 +157,7 @@ pub fn execute_str(
     hook: &mut dyn Hook,
 ) -> Result<ExecuteSummary, TestError> {
     let suite: BlockchainTest =
-        serde_json::from_str(input).map_err(|err| TestError::unknown(path, err.into()))?;
+        fixture_io::parse_json(input).map_err(|err| TestError::unknown(path, err.into()))?;
     execute_suite(path, &suite, config, test_filter, hook)
 }
 
@@ -199,7 +202,7 @@ pub fn execute_case_on(
     execute_case(path, name, test_case, database, config, hook, &resources)
 }
 
-fn execute_suite_with_resources(
+pub(crate) fn execute_suite_with_resources(
     path: &Path,
     suite: &BlockchainTest,
     config: ExecuteConfig,
@@ -225,6 +228,7 @@ fn execute_suite_with_resources(
         outcome?;
         summary.executed += 1;
     }
+    resources.verify_backend().map_err(|error| TestError::unknown(path, error.into()))?;
     Ok(summary)
 }
 
@@ -277,6 +281,17 @@ fn execute_case(
     hook.case_started(CaseStarted { name, total_blocks, network: test_case.network });
 
     for (block_index, block) in test_case.blocks.iter().enumerate() {
+        let spec = if test_case.network == ForkSpec::AmsterdamToBogotaAtTime15k {
+            if block_header(block).map_or(block_env.timestamp, |header| header.timestamp)
+                >= U256::from(15_000)
+            {
+                SpecId::BOGOTA
+            } else {
+                SpecId::AMSTERDAM
+            }
+        } else {
+            spec
+        };
         let block_number = block_number(block);
         let block_gas_used = block_gas_used(block);
         let total_transactions = block_transactions(block).len();
@@ -491,6 +506,21 @@ fn execute_block(
         }
 
         let transactions = block_transactions(block);
+        let wire_transactions = if block.rlp.is_empty() {
+            None
+        } else {
+            match fixture_io::block_transaction_bytes(&block.rlp) {
+                Ok(wire) if wire.len() == transactions.len() => Some(wire),
+                _ if should_fail => return Ok(BlockResolution::Discard),
+                _ => {
+                    return Err(TestError::case(
+                        path,
+                        name,
+                        TestErrorKind::UnexpectedFailure("invalid block transaction RLP".into()),
+                    ));
+                }
+            }
+        };
         // EIP-8037: track execution and state gas separately for the block-header gas check.
         let mut cumulative_tx_gas_used = 0u64;
         let mut block_execution_gas_used = 0u64;
@@ -504,7 +534,12 @@ fn execute_block(
                 transaction_index,
                 total_transactions,
             });
-            let tx = match build_tx(raw_tx) {
+            let built = if let Some(wire) = &wire_transactions {
+                build_recovered_tx_bytes(&wire[transaction_index]).map_err(Into::into)
+            } else {
+                build_tx(raw_tx)
+            };
+            let tx = match built {
                 Ok(tx) => tx,
                 Err(_err) if should_fail => {
                     return Ok(BlockResolution::Discard);
@@ -534,8 +569,27 @@ fn execute_block(
                 let execution_gas_available =
                     block_gas_limit.saturating_sub(block_execution_gas_used);
                 let state_gas_available = block_gas_limit.saturating_sub(block_state_gas_used);
-                if tx_gas_limit.min(evm.version().tx_gas_limit_cap) > execution_gas_available
-                    || tx_gas_limit > state_gas_available
+                let (execution_reservation, state_reservation) = if let Some(frame) =
+                    tx.inner().as_eip8141()
+                {
+                    let gas =
+                        match evm2::ethereum::eip8141::FrameGas::calculate(frame, evm.version()) {
+                            Ok(gas) => gas,
+                            Err(_) if should_fail => return Ok(BlockResolution::Discard),
+                            Err(error) => {
+                                return Err(TestError::case(
+                                    path,
+                                    name,
+                                    TestErrorKind::UnexpectedFailure(error.to_string()),
+                                ));
+                            }
+                        };
+                    (gas.execution, gas.state)
+                } else {
+                    (tx_gas_limit.min(evm.version().tx_gas_limit_cap), tx_gas_limit)
+                };
+                if execution_reservation > execution_gas_available
+                    || state_reservation > state_gas_available
                 {
                     if should_fail {
                         return Ok(BlockResolution::Discard);
@@ -586,15 +640,24 @@ fn execute_block(
                             post_state.commit_source(&block_state);
                             Eip658Value::PostState(state_root_from_database(&post_state))
                         };
-                        let receipt = Receipt {
-                            status,
-                            cumulative_gas_used: cumulative_tx_gas_used,
-                            logs: result.logs,
-                        }
-                        .with_bloom();
-                        let tx_type = TxType::try_from(tx.inner().ty())
-                            .expect("executor only builds supported Ethereum transaction types");
-                        receipts.push(ReceiptEnvelope::from_typed(tx_type, receipt));
+                        let receipt = if let Some(frame) = result.frame {
+                            ReceiptEnvelope::Eip8141(
+                                frame.into_receipt(cumulative_tx_gas_used).into(),
+                            )
+                        } else {
+                            let receipt = Receipt {
+                                status,
+                                cumulative_gas_used: cumulative_tx_gas_used,
+                                logs: result.logs,
+                            }
+                            .with_bloom();
+                            let tx_type = TxType::try_from(tx.inner().ty()).expect(
+                                "executor only builds supported Ethereum transaction types",
+                            );
+                            ReceiptEnvelope::from_typed(tx_type, receipt)
+                                .expect("ordinary result has an ordinary receipt")
+                        };
+                        receipts.push(receipt);
                     }
                 }
                 Err(err) if should_fail => {
@@ -1058,6 +1121,9 @@ fn blob_params_for_timestamp(timestamp: U256, spec: SpecId) -> BlobParams {
 }
 
 fn build_tx(raw: &Transaction) -> Result<RecoveredTxEnvelope, TestErrorKind> {
+    if let Some(bytes) = &raw.txbytes {
+        return Ok(build_recovered_tx_bytes(bytes)?);
+    }
     let caller = raw.sender.ok_or(TestErrorKind::MissingSender)?;
     let gas_limit = raw.gas_limit.try_into().map_err(|_| TestErrorKind::Overflow("gasLimit"))?;
     let nonce = raw.nonce.try_into().map_err(|_| TestErrorKind::Overflow("nonce"))?;
@@ -1078,6 +1144,9 @@ fn build_tx(raw: &Transaction) -> Result<RecoveredTxEnvelope, TestErrorKind> {
         authorization_list: signed_authorizations(raw.authorization_list.as_deref())?,
         blob_versioned_hashes: raw.blob_versioned_hashes.clone(),
         max_fee_per_blob_gas: raw.max_fee_per_blob_gas,
+        frames: raw.frames.clone(),
+        signatures: raw.signatures.clone(),
+        nonce_keys: raw.nonce_keys.clone(),
     })?)
 }
 
@@ -1358,6 +1427,8 @@ fn fork_to_spec_id(fork: ForkSpec) -> SpecId {
         ForkSpec::Prague => SpecId::PRAGUE,
         ForkSpec::Osaka => SpecId::OSAKA,
         ForkSpec::Amsterdam => SpecId::AMSTERDAM,
+        ForkSpec::Bogota => SpecId::BOGOTA,
+        ForkSpec::AmsterdamToBogotaAtTime15k => SpecId::AMSTERDAM,
         ForkSpec::FrontierToHomesteadAt5
         | ForkSpec::HomesteadToDaoAt5
         | ForkSpec::HomesteadToEIP150At5
@@ -1909,6 +1980,10 @@ mod tests {
                         ..BlockHeader::default()
                     }),
                     transactions: Some(vec![Transaction {
+                        txbytes: None,
+                        frames: None,
+                        signatures: Vec::new(),
+                        nonce_keys: None,
                         transaction_type: None,
                         sender: Some(caller),
                         data: Bytes::new(),

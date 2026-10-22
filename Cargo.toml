@@ -61,18 +61,18 @@ evm2-jit-context = { path = "crates/jit/context", version = "0.1.0", default-fea
 evm2-jit-llvm = { path = "crates/jit/llvm", version = "0.1.0", default-features = false }
 evm2-jit-runtime = { path = "crates/jit/runtime", version = "0.1.0", default-features = false }
 
-alloy-consensus = { version = "2.0.4", default-features = false }
+alloy-consensus = { version = "=2.4.1", default-features = false }
 alloy-chains = { version = "0.2.34", default-features = false }
 alloy-eip2930 = { version = "0.2.4", default-features = false }
 alloy-eip7928 = { version = "0.4.11", default-features = false }
-alloy-eips = { version = "2.0.4", default-features = false }
+alloy-eips = { version = "=2.4.1", default-features = false }
 alloy-hardforks = { version = "0.4", default-features = false }
 alloy-primitives = { version = "1.5.7", default-features = false }
-alloy-provider = { version = "2.0.4", default-features = false }
+alloy-provider = { version = "=2.4.1", default-features = false }
 alloy-rlp = { version = "0.3", default-features = false }
-alloy-rpc-client = { version = "2.0.4", default-features = false }
-alloy-rpc-types-eth = { version = "2.0.4", default-features = false }
-alloy-rpc-types-trace = { version = "2.0.4", default-features = false }
+alloy-rpc-client = { version = "=2.4.1", default-features = false }
+alloy-rpc-types-eth = { version = "=2.4.1", default-features = false }
+alloy-rpc-types-trace = { version = "=2.4.1", default-features = false }
 alloy-sol-types = { version = "1.5.7", default-features = false }
 alloy-trie = { version = "0.9.6", default-features = false }
 
@@ -180,6 +180,26 @@ lto = "thin"
 codegen-units = 1
 
 [patch.crates-io]
+# Bogota devnet 1
+alloy-consensus = { git = "https://github.com/Rimeeeeee/alloy", rev = "1ff4bf799bc78b0913561fa3e44bc65d0444c638" }
+alloy-consensus-any = { git = "https://github.com/Rimeeeeee/alloy", rev = "1ff4bf799bc78b0913561fa3e44bc65d0444c638" }
+alloy-contract = { git = "https://github.com/Rimeeeeee/alloy", rev = "1ff4bf799bc78b0913561fa3e44bc65d0444c638" }
+alloy-eips = { git = "https://github.com/Rimeeeeee/alloy", rev = "1ff4bf799bc78b0913561fa3e44bc65d0444c638" }
+alloy-genesis = { git = "https://github.com/Rimeeeeee/alloy", rev = "1ff4bf799bc78b0913561fa3e44bc65d0444c638" }
+alloy-json-rpc = { git = "https://github.com/Rimeeeeee/alloy", rev = "1ff4bf799bc78b0913561fa3e44bc65d0444c638" }
+alloy-network = { git = "https://github.com/Rimeeeeee/alloy", rev = "1ff4bf799bc78b0913561fa3e44bc65d0444c638" }
+alloy-network-primitives = { git = "https://github.com/Rimeeeeee/alloy", rev = "1ff4bf799bc78b0913561fa3e44bc65d0444c638" }
+alloy-provider = { git = "https://github.com/Rimeeeeee/alloy", rev = "1ff4bf799bc78b0913561fa3e44bc65d0444c638" }
+alloy-pubsub = { git = "https://github.com/Rimeeeeee/alloy", rev = "1ff4bf799bc78b0913561fa3e44bc65d0444c638" }
+alloy-rpc-client = { git = "https://github.com/Rimeeeeee/alloy", rev = "1ff4bf799bc78b0913561fa3e44bc65d0444c638" }
+alloy-rpc-types-eth = { git = "https://github.com/Rimeeeeee/alloy", rev = "1ff4bf799bc78b0913561fa3e44bc65d0444c638" }
+alloy-rpc-types-trace = { git = "https://github.com/Rimeeeeee/alloy", rev = "1ff4bf799bc78b0913561fa3e44bc65d0444c638" }
+alloy-serde = { git = "https://github.com/Rimeeeeee/alloy", rev = "1ff4bf799bc78b0913561fa3e44bc65d0444c638" }
+alloy-signer = { git = "https://github.com/Rimeeeeee/alloy", rev = "1ff4bf799bc78b0913561fa3e44bc65d0444c638" }
+alloy-transport = { git = "https://github.com/Rimeeeeee/alloy", rev = "1ff4bf799bc78b0913561fa3e44bc65d0444c638" }
+alloy-transport-http = { git = "https://github.com/Rimeeeeee/alloy", rev = "1ff4bf799bc78b0913561fa3e44bc65d0444c638" }
+alloy-tx-macros = { git = "https://github.com/Rimeeeeee/alloy", rev = "1ff4bf799bc78b0913561fa3e44bc65d0444c638" }
+
 # faster compile times: https://github.com/arkworks-rs/algebra/issues/1104
 ark-ec = { git = "https://github.com/DaniPopes/algebra", rev = "a71d9795e2e527cd0c80e6831bd957134de30d22" }
 ark-bls12-381 = { git = "https://github.com/DaniPopes/algebra", rev = "a71d9795e2e527cd0c80e6831bd957134de30d22" }

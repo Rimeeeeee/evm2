@@ -1,5 +1,15 @@
-use alloy_consensus::{TypedTransaction, transaction::Recovered};
-use alloy_eips::eip7702::SignedAuthorization;
+use alloy_consensus::{
+    EthereumTxEnvelope, TxEip4844, TxEip8141, TypedTransaction,
+    transaction::{Recovered, SignerRecoverable},
+};
+use alloy_eips::{
+    Decodable2718,
+    eip7702::SignedAuthorization,
+    eip8141::{
+        Frame, FrameAddress, FrameLimits, FrameMode, FrameSignature, SignatureMessage,
+        SignatureScheme, TransactionFees,
+    },
+};
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256};
 use alloy_rpc_types_eth::{
     AccessList as RpcAccessList, AccessListItem as RpcAccessListItem, TransactionInput,
@@ -24,6 +34,40 @@ pub struct AccessListItem {
 pub struct TestAuthorization {
     /// Raw authorization JSON.
     pub value: serde_json::Value,
+}
+
+/// A frame in the pinned execution-specs fixture schema. Limits remain full-width until conversion.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestFrame {
+    /// Frame execution mode.
+    pub mode: U256,
+    /// Approval scope and atomic link flags.
+    pub flags: U256,
+    /// Empty or explicit target bytes.
+    pub target: Option<Bytes>,
+    /// Execution budget.
+    pub gas_limit: U256,
+    /// State budget.
+    pub state_gas_limit: U256,
+    /// Transfer value.
+    pub value: U256,
+    /// Frame input.
+    pub data: Bytes,
+}
+
+/// Raw signature metadata in the pinned execution-specs fixture schema.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestFrameSignature {
+    /// Signature scheme, retained full-width until validation.
+    pub scheme: U256,
+    /// Empty or explicit signer bytes.
+    pub signer: Bytes,
+    /// Empty or explicit signed digest bytes.
+    pub msg: Bytes,
+    /// Protocol signature or arbitrary witness.
+    pub signature: Bytes,
 }
 
 impl Serialize for TestAuthorization {
@@ -101,10 +145,19 @@ pub(crate) struct TxFields {
     pub(crate) blob_versioned_hashes: Vec<B256>,
     /// EIP-4844 max fee per blob gas.
     pub(crate) max_fee_per_blob_gas: Option<U256>,
+    /// Ordered native frame payload, if type 6.
+    pub(crate) frames: Option<Vec<TestFrame>>,
+    /// Signature entries for a frame transaction.
+    pub(crate) signatures: Vec<TestFrameSignature>,
+    /// Optional keyed nonce schema.
+    pub(crate) nonce_keys: Option<Vec<U256>>,
 }
 
 /// Builds an evm2 recovered transaction envelope from common fixture fields.
 pub(crate) fn build_recovered_tx(fields: TxFields) -> Result<RecoveredTxEnvelope, TxBuildError> {
+    if fields.tx_type == Some(6) || fields.frames.is_some() {
+        return build_frame_tx(fields);
+    }
     let mut request = TransactionRequest::default()
         .from(fields.caller)
         .gas_limit(fields.gas_limit)
@@ -165,6 +218,92 @@ pub(crate) fn build_recovered_tx(fields: TxFields) -> Result<RecoveredTxEnvelope
     Ok(recovered_envelope(tx, fields.caller))
 }
 
+fn build_frame_tx(fields: TxFields) -> Result<RecoveredTxEnvelope, TxBuildError> {
+    let invalid = |reason: &str| TxBuildError::BuildTransaction(reason.into());
+    let frames = fields
+        .frames
+        .ok_or_else(|| invalid("type 6 requires frames"))?
+        .into_iter()
+        .map(|frame| {
+            let mode = u8::try_from(frame.mode)
+                .ok()
+                .and_then(FrameMode::try_from_u8)
+                .ok_or_else(|| invalid("invalid frame mode"))?;
+            let target = FrameAddress::try_from(
+                frame.target.as_ref().map_or(&[][..], |target| target.as_ref()),
+            )
+            .map_err(|error| invalid(&error.to_string()))?;
+            Ok(Frame {
+                mode,
+                target,
+                flags: frame.flags.try_into().map_err(|_| TxBuildError::Overflow("frame flags"))?,
+                limits: FrameLimits {
+                    execution: frame
+                        .gas_limit
+                        .try_into()
+                        .map_err(|_| TxBuildError::Overflow("frame execution gas"))?,
+                    state: frame
+                        .state_gas_limit
+                        .try_into()
+                        .map_err(|_| TxBuildError::Overflow("frame state gas"))?,
+                },
+                value: frame.value,
+                data: frame.data,
+            })
+        })
+        .collect::<Result<_, TxBuildError>>()?;
+    let signatures = fields
+        .signatures
+        .into_iter()
+        .map(|signature| {
+            Ok(FrameSignature {
+                scheme: u8::try_from(signature.scheme)
+                    .ok()
+                    .and_then(|scheme| SignatureScheme::try_from(scheme).ok())
+                    .ok_or_else(|| invalid("invalid signature scheme"))?,
+                signer: FrameAddress::try_from(signature.signer.as_ref())
+                    .map_err(|error| invalid(&error.to_string()))?,
+                msg: SignatureMessage::try_from(signature.msg.as_ref())
+                    .map_err(|error| invalid(&error.to_string()))?,
+                signature: signature.signature,
+            })
+        })
+        .collect::<Result<_, TxBuildError>>()?;
+    let payload = TxEip8141 {
+        chain_id: fields
+            .chain_id
+            .unwrap_or(U256::ONE)
+            .try_into()
+            .map_err(|_| TxBuildError::Overflow("chainId"))?,
+        nonce: fields.nonce,
+        nonce_keys: fields.nonce_keys,
+        sender: fields.caller,
+        frames,
+        signatures,
+        fees: TransactionFees {
+            max_fee_per_gas: fields.max_fee_per_gas.unwrap_or_default(),
+            max_priority_fee_per_gas: fields.max_priority_fee_per_gas.unwrap_or_default(),
+            max_fee_per_blob_gas: fields.max_fee_per_blob_gas.unwrap_or_default(),
+        },
+        blob_versioned_hashes: fields.blob_versioned_hashes,
+    };
+    Ok(Recovered::new_unchecked(TxEnvelope::Eip8141(payload), fields.caller))
+}
+
+/// Decodes canonical transaction bytes, including self-authorized frame envelopes.
+pub(crate) fn build_recovered_tx_bytes(bytes: &[u8]) -> Result<RecoveredTxEnvelope, TxBuildError> {
+    let mut input = bytes;
+    let envelope = EthereumTxEnvelope::<TxEip4844>::decode_2718(&mut input)
+        .map_err(|error| TxBuildError::BuildTransaction(error.to_string()))?;
+    if !input.is_empty() {
+        return Err(TxBuildError::BuildTransaction("trailing transaction bytes".into()));
+    }
+    let sender = envelope
+        .recover_signer()
+        .map_err(|error| TxBuildError::BuildTransaction(error.to_string()))?;
+    Ok(Recovered::new_unchecked(envelope.into(), sender))
+}
+
 /// Converts EEST access list items into RPC access list items.
 pub(crate) fn rpc_access_list<'a>(
     items: impl IntoIterator<Item = &'a AccessListItem>,
@@ -204,6 +343,10 @@ fn recovered_envelope(tx: TypedTransaction, caller: Address) -> RecoveredTxEnvel
         TypedTransaction::Eip1559(tx) => Recovered::new_unchecked(TxEnvelope::Eip1559(tx), caller),
         TypedTransaction::Eip4844(tx) => Recovered::new_unchecked(TxEnvelope::Eip4844(tx), caller),
         TypedTransaction::Eip7702(tx) => Recovered::new_unchecked(tx.into(), caller),
+        TypedTransaction::Eip8141(tx) => {
+            let sender = tx.sender;
+            Recovered::new_unchecked(TxEnvelope::Eip8141(tx), sender)
+        }
     }
 }
 

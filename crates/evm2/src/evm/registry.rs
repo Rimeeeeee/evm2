@@ -136,6 +136,9 @@ pub enum HandlerError {
     /// Priority fee is greater than max fee.
     #[error("priority fee greater than max fee")]
     PriorityFeeGreaterThanMaxFee,
+    /// Invalid Bogota frame transaction.
+    #[error("invalid frame transaction: {0}")]
+    InvalidFrameTransaction(&'static str),
 }
 
 impl From<DatabaseError> for HandlerError {

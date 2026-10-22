@@ -49,6 +49,17 @@ pub struct DecodedCallTrace {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CallTrace {
+    /// Ordered frame index for top-level frame transaction nodes.
+    pub frame_index: Option<usize>,
+    /// Protocol frame mode, encoded as 0..=3.
+    pub frame_mode: Option<u8>,
+    /// Final state gas attributed after cross-frame restoration and rollback.
+    pub state_gas_used: u64,
+    /// Whether the frame belongs to a rolled-back atomic group or assertion body.
+    pub rolled_back: bool,
+    /// Whether this frame was skipped by atomic/assertion control flow.
+    pub skipped: bool,
+
     /// The depth of the call.
     ///
     /// Zero represents the root trace node.

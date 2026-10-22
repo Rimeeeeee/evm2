@@ -32,3 +32,6 @@ pub mod i256;
 
 #[cfg(test)]
 mod macro_tests;
+
+mod frame;
+pub use frame::*;

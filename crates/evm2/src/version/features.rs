@@ -240,6 +240,14 @@ evm_features! {
     ///
     /// Default: on since Amsterdam
     EIP2780,
+    /// Bogota frame transaction execution and introspection.
+    EIP8141,
+    /// Bogota keyed nonce payload and protocol transitions.
+    EIP8250,
+    /// Bogota POST_TX assertion instructions.
+    EIP7906,
+    /// Explicit simulation-only allowance for unsigned frame requests. Off by default.
+    FRAME_SIGNATURE_PLACEHOLDERS,
 }
 
 #[cfg(test)]

@@ -192,7 +192,7 @@ fn cached_base_precompiles<T: EvmTypesHost>(spec: SpecId) -> &'static Precompile
         SpecId::BERLIN | SpecId::LONDON | SpecId::MERGE | SpecId::SHANGHAI => 3,
         SpecId::CANCUN => 4,
         SpecId::PRAGUE => 5,
-        SpecId::OSAKA | SpecId::AMSTERDAM => 6,
+        SpecId::OSAKA | SpecId::AMSTERDAM | SpecId::BOGOTA => 6,
     };
 
     {
