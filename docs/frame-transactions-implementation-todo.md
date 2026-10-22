@@ -1,6 +1,6 @@
 # evm2 frame transaction TODO
 
-- [x] Bogota fork activation and type-6 transaction dispatch.
+- [x] Bogota version selection and type-6 transaction dispatch.
 - [x] Frame transaction, signature and receipt type integration.
 - [x] Explicit payload sender throughout native execution.
 - [x] Full-width fee and nonce-key handling.
@@ -49,8 +49,8 @@
 - [x] Preserve approved payment and nonces after assertion failure.
 - [x] Delay account destruction until assertions finish.
 - [x] EIP-8272 verifier execution as ordinary deployed code.
-- [x] Actual payload-slot environment for recent-root validation.
-- [x] Recent-root deployment, ring-window and tuple handling.
+- [x] BlockEnv slot exposure and fixture slot ingestion.
+- [x] Recent-root verifier deployment, window and tuple regression coverage.
 - [x] BAL access records survive write rollback.
 - [x] State streams preserve prefix writes after failed assertions.
 - [x] Native JIT and AOT support for all frame opcodes.
