@@ -877,7 +877,7 @@ evm_versions! {
 
     BOGOTA {
         features: [EIP8141, EIP8250, EIP7906,],
-        ops: [APPROVE: ZERO, TXPARAM: BASE, FRAMEDATALOAD: VERYLOW, FRAMEDATACOPY: VERYLOW, FRAMEPARAM: BASE, SIGPARAM: BASE, SIGDATACOPY: VERYLOW, TXTRACE: WARM_STORAGE_READ_COST, TXDIFF: WARM_STORAGE_READ_COST, EVENTDATACOPY: VERYLOW,],
+        ops: [APPROVE: ZERO, TXPARAM: BASE, FRAMEDATALOAD: VERYLOW, FRAMEDATACOPY: VERYLOW, FRAMEPARAM: BASE, SIGPARAM: BASE, SIGDATACOPY: VERYLOW, TXTRACE: WARM_STORAGE_READ_COST, EVENTDATACOPY: VERYLOW,],
     }
 }
 
@@ -1048,7 +1048,6 @@ macro_rules! op_instr {
     (@path $ty:ident, SIGPARAM) => { instr::sigparam<$ty> };
     (@path $ty:ident, SIGDATACOPY) => { instr::sigdatacopy<$ty> };
     (@path $ty:ident, TXTRACE) => { instr::txtrace<$ty> };
-    (@path $ty:ident, TXDIFF) => { instr::txdiff<$ty> };
     (@path $ty:ident, EVENTDATACOPY) => { instr::eventdatacopy<$ty> };
 }
 use op_instr;

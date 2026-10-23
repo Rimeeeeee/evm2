@@ -8,13 +8,11 @@ pub mod eip2930;
 pub mod eip4844;
 /// EIP-7702 transaction handler.
 pub mod eip7702;
+pub mod eip7906;
+pub mod eip8141;
 mod lazy_eip7702;
 /// Legacy transaction handler.
 pub mod legacy;
-
-pub mod eip8141;
-
-pub mod eip7906;
 
 pub use lazy_eip7702::{LazyAuthorization, LazyTxEip7702};
 
@@ -147,9 +145,7 @@ impl TxEnvelope {
             | Self::Eip8141(_) => None,
         }
     }
-}
 
-impl TxEnvelope {
     /// Returns the frame payload, if present.
     pub const fn as_eip8141(&self) -> Option<&TxEip8141> {
         match self {

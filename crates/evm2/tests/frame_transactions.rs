@@ -1,10 +1,10 @@
 //! Native Bogota execution, journal, and settlement regressions.
 
-use alloy_consensus::{Transaction, TxEip8141, TxLegacy, transaction::Recovered};
+use alloy_consensus::{TxEip8141, TxLegacy, transaction::Recovered};
 use alloy_eips::{
     eip8141::{
-        Frame, FrameLimits, FrameMode, FrameSignature, FrameStatus, NONCE_MANAGER, SignatureScheme,
-        nonce_slot,
+        Frame, FrameLimits, FrameMode, FrameSignature, FrameStatus, NONCE_MANAGER,
+        SignatureMessage, SignatureScheme, nonce_slot,
     },
     eip8272::{
         RECENT_ROOT_ADDRESS, RECENT_ROOT_CODE, RECENT_ROOT_CODE_HASH, RECENT_ROOT_ENTRY_DOMAIN,
@@ -13,12 +13,13 @@ use alloy_eips::{
 };
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256};
 use evm2::{
-    BaseEvmTypes, Evm, FrameTransactionResult, Precompiles, SpecId, TxResultExt,
+    BaseEvmTypes, Evm, FrameTransactionResult, Precompiles, SpecId, TxResultExt, Version,
     bytecode::Bytecode,
     env::BlockEnvExt,
     ethereum::{TxEnvelope, eip8141::FrameGas, ethereum_tx_registry},
     evm::{AccountInfo, Bal, BlockAccessIndex, Database, Db, InMemoryDB},
     interpreter::{GasTracker, InstrStop},
+    version::GasId,
 };
 use k256::ecdsa::SigningKey;
 use std::sync::{
@@ -44,7 +45,7 @@ fn payload(frames: Vec<Frame>) -> TxEip8141 {
     TxEip8141 {
         chain_id: 1,
         sender: SENDER,
-        nonce_keys: Some(vec![U256::ZERO]),
+        nonce_keys: Some(vec![]),
         frames,
         ..Default::default()
     }
@@ -130,8 +131,8 @@ fn assertion_failure_reverts_body_and_preserves_payment_prefix() {
     let tx = recovered(payload(vec![
         frame(FrameMode::Verify, SENDER),
         frame(FrameMode::Sender, BODY),
-        frame(FrameMode::PostTx, ASSERTION),
-        frame(FrameMode::PostTx, ASSERTION),
+        frame(FrameMode::Assert, ASSERTION),
+        frame(FrameMode::Assert, ASSERTION),
     ]));
     let result = evm.transact(&tx).unwrap().commit();
     assert!(!result.status);
@@ -193,7 +194,11 @@ fn empty_account_verification_uses_canonical_transaction_signature() {
         Address::from_raw_public_key(&key.verifying_key().to_sec1_point(false).as_bytes()[1..]);
     let mut tx = payload(vec![frame(FrameMode::Verify, sender)]);
     tx.sender = sender;
-    tx.signatures.push(FrameSignature { scheme: SignatureScheme::Secp256k1, ..Default::default() });
+    tx.signatures.push(FrameSignature {
+        scheme: SignatureScheme::Secp256k1,
+        signature: vec![0; 65].into(),
+        ..Default::default()
+    });
     let (sig, recid) = key.sign_prehash_recoverable(tx.signature_hash().as_slice());
     let mut bytes = vec![recid.to_byte()];
     bytes.extend_from_slice(sig.to_bytes().as_slice());
@@ -331,17 +336,15 @@ fn prefix_stops_before_the_requested_body_even_without_a_payer() {
 }
 
 #[test]
-fn generic_envelope_fee_accessors_preserve_u256() {
+fn aggregate_fee_signature_hash_preserves_full_width_budget_and_priority() {
     let mut tx = payload(vec![frame(FrameMode::Verify, SENDER)]);
     let large = U256::from(1) << 180;
-    tx.fees.max_fee_per_gas = large;
-    tx.fees.max_priority_fee_per_gas = large - U256::from(1);
-    tx.fees.max_fee_per_blob_gas = large;
-    let tx = TxEnvelope::Eip8141(tx);
-    assert_eq!(tx.max_fee_per_gas_u256(), large);
-    assert_eq!(tx.max_priority_fee_per_gas_u256(), Some(large - U256::from(1)));
-    assert_eq!(tx.max_fee_per_blob_gas_u256(), Some(large));
-    assert_eq!(tx.effective_gas_price_u256(Some(1)), large);
+    let baseline = tx.signature_hash();
+    tx.fees.max_fee = large;
+    let budget = tx.signature_hash();
+    assert_ne!(budget, baseline);
+    tx.fees.max_priority_fee_per_gas = large;
+    assert_ne!(tx.signature_hash(), budget);
 }
 
 #[test]
@@ -397,7 +400,7 @@ fn bal_positioned_frames_preserve_prefix_writes_after_assertion_failure() {
         tx.nonce = nonce;
         tx.nonce_keys = Some(vec![U256::from(7)]);
         if nonce == 1 {
-            tx.frames.push(frame(FrameMode::PostTx, ASSERTION));
+            tx.frames.push(frame(FrameMode::Assert, ASSERTION));
         }
         transactions.push(recovered(tx));
     }
@@ -446,7 +449,7 @@ fn atomic_group_cannot_end_on_an_assertion() {
     let tx = recovered(payload(vec![
         frame(FrameMode::Verify, SENDER),
         body,
-        frame(FrameMode::PostTx, ASSERTION),
+        frame(FrameMode::Assert, ASSERTION),
     ]));
     assert!(evm.transact(&tx).is_err());
     let valid = recovered(payload(vec![frame(FrameMode::Verify, SENDER)]));
@@ -673,4 +676,145 @@ fn verify_entry_failure_emits_its_frame_end_before_invalidating_the_prefix() {
     let inspector = evm.clear_inspector_as::<EntryFailureInspector>().unwrap();
     assert_eq!(inspector.starts, vec![0]);
     assert_eq!(inspector.ends, vec![(0, FrameStatus::Failure, InstrStop::OutOfGas)]);
+}
+
+#[test]
+fn elided_witness_hash_and_intrinsic_commit_to_length_instead_of_contents() {
+    let version = Version::base(SpecId::BOGOTA);
+    let token = u64::from(version.gas_params.get(GasId::TxTokenNonZeroByteMultiplier));
+    let intrinsic_byte_cost = token * u64::from(version.gas_params.get(GasId::TxTokenCost));
+    let floor_byte_cost = token * u64::from(version.gas_params.get(GasId::TxFloorCostPerToken));
+    for len in [0, 1, 55, 56, 64, 128, 256] {
+        let mut zero = payload(vec![frame(FrameMode::Verify, SENDER)]);
+        zero.signatures
+            .push(FrameSignature { signature: vec![0; len].into(), ..Default::default() });
+        let mut nonzero = zero.clone();
+        nonzero.signatures[0].signature = vec![0xff; len].into();
+        let gas = FrameGas::calculate(&zero, version).unwrap();
+        assert_eq!(FrameGas::calculate(&nonzero, version).unwrap(), gas, "length {len}");
+        assert_eq!(nonzero.signature_hash(), zero.signature_hash(), "length {len}");
+        nonzero.signatures[0].signature = vec![0xff; len + 1].into();
+        assert_ne!(nonzero.signature_hash(), zero.signature_hash(), "length {len}");
+        let extended = FrameGas::calculate(&nonzero, version).unwrap();
+        assert_eq!(extended.intrinsic - gas.intrinsic, intrinsic_byte_cost);
+        assert_eq!(extended.floor - gas.floor, floor_byte_cost);
+    }
+}
+
+#[test]
+fn explicit_signature_messages_preserve_content_sensitive_hashing_and_intrinsic_pricing() {
+    let version = Version::base(SpecId::BOGOTA);
+    let mut zero = payload(vec![frame(FrameMode::Verify, SENDER)]);
+    zero.signatures.push(FrameSignature {
+        msg: SignatureMessage::Explicit(B256::repeat_byte(1)),
+        signature: vec![0; 64].into(),
+        ..Default::default()
+    });
+    let mut nonzero = zero.clone();
+    nonzero.signatures[0].signature = vec![0xff; 64].into();
+    assert_ne!(nonzero.signature_hash(), zero.signature_hash());
+    let zero_gas = FrameGas::calculate(&zero, version).unwrap();
+    let nonzero_gas = FrameGas::calculate(&nonzero, version).unwrap();
+    let token_difference =
+        u64::from(version.gas_params.get(GasId::TxTokenNonZeroByteMultiplier)) - 1;
+    assert_eq!(
+        nonzero_gas.intrinsic - zero_gas.intrinsic,
+        64 * token_difference * u64::from(version.gas_params.get(GasId::TxTokenCost))
+    );
+    assert_eq!(nonzero_gas.floor, zero_gas.floor);
+}
+
+#[test]
+fn aggregate_fee_escrow_settlement_and_gasprice_cover_full_partial_and_overflowing_tips() {
+    let beneficiary = Address::with_last_byte(0xd0);
+    for blobs in [false, true] {
+        for kind in ["full", "partial", "required", "capped"] {
+            let mut evm = evm(&[0x3a, 0x5f, 0x52, 0x60, 32, 0x5f, 0xf3], &[]);
+            evm.set_block(BlockEnvExt {
+                basefee: U256::from(7),
+                blob_basefee: U256::from(3),
+                beneficiary,
+                ..Default::default()
+            });
+            let mut tx = payload(vec![
+                frame(FrameMode::Verify, SENDER),
+                frame(FrameMode::Sender, BODY),
+                frame(FrameMode::Default, BODY),
+                frame(FrameMode::Assert, BODY),
+            ]);
+            tx.nonce_keys = Some(vec![]);
+            if blobs {
+                tx.blob_versioned_hashes.push(B256::repeat_byte(1));
+            }
+            let gas = FrameGas::calculate(&tx, evm.version()).unwrap();
+            let max_gas = U256::from(gas.maximum);
+            let blob_charge = if blobs { U256::from(131_072 * 3) } else { U256::ZERO };
+            let required = max_gas * U256::from(7) + blob_charge;
+            let (requested_tip, headroom, reported_price) = match kind {
+                "full" => (U256::from(11), max_gas * U256::from(11) + U256::from(99), 18),
+                "partial" => (U256::from(11), max_gas * U256::from(3) + U256::ONE, 10),
+                "required" => (U256::from(11), U256::ZERO, 7),
+                _ => (U256::MAX, U256::from(17), 7),
+            };
+            tx.fees.max_fee = required + headroom;
+            tx.fees.max_priority_fee_per_gas = requested_tip;
+            let expected_escrow =
+                if kind == "full" { required + max_gas * U256::from(11) } else { tx.fees.max_fee };
+            let max_fee = tx.fees.max_fee;
+            let result = evm.transact(&recovered(tx)).unwrap().commit();
+            assert!(result.status, "{kind}, blobs={blobs}");
+            let used = U256::from(result.tx_gas_used());
+            let paid_base_fee = used * U256::from(7) + blob_charge;
+            let expected_tip = if kind == "capped" {
+                expected_escrow - paid_base_fee
+            } else {
+                used * U256::from(11)
+            };
+            assert!(paid_base_fee + expected_tip <= expected_escrow);
+            assert!(expected_escrow <= max_fee);
+            let frame = result.frame.unwrap();
+            assert_eq!(frame.precharge, expected_escrow, "{kind}, blobs={blobs}");
+            for output in &frame.outputs[1..] {
+                assert_eq!(U256::from_be_slice(output), U256::from(reported_price));
+            }
+            assert_eq!(
+                evm.state_mut().account(&SENDER).unwrap().balance(),
+                U256::from(1_000_000_000) - paid_base_fee - expected_tip,
+                "{kind}, blobs={blobs}"
+            );
+            assert_eq!(evm.state_mut().account(&beneficiary).unwrap().balance(), expected_tip);
+            if matches!(kind, "partial" | "required") {
+                // Unused gas backs the full requested tip, so GASPRICE is a strict lower bound.
+                assert!(used * U256::from(reported_price) < used * U256::from(7) + expected_tip);
+            }
+        }
+    }
+}
+
+#[test]
+fn nonce_intrinsic_charges_zero_keys_and_exempts_only_single_use_sequences() {
+    let version = Version::base(SpecId::BOGOTA);
+    let gp = &version.gas_params;
+    let token = u64::from(gp.get(GasId::TxTokenNonZeroByteMultiplier));
+    let intrinsic_byte_cost = token * u64::from(gp.get(GasId::TxTokenCost));
+    let floor_byte_cost = token * u64::from(gp.get(GasId::TxFloorCostPerToken));
+    let key_cost = u64::from(gp.get(GasId::WarmStorageReadCost))
+        + u64::from(gp.get(GasId::ColdStorageAdditionalCost))
+        + u64::from(gp.get(GasId::SstoreSetWithoutLoadCost));
+    let mut tx = payload(vec![frame(FrameMode::Verify, SENDER)]);
+    tx.nonce_keys = Some(vec![]);
+    let legacy = FrameGas::calculate(&tx, version).unwrap();
+    tx.nonce_keys = Some(vec![U256::ZERO]);
+    let zero_key = FrameGas::calculate(&tx, version).unwrap();
+    assert_eq!(zero_key.intrinsic - legacy.intrinsic, key_cost + intrinsic_byte_cost);
+    assert_eq!(zero_key.floor - legacy.floor, key_cost + floor_byte_cost);
+    tx.nonce_keys = Some(vec![U256::ONE]);
+    assert_eq!(FrameGas::calculate(&tx, version).unwrap(), zero_key);
+    tx.nonce = u64::MAX - 1;
+    let incrementable = FrameGas::calculate(&tx, version).unwrap();
+    tx.nonce = u64::MAX;
+    let single_use = FrameGas::calculate(&tx, version).unwrap();
+    // The ordinary sequence encodes as 0x88 followed by eight nonzero bytes.
+    assert_eq!(incrementable.intrinsic - single_use.intrinsic, 9 * intrinsic_byte_cost);
+    assert_eq!(incrementable.floor - single_use.floor, 9 * floor_byte_cost);
 }

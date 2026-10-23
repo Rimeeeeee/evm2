@@ -20,8 +20,9 @@ use alloy_primitives::{Address, B256, Bytes, TxKind, U256, map::HashMap};
 use evm2::{
     SpecId,
     env::{BlockEnv, BlockEnvExt},
-    ethereum::{RecoveredTxEnvelope, TxEnvelope},
+    ethereum::{RecoveredTxEnvelope, TxEnvelope, eip8141::FrameGas},
     interpreter::op,
+    version::Version,
 };
 use revm::{
     context::{BlockEnv as RevmBlockEnv, TxEnv as RevmTxEnv},
@@ -884,16 +885,21 @@ fn frame_case_tx(payload: TxEip8141) -> CaseTx {
 
 impl CaseGenerator {
     fn generate_frames(&mut self, rng: &mut Gen) {
-        let scenario = rng.range(14);
+        let scenario = rng.range(16);
         let keyed = rng.one_in(2);
         self.generate_frame_scenario(rng, scenario, keyed);
     }
 
     fn generate_frame_scenario(&mut self, rng: &mut Gen, scenario: usize, keyed: bool) {
         let keys = if keyed {
-            if rng.one_in(2) { vec![U256::from(7), U256::MAX] } else { vec![U256::from(7)] }
+            match rng.range(4) {
+                0 => vec![U256::ZERO],
+                1 => vec![U256::ZERO, U256::ONE],
+                2 => vec![U256::from(7)],
+                _ => vec![U256::from(7), U256::MAX],
+            }
         } else {
-            vec![U256::ZERO]
+            vec![]
         };
         let mut case = EvmCase {
             spec: SpecId::BOGOTA,
@@ -959,7 +965,7 @@ impl CaseGenerator {
             frames: vec![generated_frame(FrameMode::Verify, CALLER, 3), write.clone()],
             ..Default::default()
         };
-        payload.fees.max_fee_per_gas = U256::from(1);
+        payload.fees.max_fee = U256::from(1);
         let mut body_code = vec![
             op::PUSH0,
             op::TXPARAM,
@@ -1007,10 +1013,7 @@ impl CaseGenerator {
         body_code.extend_from_slice(&case.accounts[1].code);
         case.accounts[1].code = body_code.into();
         let mut assertion_code = vec![op::PUSH0, op::PUSH1, 1, op::TXTRACE, op::PUSH0, op::MSTORE];
-        assertion_code.push(op::PUSH0);
-        assertion_code.push(op::PUSH20);
-        assertion_code.extend_from_slice(TARGET.as_slice());
-        assertion_code.extend_from_slice(&[op::PUSH1, 6, op::TXDIFF, op::POP]);
+        assertion_code.extend_from_slice(&[op::PUSH0, op::PUSH0, op::TXTRACE, op::POP]);
         assertion_code.extend_from_slice(&[
             op::PUSH0,
             op::PUSH0,
@@ -1039,9 +1042,9 @@ impl CaseGenerator {
             2 => {
                 case.features.insert(FuzzFeatures::FRAME_ASSERTION);
                 payload.frames.extend([
-                    generated_frame(FrameMode::PostTx, FRAME_ASSERTION, 0),
-                    generated_frame(FrameMode::PostTx, FRAME_FAILURE, 0),
-                    generated_frame(FrameMode::PostTx, FRAME_ASSERTION, 0),
+                    generated_frame(FrameMode::Assert, FRAME_ASSERTION, 0),
+                    generated_frame(FrameMode::Assert, FRAME_FAILURE, 0),
+                    generated_frame(FrameMode::Assert, FRAME_ASSERTION, 0),
                 ]);
             }
             3 | 4 => {
@@ -1127,8 +1130,8 @@ impl CaseGenerator {
             10 => {
                 case.features.insert(FuzzFeatures::FRAME_INVALID);
                 payload.nonce_keys = Some(match rng.range(4) {
-                    0 => vec![],
-                    1 => vec![U256::ZERO, U256::ONE],
+                    0 => (0u64..17).map(U256::from).collect(),
+                    1 => vec![U256::ONE, U256::ZERO],
                     2 => vec![U256::ONE, U256::ONE],
                     _ => vec![U256::MAX, U256::ONE],
                 });
@@ -1147,7 +1150,7 @@ impl CaseGenerator {
                     ..Default::default()
                 });
             }
-            _ => {
+            13 => {
                 case.features.insert(FuzzFeatures::FRAME_RECENT_ROOT);
                 let age = rng.pick(&[1, 8191, 0, 8192]);
                 let slot = case.block.slot_num - age;
@@ -1176,6 +1179,33 @@ impl CaseGenerator {
                 verifier.data = tuple.into();
                 payload.frames.insert(0, verifier);
             }
+            14 | 15 => {
+                case.block.basefee = 3;
+                payload.fees.max_priority_fee_per_gas =
+                    rng.pick(&[U256::ZERO, U256::ONE, U256::MAX]);
+                let maximum =
+                    FrameGas::calculate(&payload, Version::base(SpecId::BOGOTA)).unwrap().maximum;
+                let required = U256::from(maximum) * U256::from(case.block.basefee);
+                payload.fees.max_fee = if scenario == 15 {
+                    case.features.insert(FuzzFeatures::FRAME_INVALID);
+                    required - U256::ONE
+                } else {
+                    required + U256::from(rng.pick(&[0, maximum / 2, maximum * 2]))
+                };
+                let body = &mut case.accounts[1].code;
+                let mut code = body[..body.len() - 1].to_vec();
+                code.extend_from_slice(&[
+                    op::GASPRICE,
+                    op::PUSH0,
+                    op::MSTORE,
+                    op::PUSH1,
+                    32,
+                    op::PUSH0,
+                    op::RETURN,
+                ]);
+                *body = code.into();
+            }
+            _ => unreachable!(),
         }
         case.tx = frame_case_tx(payload);
         self.case = case;

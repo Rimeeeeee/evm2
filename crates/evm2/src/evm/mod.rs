@@ -241,71 +241,6 @@ pub struct Evm<'a, T: EvmTypesHost> {
     pub(crate) frame_tx: Option<frame::FrameTransactionRuntime>,
 }
 
-#[cfg(feature = "async")]
-impl<'a, T: EvmTypes<Tx = crate::ethereum::TxEnvelope>> Evm<'a, T> {
-    /// Executes and discards a frame validation prefix on an async host fiber.
-    ///
-    /// Async database and inspector operations may suspend while validating the prefix.
-    /// Dropping the future cancels execution and discards approvals, nonce writes, and
-    /// transaction scratch, just like the synchronous prefix API.
-    pub fn validate_frame_prefix_async<'fut>(
-        &'fut mut self,
-        tx: &'fut Recovered<T::Tx>,
-        prefix_end: usize,
-    ) -> impl Future<
-        Output = r#async::AsyncResult<
-            crate::ethereum::eip8141::FrameValidationResult,
-            registry::HandlerError,
-        >,
-    > + 'fut {
-        let stack = self.async_stack();
-        // SAFETY: The future exclusively borrows the EVM and its stack slot until dropped.
-        unsafe {
-            r#async::on_local_fiber_result_with_stack(stack, move || {
-                self.validate_frame_prefix(tx, prefix_end)
-            })
-        }
-    }
-
-    /// Executes a frame validation prefix on an async host fiber with a `Send` future.
-    ///
-    /// As with [`Self::transact_async_send`], first verify the current erased database,
-    /// precompiles, and optional inspector using [`Self::evm_is_send`] or
-    /// [`Self::evm_is_send_with_inspector`]. Cancellation discards all prefix effects.
-    pub fn validate_frame_prefix_async_send<'fut>(
-        &'fut mut self,
-        tx: &'fut Recovered<T::Tx>,
-        prefix_end: usize,
-    ) -> impl Future<
-        Output = r#async::AsyncResult<
-            crate::ethereum::eip8141::FrameValidationResult,
-            registry::HandlerError,
-        >,
-    > + Send
-    + 'fut
-    where
-        T::SpecId: Send,
-        T::EvmExt: Send,
-        T::MessageExt: Send,
-        T::MessageResultExt: Send,
-        T::TxEnvExt: Send,
-        T::TxResultExt: Send,
-        T::BlockEnvExt: Send,
-    {
-        self.assert_erased_send();
-        let stack = self.async_stack();
-        let evm = SendEvmRef { evm: self };
-        // SAFETY: The future owns the exclusive EVM borrow and its erased fields were
-        // checked above. The reusable stack remains borrowed until the future is dropped.
-        unsafe {
-            r#async::on_fiber_result_with_stack(stack, move || {
-                let SendEvmRef { evm } = evm;
-                evm.validate_frame_prefix(tx, prefix_end)
-            })
-        }
-    }
-}
-
 impl<'a, T: EvmTypes> Evm<'a, T> {
     /// Creates an EVM for `spec_id` with the provided transaction registry, database, and
     /// precompile provider.
@@ -980,24 +915,6 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         self.interpreter_runner.take()
     }
 
-    /// Invokes a frame lifecycle hook while preventing inspector mutation.
-    pub(crate) fn inspect_frame(&mut self, f: impl FnOnce(&mut dyn Inspector<T>, &mut Self)) {
-        let guard = self.enter_execution();
-        if let Some(inspector) = guard.evm.inspector.as_deref_mut() {
-            // SAFETY: the execution guard prevents replacing the boxed inspector.
-            let inspector = unsafe { &mut *(inspector as *mut dyn Inspector<T>) };
-            f(inspector, guard.evm);
-        }
-    }
-
-    /// Runs executable-prefix validation with the normal execution mutation guard.
-    pub(crate) fn simulate_frames<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        assert!(!self.running, "prefix validation cannot interrupt active execution");
-        let runner = self.interpreter_runner.take();
-        let guard = FrameSimulationGuard { execution: self.enter_execution(), runner };
-        f(guard.execution.evm)
-    }
-
     /// Returns the active EVM version.
     #[inline]
     pub const fn version(&self) -> &crate::Version {
@@ -1052,21 +969,6 @@ struct CurrentFrameGuard<'guard, 'evm, T: EvmTypesHost> {
 impl<T: EvmTypesHost> Drop for CurrentFrameGuard<'_, '_, T> {
     fn drop(&mut self) {
         self.evm.current_frame = self.previous;
-    }
-}
-
-struct FrameSimulationGuard<'guard, 'evm, T: EvmTypesHost> {
-    execution: ExecutionGuard<'guard, 'evm, T>,
-    runner: Option<Arc<dyn InterpreterRunner<T>>>,
-}
-
-impl<T: EvmTypesHost> Drop for FrameSimulationGuard<'_, '_, T> {
-    fn drop(&mut self) {
-        let evm = &mut self.execution.evm;
-        evm.interpreter_runner = self.runner.take();
-        evm.frame_tx = None;
-        evm.current_frame = None;
-        evm.state.clear_transaction_state();
     }
 }
 
@@ -1834,12 +1736,7 @@ impl<'a, T: EvmTypes> Host<T> for Evm<'a, T> {
         self.frame_tx.as_ref()?.tx_param(param, state_left)
     }
     fn frame_data(&self, index: Word) -> Option<Bytes> {
-        self.frame_tx
-            .as_ref()?
-            .payload
-            .frames
-            .get(usize::try_from(index).ok()?)
-            .map(|f| f.data.clone())
+        self.frame_tx.as_ref()?.data(index)
     }
     fn frame_param(&self, index: Word, param: Word) -> Option<Word> {
         self.frame_tx.as_ref()?.param(index, param)
@@ -1848,12 +1745,10 @@ impl<'a, T: EvmTypes> Host<T> for Evm<'a, T> {
         self.frame_tx.as_ref()?.signature_param(index, param)
     }
     fn frame_signature_bytes(&self, index: Word) -> Option<Bytes> {
-        let sig = self.frame_tx.as_ref()?.payload.signatures.get(usize::try_from(index).ok()?)?;
-        (sig.scheme == alloy_eips::eip8141::SignatureScheme::Arbitrary)
-            .then(|| sig.signature.clone())
+        self.frame_tx.as_ref()?.signature_bytes(index)
     }
-    fn is_post_tx_frame(&self) -> bool {
-        self.frame_tx.as_ref().is_some_and(|rt| rt.is_post_tx())
+    fn is_assert_frame(&self) -> bool {
+        self.frame_tx.as_ref().is_some_and(|rt| rt.is_assert())
     }
     fn approve_frame(
         &mut self,
@@ -1865,26 +1760,16 @@ impl<'a, T: EvmTypes> Host<T> for Evm<'a, T> {
     }
     fn frame_sstore_gas(&mut self, address: Address, key: Word, charge: u64, refill: u64) -> u64 {
         if let Some(rt) = &mut self.frame_tx {
-            rt.record_sstore_state_gas(address, key, charge);
-            rt.refill_sstore_state_gas(address, key, refill)
+            rt.sstore_gas(address, key, charge, refill)
         } else {
             refill
         }
     }
     fn txtrace(&mut self, param: Word, index: Word) -> Option<Word> {
-        self.frame_trace_value(param, index)
-    }
-    fn txdiff(
-        &mut self,
-        param: Word,
-        in2: Word,
-        in3: Word,
-        skip: bool,
-    ) -> Result<(Word, bool), HostError> {
-        self.frame_diff_value(param, in2, in3, skip)
+        self.frame_tx.as_mut()?.trace_value(&self.state, param, index)
     }
     fn event_data(&self, index: Word) -> Option<Bytes> {
-        self.frame_event_data(index)
+        self.frame_tx.as_ref()?.event_data(&self.state, index)
     }
 
     fn selfdestruct(
@@ -4600,7 +4485,7 @@ mod tests {
                             TxEnvelope::Eip8141(TxEip8141 {
                                 chain_id: 1,
                                 sender,
-                                nonce_keys: Some(vec![U256::ZERO]),
+                                nonce_keys: Some(vec![]),
                                 frames: [
                                     (FrameMode::Verify, sender, 3),
                                     (FrameMode::Sender, creator, 0),

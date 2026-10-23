@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Binary fixture identity; schema changes require regeneration.
-const BINARY_FORMAT: [u8; 5] = *b"EV2F\x01";
+const BINARY_FORMAT: [u8; 5] = *b"EV2F\x02";
 
 pub(crate) fn to_vec(suite: &BlockchainTest) -> Result<Vec<u8>, postcard::Error> {
     postcard::to_allocvec(&(BINARY_FORMAT, BlockchainTestRef::new(suite)))
@@ -138,6 +138,7 @@ struct TransactionWire {
     chain_id: Option<U256>,
     access_list: Option<Vec<AccessListItem>>,
     max_fee_per_gas: Option<U256>,
+    max_fee: Option<U256>,
     max_priority_fee_per_gas: Option<U256>,
     blob_versioned_hashes: Vec<B256>,
     max_fee_per_blob_gas: Option<U256>,
@@ -166,6 +167,7 @@ impl TransactionWire {
             chain_id: tx.chain_id,
             access_list: tx.access_list.clone(),
             max_fee_per_gas: tx.max_fee_per_gas,
+            max_fee: tx.max_fee,
             max_priority_fee_per_gas: tx.max_priority_fee_per_gas,
             blob_versioned_hashes: tx.blob_versioned_hashes.clone(),
             max_fee_per_blob_gas: tx.max_fee_per_blob_gas,
@@ -199,6 +201,7 @@ impl From<TransactionWire> for Transaction {
             chain_id: value.chain_id,
             access_list: value.access_list,
             max_fee_per_gas: value.max_fee_per_gas,
+            max_fee: value.max_fee,
             max_priority_fee_per_gas: value.max_priority_fee_per_gas,
             blob_versioned_hashes: value.blob_versioned_hashes,
             max_fee_per_blob_gas: value.max_fee_per_blob_gas,
@@ -338,7 +341,7 @@ mod tests {
     #[test]
     fn binary_frame_fixture_preserves_full_width_metadata_and_authoritative_wire_bytes() {
         let raw = hex!(
-            "06e70180941111111111111111111111111111111111111111c9c8808080c280808080c0c3808080c0"
+            "06e60180941111111111111111111111111111111111111111c9c8808080c280808080c0c28080c0"
         );
         let transaction = Transaction {
             txbytes: Some(raw.to_vec().into()),
@@ -346,6 +349,7 @@ mod tests {
             sender: Some(Address::repeat_byte(0x22)),
             nonce_keys: Some(vec![U256::ONE, U256::MAX]),
             max_fee_per_gas: Some(U256::MAX),
+            max_fee: Some(U256::MAX - U256::from(3)),
             max_priority_fee_per_gas: Some(U256::MAX - U256::ONE),
             max_fee_per_blob_gas: Some(U256::MAX - U256::from(2)),
             frames: Some(vec![TestFrame {
@@ -398,7 +402,7 @@ mod tests {
             assert_eq!(reference.caller, Address::repeat_byte(0x11));
             let frame = reference.frame_transaction.unwrap();
             assert_eq!(frame.nonce_keys, None);
-            assert_eq!(frame.max_fee_per_gas, U256::ZERO);
+            assert_eq!(frame.max_fee, U256::ZERO);
             assert_eq!(frame.frames, vec![alloy_eips::eip8141::Frame::default()]);
         }
         let mut wrong_schema = encoded.clone();
@@ -411,7 +415,7 @@ mod tests {
 
     #[test]
     fn binary_format_is_checked_before_decoding_the_fixture_payload() {
-        for input in [&[][..], b"EV2F", b"EV2F\0\xff", b"EV2F\x02\xff", b"\xff\xff\xff\xff\xff"] {
+        for input in [&[][..], b"EV2F", b"EV2F\0\xff", b"EV2F\x01\xff", b"\xff\xff\xff\xff\xff"] {
             assert!(matches!(from_bytes(input), Err(postcard::Error::DeserializeBadEncoding)));
         }
         assert!(matches!(

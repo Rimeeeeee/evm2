@@ -119,6 +119,8 @@ pub struct TransactionParts {
     pub value: Vec<U256>,
     /// EIP-1559 max fee.
     pub max_fee_per_gas: Option<U256>,
+    /// EIP-8141 total signed fee budget.
+    pub max_fee: Option<U256>,
     /// EIP-1559 priority fee.
     pub max_priority_fee_per_gas: Option<U256>,
     /// EIP-7873 initcodes.

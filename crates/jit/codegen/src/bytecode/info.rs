@@ -117,7 +117,6 @@ const DYNAMIC_WITH_BASE_GAS: &[u8] = &[
     op::FRAMEDATACOPY,
     op::SIGDATACOPY,
     op::EVENTDATACOPY,
-    op::TXDIFF,
 ];
 
 /// Opcodes whose gas cost is entirely dynamic — computed fully in builtins at runtime.
@@ -157,7 +156,6 @@ const SPEC_GATED_OPCODES: &[(u8, SpecId)] = &[
     (op::SIGPARAM, SpecId::BOGOTA),
     (op::SIGDATACOPY, SpecId::BOGOTA),
     (op::TXTRACE, SpecId::BOGOTA),
-    (op::TXDIFF, SpecId::BOGOTA),
     (op::EVENTDATACOPY, SpecId::BOGOTA),
 ];
 

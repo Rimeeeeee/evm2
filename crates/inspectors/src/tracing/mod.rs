@@ -803,7 +803,7 @@ impl<T: EvmTypes> Inspector<T> for TracingInspector {
                 frame.resolved_target(sender),
                 frame.data.clone(),
                 frame.value,
-                if matches!(frame.mode, FrameMode::Verify | FrameMode::PostTx) {
+                if matches!(frame.mode, FrameMode::Verify | FrameMode::Assert) {
                     CallKind::StaticCall
                 } else {
                     CallKind::Call

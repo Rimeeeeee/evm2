@@ -330,7 +330,7 @@ mod tests {
     fn frame_regressions_replay_every_scenario_with_account_and_keyed_nonces() {
         let mut native = Evm2Backend::default();
         let mut reference = RevmBackend::default();
-        for scenario in 0..14 {
+        for scenario in 0..16 {
             for keyed in [false, true] {
                 let case = CaseGenerator::frame_regression_case(scenario, keyed);
                 let encoded = serde_json::to_vec(&case).unwrap();
@@ -339,7 +339,7 @@ mod tests {
                 assert_eq!(native.run(&case), expected, "scenario {scenario}, keyed {keyed}");
                 assert_eq!(reference.run(&replay), expected);
                 assert_eq!(native.run(&replay), expected);
-                if matches!(scenario, 9..=12) {
+                if matches!(scenario, 9..=12 | 15) {
                     assert_eq!(expected.kind, FuzzOutcomeKind::Error);
                 } else if scenario == 13 {
                     let verifier = &case.tx.frame_transaction.as_ref().unwrap().frames[0];

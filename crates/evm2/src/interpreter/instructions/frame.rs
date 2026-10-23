@@ -2,7 +2,6 @@
 
 use crate::{
     EvmTypesHost,
-    ethereum::eip7906::TxDiffParam,
     interpreter::{Host, InstrStop, Result, Word, private::GasInstructionCx},
     utils::{WordExt, b256_to_word, read_word_padded},
 };
@@ -11,7 +10,7 @@ use evm2_macros::instruction;
 
 #[instruction(dynamic_gas)]
 pub fn approve(cx: _, [offset, len, scope]: [Word]) -> Result {
-    if cx.state.host().is_post_tx_frame() {
+    if cx.state.host().is_assert_frame() {
         return Err(InstrStop::StateChangeDuringStaticCall);
     }
     let len = len.to_usize()?;
@@ -95,28 +94,6 @@ pub fn sigdatacopy(cx: _, [memory, offset, len, index]: [Word]) -> Result {
 #[instruction]
 pub fn txtrace(cx: _, [param, index]: [Word]) -> Result<out> {
     *out = cx.state.host().txtrace(*param, *index).ok_or(InstrStop::OpcodeNotFound)?;
-}
-
-#[instruction(dynamic_gas)]
-pub fn txdiff(cx: _, [param, in2, in3]: [Word]) -> Result<out> {
-    let selector = u8::try_from(*param)
-        .ok()
-        .and_then(|p| TxDiffParam::try_from(p).ok())
-        .ok_or(InstrStop::OpcodeNotFound)?;
-    let cold = if selector.is_storage_lookup() {
-        u64::from(cx.state.gas_params().get(crate::version::GasId::ColdStorageAdditionalCost))
-    } else if selector.is_account_lookup() {
-        cx.state.gas_params().cold_account_additional_cost()
-    } else {
-        0
-    };
-    let skip = cx.gas.remaining() < cold;
-    let (value, is_cold) =
-        cx.state.host().txdiff(*param, *in2, *in3, skip).map_err(|e| cx.state.fail(e))?;
-    if is_cold {
-        cx.gas.spend(cold)?;
-    }
-    *out = value;
 }
 
 #[instruction(dynamic_gas)]

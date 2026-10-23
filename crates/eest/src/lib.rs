@@ -52,9 +52,11 @@ pub use fixture_io::{
     read_blockchain as read_blockchain_fixture, read_to_string as read_fixture_text,
     write_blockchain as write_blockchain_fixture,
 };
-pub use reference::{reference_block_transaction, reference_tx};
 pub use runner::run as run_statetests;
-pub use tx::{AccessListItem, TestAuthorization, TestFrame, TestFrameSignature};
+pub use tx::{
+    AccessListItem, TestAuthorization, TestFrame, TestFrameSignature, TxBuildError,
+    reference_block_transaction, reference_tx,
+};
 pub use types::{
     AccountInfo as StateTestAccountInfo, Env as StateTestEnv, SpecName as StateTestSpecName,
     Test as StateTestPost, TestSuite as StateTestSuite, TestUnit as StateTestUnit,

@@ -19,7 +19,7 @@ fn transaction(data: Bytes) -> Recovered<TxEnvelope> {
         TxEnvelope::Eip8141(TxEip8141 {
             chain_id: 1,
             sender: SENDER,
-            nonce_keys: Some(vec![U256::ZERO]),
+            nonce_keys: Some(vec![]),
             frames: [
                 (FrameMode::Verify, SENDER, 3, Bytes::new()),
                 (FrameMode::Sender, BODY, 0, data),

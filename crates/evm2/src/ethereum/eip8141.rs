@@ -1,12 +1,10 @@
-//! Bogota devnet 1 frame transaction preparation and ordered execution.
-//!
-//! Newer draft signing, nonce and assertion layouts must not be enabled under this fork.
+//! Bogota frame transaction preparation and ordered execution.
 
-use super::{effective_gas_price, validate_chain_id, validate_gas_price, validate_priority_fee};
+use super::{validate_block_gas_limit, validate_chain_id};
 use crate::{
     Evm, EvmFeatures, EvmTypes, HostError, TxResult, TxResultExt, Version,
     bytecode::Bytecode,
-    env::TxEnvExt,
+    env::{TxEnv, TxEnvExt},
     evm::{FrameTransactionResult, StateCheckpoint, frame::FrameTransactionRuntime},
     interpreter::{
         GasTracker, Host, InstrStop, Message, MessageExt, MessageKind, MessageResultExt,
@@ -16,7 +14,7 @@ use crate::{
     version::GasId,
 };
 use alloc::{sync::Arc, vec::Vec};
-use alloy_consensus::{TxEip8141, transaction::Recovered};
+use alloy_consensus::TxEip8141;
 use alloy_eips::{
     eip4844::{DATA_GAS_PER_BLOB, VERSIONED_HASH_VERSION_KZG},
     eip8141::{
@@ -47,19 +45,19 @@ pub struct FrameGas {
 #[derive(Clone, Debug)]
 pub struct PreparedFrameTx {
     /// Canonical immutable payload with its explicit sender.
-    pub payload: Arc<TxEip8141>,
+    pub(super) payload: Arc<TxEip8141>,
     /// Canonical Bogota signing hash.
-    pub signature_hash: B256,
+    pub(super) signature_hash: B256,
     /// Active-schedule gas and reservation metadata.
-    pub gas: FrameGas,
-    /// Effective execution gas price.
-    pub gas_price: U256,
+    pub(super) gas: FrameGas,
+    /// Transaction-wide lower bound returned by GASPRICE.
+    pub(super) gas_price: U256,
     /// Blob fee charged at the current block's blob base fee.
-    pub blob_charge: U256,
-    /// Maximum amount collected at payment approval.
-    pub max_cost: U256,
+    pub(super) blob_charge: U256,
+    /// Amount escrowed at payment approval, bounded by the signed max_fee.
+    pub(super) max_cost: U256,
     /// Legacy account nonce before any frame executes.
-    pub legacy_nonce: u64,
+    pub(super) legacy_nonce: u64,
 }
 
 /// Read-only executable-prefix result consumed by node admission policy.
@@ -101,10 +99,7 @@ impl FrameGas {
             tx.nonce_keys.as_deref().map(|keys| nonce_calldata(keys, tx.nonce)).unwrap_or_default();
         let sum = |a: u64, b: u64| a.checked_add(b).ok_or(invalid("gas arithmetic overflow"));
         let mul = |a: u64, b: u64| a.checked_mul(b).ok_or(invalid("gas arithmetic overflow"));
-        let count = tx
-            .nonce_keys
-            .as_deref()
-            .map_or(0, |keys| if keys == [U256::ZERO] { 0 } else { keys.len() as u64 });
+        let count = tx.nonce_keys.as_deref().map_or(0, |keys| keys.len() as u64);
         let access = mul(
             count,
             sum(
@@ -129,7 +124,11 @@ impl FrameGas {
         let mut fields = core::iter::once(nonce_data.as_slice())
             .chain(tx.frames.iter().map(|frame| frame.data.as_ref()))
             .chain(tx.signatures.iter().flat_map(|sig| {
-                [sig.signer.as_bytes(), sig.msg.as_bytes(), sig.signature.as_ref()]
+                [
+                    sig.signer.as_bytes(),
+                    sig.msg.as_bytes(),
+                    if sig.signs_transaction_hash() { &[] } else { sig.signature.as_ref() },
+                ]
             }));
         let (tokens, floor_tokens) = fields.try_fold((0, 0), |total, bytes| {
             bytes.iter().try_fold(total, |(tokens, floor), byte| {
@@ -147,6 +146,23 @@ impl FrameGas {
                 ))
             })
         })?;
+        // The signing hash commits to an empty-message witness's length, so its intrinsic
+        // price must depend on that length alone, including when its bytes are all zero.
+        let elided_tokens = tx
+            .signatures
+            .iter()
+            .filter(|sig| sig.signs_transaction_hash())
+            .try_fold(0, |s, sig| {
+                sum(
+                    s,
+                    mul(
+                        sig.signature.len() as u64,
+                        gp.get(GasId::TxTokenNonZeroByteMultiplier).into(),
+                    )?,
+                )
+            })?;
+        let tokens = sum(tokens, elided_tokens)?;
+        let floor_tokens = sum(floor_tokens, elided_tokens)?;
         let intrinsic = sum(base, mul(tokens, gp.get(GasId::TxTokenCost).into())?)?;
         let floor = sum(base, mul(floor_tokens, gp.get(GasId::TxFloorCostPerToken).into())?)?;
         let execution =
@@ -157,11 +173,53 @@ impl FrameGas {
     }
 }
 
+/// Executes an EIP-8141 transaction using Ethereum rules.
+pub fn handle<T: EvmTypes>(mut req: TxRequest<'_, '_, T, TxEip8141>) -> HandlerResult<TxResult<T>> {
+    let prepared = prepare(&mut req)?;
+    execute_prepared(req, prepared)
+}
+
 /// Performs shared preparation without executing a frame or consuming a nonce.
 pub fn prepare<T: EvmTypes>(
     req: &mut TxRequest<'_, '_, T, TxEip8141>,
 ) -> HandlerResult<PreparedFrameTx> {
     prepare_payload(req.host, req.tx.inner())
+}
+
+/// Executes the already-prepared frame transaction and settles payment once.
+pub fn execute_prepared<T: EvmTypes>(
+    req: TxRequest<'_, '_, T, TxEip8141>,
+    prepared: PreparedFrameTx,
+) -> HandlerResult<TxResult<T>> {
+    let host = req.host;
+    let result = run(host, &prepared, None);
+    host.frame_tx = None;
+    result
+}
+
+pub(crate) fn validate_prefix<T: EvmTypes>(
+    host: &mut Evm<'_, T>,
+    payload: &TxEip8141,
+    prefix_end: usize,
+) -> HandlerResult<FrameValidationResult> {
+    if prefix_end == 0 || prefix_end > payload.frames.len() {
+        return Err(invalid("prefix outside frame bounds"));
+    }
+    let prepared = prepare_payload(host, payload)?;
+    let result = run(host, &prepared, Some(prefix_end))?;
+    let frame = result.frame.as_ref().unwrap();
+    if frame.receipts.len() != prefix_end {
+        return Err(invalid("validation prefix boundary mismatch"));
+    }
+    Ok(FrameValidationResult {
+        payer: frame.payer,
+        max_cost: prepared.max_cost,
+        prefix_end,
+        sender_approved: host.frame_tx.as_ref().unwrap().approval.sender_approved,
+        signature_gas: prepared.gas.signatures,
+        execution_gas: frame.receipts.iter().map(|receipt| receipt.gas_used.execution).sum(),
+        state_gas: result.state_gas_spent,
+    })
 }
 
 fn prepare_payload<T: EvmTypes>(
@@ -179,7 +237,7 @@ fn prepare_payload<T: EvmTypes>(
     if let Some(keys) = &tx.nonce_keys {
         validate_nonce_keys(keys).map_err(invalid)?;
     }
-    if tx.nonce == u64::MAX {
+    if tx.nonce == u64::MAX && tx.nonce_keys.as_ref().is_none_or(Vec::is_empty) {
         return Err(HandlerError::NonceOverflow);
     }
     let gas = FrameGas::calculate(tx, host.version())?;
@@ -189,26 +247,8 @@ fn prepare_payload<T: EvmTypes>(
             cap: host.version().tx_gas_limit_cap,
         });
     }
-    if host.feature(EvmFeatures::BLOCK_GAS_LIMIT_CHECK)
-        && U256::from(gas.execution.max(gas.state)) > host.block.gas_limit
-    {
-        return Err(HandlerError::GasLimitMoreThanBlock {
-            gas_limit: gas.execution.max(gas.state),
-            block_gas_limit: host.block.gas_limit,
-        });
-    }
+    validate_block_gas_limit(host.version(), gas.execution.max(gas.state), host.block.gas_limit)?;
     validate_chain_id(host.version(), Some(tx.chain_id), false)?;
-    validate_priority_fee(
-        host.version(),
-        tx.fees.max_fee_per_gas,
-        tx.fees.max_priority_fee_per_gas,
-    )?;
-    let gas_price = effective_gas_price(
-        tx.fees.max_fee_per_gas,
-        tx.fees.max_priority_fee_per_gas,
-        host.block.basefee,
-    );
-    validate_gas_price(host.version(), gas_price, host.block.basefee)?;
     if tx.blob_versioned_hashes.len() > host.version().max_blobs_per_tx {
         return Err(HandlerError::TooManyBlobs {
             have: tx.blob_versioned_hashes.len(),
@@ -218,30 +258,34 @@ fn prepare_payload<T: EvmTypes>(
     if tx.blob_versioned_hashes.iter().any(|h| h[0] != VERSIONED_HASH_VERSION_KZG) {
         return Err(HandlerError::BlobVersionNotSupported);
     }
-    if !tx.blob_versioned_hashes.is_empty()
-        && tx.fees.max_fee_per_blob_gas < host.block.blob_basefee
-    {
-        return Err(HandlerError::BlobFeeCapLessThanBlobBaseFee {
-            max_fee_per_blob_gas: tx.fees.max_fee_per_blob_gas,
-            blob_base_fee: host.block.blob_basefee,
-        });
-    }
     let blob_charge = U256::from(tx.blob_versioned_hashes.len())
         .checked_mul(U256::from(DATA_GAS_PER_BLOB))
         .and_then(|v| v.checked_mul(host.block.blob_basefee))
         .ok_or(invalid("payment overflow"))?;
-    let max_cost = U256::from(gas.maximum)
-        .checked_mul(tx.fees.max_fee_per_gas)
+    let max_gas = U256::from(gas.maximum);
+    let required_max_fee = max_gas
+        .checked_mul(host.block.basefee)
         .and_then(|v| v.checked_add(blob_charge))
         .ok_or(invalid("payment overflow"))?;
+    let budget_left = tx
+        .fees
+        .max_fee
+        .checked_sub(required_max_fee)
+        .ok_or(invalid("max fee below required base-fee budget"))?;
+    // The requested tip product can exceed U256 even when the signed budget is valid.
+    // Saturating before the minimum preserves the arbitrary-precision result.
+    let max_priority_fee =
+        tx.fees.max_priority_fee_per_gas.saturating_mul(max_gas).min(budget_left);
+    let max_cost = required_max_fee + max_priority_fee;
+    let gas_price = host.block.basefee + max_priority_fee / max_gas;
     let signature_hash = tx.signature_hash();
     validate_signatures(tx, signature_hash, placeholders)?;
     if host.feature(EvmFeatures::NONCE_CHECK)
-        && let Some(keys) = tx.nonce_keys.as_deref().filter(|keys| *keys != [U256::ZERO])
+        && let Some(keys) = tx.nonce_keys.as_deref().filter(|keys| !keys.is_empty())
     {
         for key in keys {
             if host.state.storage(&NONCE_MANAGER)?.into_slot(nonce_slot(tx.sender, *key))?.current()
-                != U256::from(tx.nonce)
+                != U256::from(if tx.nonce == u64::MAX { 0 } else { tx.nonce })
             {
                 return Err(invalid("nonce sequence mismatch"));
             }
@@ -327,14 +371,8 @@ fn validate_structure(tx: &TxEip8141, placeholders: bool) -> HandlerResult<()> {
     if tx.frames.is_empty() || tx.frames.len() > 64 {
         return Err(invalid("EIP-8141 frame count must be in 1..=64"));
     }
-    if !alloy_eips::eip8141::has_valid_post_tx_suffix(&tx.frames) {
-        return Err(invalid("EIP-7906 POST_TX frames must form a trailing suffix"));
-    }
-    if tx.blob_versioned_hashes.is_empty() && !tx.fees.max_fee_per_blob_gas.is_zero() {
-        return Err(invalid("blob fee is non-zero without blob hashes"));
-    }
-    if !tx.blob_versioned_hashes.is_empty() && tx.fees.max_fee_per_blob_gas.is_zero() {
-        return Err(invalid("blob hashes require a non-zero blob fee"));
+    if !alloy_eips::eip8141::has_valid_assert_suffix(&tx.frames) {
+        return Err(invalid("EIP-7906 ASSERT frames must form a trailing suffix"));
     }
     let mut expiry = false;
     for (index, frame) in tx.frames.iter().enumerate() {
@@ -342,8 +380,8 @@ fn validate_structure(tx: &TxEip8141, placeholders: bool) -> HandlerResult<()> {
         if frame.has_reserved_flags() {
             return Err(invalid("reserved EIP-8141 frame flag is set"));
         }
-        if frame.is_post_tx() && (frame.is_atomic_batch() || previous_atomic) {
-            return Err(invalid("EIP-7906 atomic batch cannot contain a POST_TX frame"));
+        if frame.is_assert() && (frame.is_atomic_batch() || previous_atomic) {
+            return Err(invalid("EIP-7906 atomic batch cannot contain an ASSERT frame"));
         }
         if frame.mode != FrameMode::Sender && !frame.value.is_zero() {
             return Err(invalid("frame value is only valid in sender mode"));
@@ -390,35 +428,35 @@ fn validate_structure(tx: &TxEip8141, placeholders: bool) -> HandlerResult<()> {
     Ok(())
 }
 
-/// Executes the already-prepared frame transaction and settles payment once.
-pub fn execute_prepared<T: EvmTypes>(
-    req: TxRequest<'_, '_, T, TxEip8141>,
-    prepared: PreparedFrameTx,
-) -> HandlerResult<TxResult<T>> {
-    let host = req.host;
-    let result = run(host, &prepared, None);
-    host.frame_tx = None;
-    result
-}
-
 fn run<T: EvmTypes>(
     host: &mut Evm<'_, T>,
-    p: &PreparedFrameTx,
+    prepared: &PreparedFrameTx,
     prefix: Option<usize>,
 ) -> HandlerResult<TxResult<T>> {
-    let tx = &p.payload;
-    let mut runtime = FrameTransactionRuntime::with_capacity(tx.sender, tx.frames.len());
-    runtime.payload = tx.clone();
-    runtime.signature_hash = p.signature_hash;
-    runtime.max_cost = p.max_cost;
-    runtime.legacy_nonce = p.legacy_nonce;
-    host.frame_tx = Some(runtime);
+    let tx = &prepared.payload;
+    host.frame_tx = Some(FrameTransactionRuntime::new(
+        tx.clone(),
+        prepared.signature_hash,
+        prepared.max_cost,
+        prepared.legacy_nonce,
+    ));
     host.inspect_frame(|inspector, host| inspector.frame_transaction_start(tx, host));
     host.state.account(&tx.sender)?.warm();
     if host.feature(EvmFeatures::EIP3651) {
         host.state.prewarm(&host.block.beneficiary);
     }
     host.warm_precompiles();
+    let mut tx_env = TxEnvExt {
+        origin: ENTRY_POINT,
+        gas_price: prepared.gas_price,
+        chain_id: U256::from(host.version().chain_id),
+        blob_hashes: tx
+            .blob_versioned_hashes
+            .iter()
+            .map(|hash| U256::from_be_bytes(hash.0))
+            .collect(),
+        ..TxEnv::<T>::default()
+    };
     let mut receipts = Vec::<FrameReceipt>::with_capacity(tx.frames.len());
     let mut outputs = Vec::with_capacity(tx.frames.len());
     let mut refunds = Vec::with_capacity(tx.frames.len());
@@ -433,23 +471,26 @@ fn run<T: EvmTypes>(
         if prefix == Some(i) {
             break;
         }
-        let f = &tx.frames[i];
-        if f.mode == FrameMode::Sender && !host.frame_tx.as_ref().unwrap().approval.sender_approved
+        let frame = &tx.frames[i];
+        if frame.mode == FrameMode::Sender
+            && !host.frame_tx.as_ref().unwrap().approval.sender_approved
         {
             return Err(invalid("SENDER before execution approval"));
         }
-        if batch.is_none() && f.is_atomic_batch() {
+        if batch.is_none() && frame.is_atomic_batch() {
             batch = Some(checkpoint(host, receipts.len(), true));
         }
         let state = host.state.checkpoint();
         let rt = host.frame_tx.as_mut().unwrap();
         rt.current_frame_index = i;
-        rt.resolved_target = f.resolved_target(tx.sender);
+        rt.resolved_target = frame.resolved_target(tx.sender);
         rt.state_gas_used.push(0);
         let gas_checkpoint = rt.state_gas_checkpoint();
         let log_start = host.logs().len();
-        host.inspect_frame(|inspector, host| inspector.frame_start(i, f, host));
-        let (stop, execution, state_used, refund, output) = execute_frame(host, p, f)?;
+        host.inspect_frame(|inspector, host| inspector.frame_start(i, frame, host));
+        tx_env.origin = if frame.mode == FrameMode::Sender { tx.sender } else { ENTRY_POINT };
+        let (stop, execution, state_used, refund, output) =
+            execute_frame(host, &tx_env, tx, frame)?;
         stops[i] = stop;
         if !stop.is_success() {
             host.state.rollback(state, host.version().features);
@@ -466,7 +507,7 @@ fn run<T: EvmTypes>(
         host.inspect_frame(|inspector, host| {
             inspector.frame_end(i, receipts.last().unwrap(), &output, stop, host)
         });
-        if f.mode == FrameMode::Verify && !stop.is_success() {
+        if frame.mode == FrameMode::Verify && !stop.is_success() {
             return Err(invalid("VERIFY frame failed"));
         }
         outputs.push(output);
@@ -481,7 +522,7 @@ fn run<T: EvmTypes>(
         if body.is_none() && stop.is_success() && rt.approval.payer.is_some() {
             body = Some(checkpoint(host, receipts.len(), false));
         }
-        if !stop.is_success() && f.mode == FrameMode::PostTx {
+        if !stop.is_success() && frame.mode == FrameMode::Assert {
             if let Some(c) = body.take() {
                 rolled_back[c.start..receipts.len() - 1].fill(true);
                 rollback(host, c, &mut receipts, &mut refunds, &mut outputs, true);
@@ -502,7 +543,7 @@ fn run<T: EvmTypes>(
                 i += 1;
                 skipped(host, &mut receipts, &mut refunds, &mut outputs);
             }
-        } else if !f.is_atomic_batch() {
+        } else if !frame.is_atomic_batch() {
             batch = None;
         }
         if let Some(prefix_end) = prefix
@@ -525,7 +566,7 @@ fn run<T: EvmTypes>(
     }
     let state = receipts.iter().map(|r| r.gas_used.state).sum::<u64>();
     let spent =
-        p.gas.intrinsic + receipts.iter().map(|r| r.gas_used.execution).sum::<u64>() + state;
+        prepared.gas.intrinsic + receipts.iter().map(|r| r.gas_used.execution).sum::<u64>() + state;
     let refund = refunds.into_iter().fold(0i64, i64::saturating_add).max(0) as u64;
     let refund =
         refund.min(spent / u64::from(host.version().gas_params.get(GasId::MaxRefundQuotient)));
@@ -533,7 +574,7 @@ fn run<T: EvmTypes>(
         status: !failed,
         total_gas_spent: spent,
         state_gas_spent: state,
-        floor_gas: p.gas.floor,
+        floor_gas: prepared.gas.floor,
         refunded: refund,
         stop: if failed { InstrStop::Revert } else { InstrStop::Return },
         frame: Some(FrameTransactionResult {
@@ -547,20 +588,36 @@ fn run<T: EvmTypes>(
         }),
         ..Default::default()
     };
-    if prefix.is_none() && host.feature(EvmFeatures::FEE_CHARGE) {
-        let used = U256::from(result.tx_gas_used());
-        let actual = used
-            .checked_mul(p.gas_price)
-            .and_then(|v| v.checked_add(p.blob_charge))
-            .ok_or(invalid("settlement overflow"))?;
-        host.state.account(&payer)?.add_balance(precharge.saturating_sub(actual));
-        let beneficiary = host.block.beneficiary;
-        host.state
-            .account(&beneficiary)?
-            .add_balance(used * p.gas_price.saturating_sub(host.block.basefee));
+    if prefix.is_none() {
+        settle_fees(host, prepared, &result)?;
     }
     host.inspect_frame(|inspector, host| inspector.frame_transaction_end(&result, host));
     Ok(result)
+}
+
+fn settle_fees<T: EvmTypes>(
+    host: &mut Evm<'_, T>,
+    prepared: &PreparedFrameTx,
+    result: &TxResult<T>,
+) -> HandlerResult<()> {
+    if !host.feature(EvmFeatures::FEE_CHARGE) {
+        return Ok(());
+    }
+    let used = U256::from(result.tx_gas_used());
+    let base_fee_paid = used
+        .checked_mul(host.block.basefee)
+        .and_then(|value| value.checked_add(prepared.blob_charge))
+        .ok_or(invalid("settlement overflow"))?;
+    let available_tip =
+        prepared.max_cost.checked_sub(base_fee_paid).ok_or(invalid("settlement overflow"))?;
+    let priority_fee_paid =
+        prepared.payload.fees.max_priority_fee_per_gas.saturating_mul(used).min(available_tip);
+    let actual = base_fee_paid + priority_fee_paid;
+    let frame = result.frame.as_ref().expect("frame handler produces frame results");
+    host.state.account(&frame.payer)?.add_balance(frame.precharge.saturating_sub(actual));
+    let beneficiary = host.block.beneficiary;
+    host.state.account(&beneficiary)?.add_balance(priority_fee_paid);
+    Ok(())
 }
 
 fn checkpoint<T: EvmTypes>(host: &Evm<'_, T>, start: usize, warmth: bool) -> Batch {
@@ -587,9 +644,7 @@ fn rollback<T: EvmTypes>(
         host.state.restore_frame_warmth(&warmth);
     }
     let rt = host.frame_tx.as_mut().unwrap();
-    rt.approval = c.approval;
-    rt.root_approval = None;
-    rt.approval_stack.clear();
+    rt.restore_approval(c.approval);
     rt.revert_state_gas(c.gas);
     for j in c.start..receipts.len().saturating_sub(1) {
         receipts[j].logs.clear();
@@ -628,12 +683,12 @@ fn skipped<T: EvmTypes>(
 
 fn execute_frame<T: EvmTypes>(
     host: &mut Evm<'_, T>,
-    p: &PreparedFrameTx,
-    f: &Frame,
+    tx_env: &TxEnv<T>,
+    tx: &TxEip8141,
+    frame: &Frame,
 ) -> HandlerResult<(InstrStop, u64, u64, i64, Bytes)> {
-    let target = f.resolved_target(p.payload.sender);
-    let mut gas = GasTracker::new_isolated(f.limits.execution, f.limits.state);
-    let caller = if f.mode == FrameMode::Sender { p.payload.sender } else { ENTRY_POINT };
+    let target = frame.resolved_target(tx.sender);
+    let mut gas = GasTracker::new_isolated(frame.limits.execution, frame.limits.state);
     let run = (|| -> Result<MessageResultExt<T::MessageResultExt>, HostError> {
         let warm = host.version().gas_params.get(GasId::WarmStorageReadCost) as u64;
         let cold = host.version().gas_params.cold_account_additional_cost();
@@ -642,10 +697,10 @@ fn execute_frame<T: EvmTypes>(
         if load.is_cold {
             gas.spend(cold)?;
         }
-        if !f.value.is_zero() && host.state.account(&p.payload.sender)?.balance() < f.value {
+        if !frame.value.is_zero() && host.state.account(&tx.sender)?.balance() < frame.value {
             return Err(InstrStop::OutOfFunds.into());
         }
-        if !f.value.is_zero() && load.is_empty {
+        if !frame.value.is_zero() && load.is_empty {
             gas.spend_state(host.version().gas_params.new_account_state_gas())?;
         }
         let precompile = host.precompiles().contains(&target);
@@ -664,20 +719,8 @@ fn execute_frame<T: EvmTypes>(
             code = load.code;
             code_address = delegate;
         }
-        let env = TxEnvExt {
-            origin: caller,
-            gas_price: p.gas_price,
-            chain_id: U256::from(host.version().chain_id),
-            blob_hashes: p
-                .payload
-                .blob_versioned_hashes
-                .iter()
-                .map(|h| U256::from_be_bytes(h.0))
-                .collect(),
-            ..Default::default()
-        };
         let mut message = MessageExt {
-            kind: if matches!(f.mode, FrameMode::Verify | FrameMode::PostTx) {
+            kind: if matches!(frame.mode, FrameMode::Verify | FrameMode::Assert) {
                 MessageKind::StaticCall
             } else {
                 MessageKind::Call
@@ -686,14 +729,14 @@ fn execute_frame<T: EvmTypes>(
             reservoir: gas.reservoir(),
             destination: target,
             call_target: target,
-            caller,
+            caller: tx_env.origin,
             code,
             code_address,
-            input: f.data.clone(),
-            value: f.value,
+            input: frame.data.clone(),
+            value: frame.value,
             ..Message::<T>::default()
         };
-        Ok(host.execute_message(&env, &mut message)?)
+        Ok(host.execute_message(tx_env, &mut message)?)
     })();
     let (stop, state, refund, output) = match run {
         Ok(result) => {
@@ -701,7 +744,7 @@ fn execute_frame<T: EvmTypes>(
             gas.set_reservoir(result.gas.reservoir());
             (
                 result.stop,
-                f.limits.state.saturating_sub(result.gas.reservoir()),
+                frame.limits.state.saturating_sub(result.gas.reservoir()),
                 result.gas.refunded(),
                 result.output,
             )
@@ -712,47 +755,12 @@ fn execute_frame<T: EvmTypes>(
     Ok((
         stop,
         if stop.is_halt() && stop != InstrStop::OutOfFunds {
-            f.limits.execution
+            frame.limits.execution
         } else {
-            f.limits.execution - gas.remaining()
+            frame.limits.execution - gas.remaining()
         },
         if stop.is_success() { state } else { 0 },
         if stop.is_success() { refund } else { 0 },
         output,
     ))
-}
-
-impl<T: EvmTypes<Tx = super::TxEnvelope>> Evm<'_, T> {
-    /// Validates all signatures, executes only the payable prefix, and discards all effects.
-    ///
-    /// Prefix execution always uses the interpreter, including when full transactions use a
-    /// compiled runner. This preserves per-opcode admission observations in reverted calls.
-    pub fn validate_frame_prefix(
-        &mut self,
-        tx: &Recovered<T::Tx>,
-        prefix_end: usize,
-    ) -> HandlerResult<FrameValidationResult> {
-        self.simulate_frames(|this| {
-            let payload =
-                tx.inner().as_eip8141().ok_or(invalid("prefix requires a frame transaction"))?;
-            if prefix_end == 0 || prefix_end > payload.frames.len() {
-                return Err(invalid("prefix outside frame bounds"));
-            }
-            let p = prepare_payload(this, payload)?;
-            let r = run(this, &p, Some(prefix_end))?;
-            let frame = r.frame.as_ref().unwrap();
-            if frame.receipts.len() != prefix_end {
-                return Err(invalid("validation prefix boundary mismatch"));
-            }
-            Ok(FrameValidationResult {
-                payer: frame.payer,
-                max_cost: p.max_cost,
-                prefix_end,
-                sender_approved: this.frame_tx.as_ref().unwrap().approval.sender_approved,
-                signature_gas: p.gas.signatures,
-                execution_gas: frame.receipts.iter().map(|r| r.gas_used.execution).sum(),
-                state_gas: r.state_gas_spent,
-            })
-        })
-    }
 }

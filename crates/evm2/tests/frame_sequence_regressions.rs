@@ -140,13 +140,13 @@ fn generated_sequences_match_rollback_model_and_inspected_prefix_reuse() {
                         frames.push(f);
                     }
                     if assertions != 0 {
-                        frames.extend(vec![frame(FrameMode::PostTx, ASSERTION, 0); 2]);
+                        frames.extend(vec![frame(FrameMode::Assert, ASSERTION, 0); 2]);
                     }
                     let tx = Recovered::new_unchecked(
                         TxEnvelope::Eip8141(TxEip8141 {
                             chain_id: 1,
                             sender: SENDER,
-                            nonce_keys: Some(vec![if keyed { U256::from(1) } else { U256::ZERO }]),
+                            nonce_keys: Some(if keyed { vec![U256::from(1)] } else { vec![] }),
                             frames,
                             ..Default::default()
                         }),

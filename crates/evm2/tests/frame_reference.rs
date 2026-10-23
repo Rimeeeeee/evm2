@@ -2,14 +2,14 @@
 
 use alloy_consensus::{TxEip8141, transaction::Recovered};
 use alloy_eips::eip8141::{
-    Frame, FrameLimits, FrameMode, FrameReceipt, NONCE_MANAGER, nonce_calldata,
+    Frame, FrameLimits, FrameMode, FrameReceipt, NONCE_MANAGER, nonce_calldata, nonce_slot,
 };
 use alloy_primitives::{Address, B256, Bytes, Log, U256};
 use evm2::{
-    BaseEvmTypes, Evm, Precompiles, SpecId,
+    BaseEvmTypes, Evm, Precompiles, SpecId, Version,
     bytecode::Bytecode,
     env::BlockEnvExt,
-    ethereum::{TxEnvelope, ethereum_tx_registry},
+    ethereum::{TxEnvelope, eip8141::FrameGas, ethereum_tx_registry},
     evm::{AccountInfo, InMemoryDB},
 };
 use revm::{
@@ -35,6 +35,7 @@ struct Case {
     storage: Vec<(Address, U256, U256)>,
     basefee: u64,
     expected_valid: bool,
+    expected_success: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -79,7 +80,7 @@ fn base_case(name: &str, body: &[u8], other: &[u8], suffix: Vec<Frame>) -> Case 
         tx: TxEip8141 {
             chain_id: 1,
             sender: SENDER,
-            nonce_keys: Some(vec![U256::ZERO]),
+            nonce_keys: Some(vec![]),
             frames,
             ..Default::default()
         },
@@ -89,6 +90,7 @@ fn base_case(name: &str, body: &[u8], other: &[u8], suffix: Vec<Frame>) -> Case 
         storage: Vec::new(),
         basefee: 0,
         expected_valid: true,
+        expected_success: None,
     }
 }
 
@@ -204,9 +206,8 @@ fn oracle(case: &Case) -> Result<Outcome, String> {
         frames: p.frames.clone(),
         signatures: p.signatures.clone(),
         signature_hash: p.signature_hash(),
-        max_fee_per_gas: p.fees.max_fee_per_gas,
+        max_fee: p.fees.max_fee,
         max_priority_fee_per_gas: p.fees.max_priority_fee_per_gas,
-        max_fee_per_blob_gas: p.fees.max_fee_per_blob_gas,
     };
     let tx = TxEnv::builder()
         .tx_type(Some(6))
@@ -287,23 +288,56 @@ fn cases() -> Vec<Case> {
             &[0x5f, 0x5f, 0xfd],
             vec![
                 frame(FrameMode::Sender, BODY),
-                frame(FrameMode::PostTx, OTHER),
-                frame(FrameMode::PostTx, OTHER),
+                frame(FrameMode::Assert, OTHER),
+                frame(FrameMode::Assert, OTHER),
             ],
         ),
         base_case(
             "assertion_trace",
             &[0x60, 42, 0x5f, 0x55, 0x00],
             &[0x5f, 0x60, 1, 0xb6, 0x5f, 0x52, 0x60, 32, 0x5f, 0xf3],
-            vec![frame(FrameMode::Sender, BODY), frame(FrameMode::PostTx, OTHER)],
+            vec![frame(FrameMode::Sender, BODY), frame(FrameMode::Assert, OTHER)],
         ),
     ];
-    for keys in [vec![], vec![0], vec![1], vec![1, 2], vec![0, 1]] {
+    for (keys, valid) in [
+        (vec![], true),
+        (vec![0], true),
+        (vec![1], true),
+        (vec![1, 2], true),
+        (vec![0, 1], true),
+        (vec![0, 0], false),
+        (vec![2, 1], false),
+        ((0..17).collect(), false),
+    ] {
         let mut case = base_case(&format!("nonce_keys_{keys:?}"), &[], &[], vec![]);
-        case.expected_valid = !keys.is_empty() && (keys.len() == 1 || !keys.contains(&0));
+        case.expected_valid = valid;
         case.tx.nonce_keys = Some(keys.into_iter().map(U256::from).collect());
         cases.push(case);
     }
+    let mut legacy_max = base_case("legacy_max_nonce_is_invalid", &[], &[], vec![]);
+    legacy_max.tx.nonce = u64::MAX;
+    legacy_max.expected_valid = false;
+    cases.push(legacy_max);
+    for keys in [vec![U256::ZERO], vec![U256::from(1)], vec![U256::ZERO, U256::from(1)]] {
+        for current in [U256::ZERO, U256::from(1), U256::from(u64::MAX), U256::from(1) << 64] {
+            let mut case =
+                base_case(&format!("single_use_keys_{keys:?}_current_{current}"), &[], &[], vec![]);
+            case.tx.nonce_keys = Some(keys.clone());
+            case.tx.nonce = u64::MAX;
+            case.expected_valid = current.is_zero();
+            case.storage.push((NONCE_MANAGER, nonce_slot(SENDER, *keys.last().unwrap()), current));
+            cases.push(case);
+        }
+    }
+    let mut sequential_max = base_case("sequential_key_exhaustion", &[], &[], vec![]);
+    sequential_max.tx.nonce_keys = Some(vec![U256::ZERO]);
+    sequential_max.tx.nonce = u64::MAX - 1;
+    sequential_max.storage.push((
+        NONCE_MANAGER,
+        nonce_slot(SENDER, U256::ZERO),
+        U256::from(u64::MAX - 1),
+    ));
+    cases.push(sequential_max);
     for state in [0, 1, 97_919, 97_920, 300_000] {
         let mut f = frame(FrameMode::Sender, BODY);
         f.limits.state = state;
@@ -319,7 +353,7 @@ fn cases() -> Vec<Case> {
         f.limits.execution = execution;
         cases.push(base_case(&format!("entry_execution_{execution}"), &[0x00], &[], vec![f]));
     }
-    for selector in 0..=0x16u8 {
+    for selector in 0..=0x1bu8 {
         let query = [0x5f, 0x60, selector, 0xb6, 0x5f, 0x52, 0x60, 32, 0x5f, 0xf3];
         cases.push(base_case(
             &format!("txtrace_{selector:02x}"),
@@ -328,20 +362,7 @@ fn cases() -> Vec<Case> {
                 0xa2, 0x00,
             ],
             &query,
-            vec![frame(FrameMode::Sender, BODY), frame(FrameMode::PostTx, OTHER)],
-        ));
-    }
-    for selector in 0..=0x0du8 {
-        let operand =
-            if selector >= 0x0b { U256::from(7) } else { U256::from_be_slice(BODY.as_slice()) };
-        let mut query = vec![0x5f, 0x7f];
-        query.extend_from_slice(&operand.to_be_bytes::<32>());
-        query.extend_from_slice(&[0x60, selector, 0xb7, 0x5f, 0x52, 0x60, 32, 0x5f, 0xf3]);
-        cases.push(base_case(
-            &format!("txdiff_{selector:02x}"),
-            &[0x60, 42, 0x5f, 0x55, 0x60, 7, 0x60, 9, 0x5f, 0x5f, 0xa2, 0x00],
-            &query,
-            vec![frame(FrameMode::Sender, BODY), frame(FrameMode::PostTx, OTHER)],
+            vec![frame(FrameMode::Sender, BODY), frame(FrameMode::Assert, OTHER)],
         ));
     }
     for pattern in 0..32u32 {
@@ -362,6 +383,7 @@ fn cases() -> Vec<Case> {
         ));
     }
     cases.extend(additional_cases());
+    cases.extend(assertion_cases());
     cases
 }
 
@@ -373,7 +395,13 @@ fn bogota_execution_matches_pinned_revm() {
         let native = native(case);
         let oracle = oracle(case);
         match (&native, &oracle) {
-            (Ok(a), Ok(b)) if case.expected_valid && a == b => println!("PASS {}", case.name),
+            (Ok(a), Ok(b))
+                if case.expected_valid
+                    && a == b
+                    && case.expected_success.is_none_or(|success| a.success == success) =>
+            {
+                println!("PASS {}", case.name);
+            }
             (Err(_), Err(_)) if !case.expected_valid => {
                 println!("INVALID {}: evm2={native:?}; revm={oracle:?}", case.name);
             }
@@ -383,10 +411,7 @@ fn bogota_execution_matches_pinned_revm() {
             }
         }
     }
-    println!(
-        "{} cases, {failures} mismatches; revm=b2109aeb7a69505617c629538e9014bd20148e5c; primitives=921ddebb486507d74808239b51e180e7600196d1",
-        cases.len()
-    );
+    println!("{} cases, {failures} mismatches against workspace revm", cases.len());
     assert_eq!(failures, 0);
 }
 
@@ -394,22 +419,27 @@ fn additional_cases() -> Vec<Case> {
     let store = [0x5f, 0x35, 0x5f, 0x55, 0x00];
     let revert = [0x5f, 0x5f, 0xfd];
     let mut cases = Vec::new();
-    for (cap, priority, basefee) in [(1, 1, 0), (9, 2, 3), (10, 0, 3), (3, 3, 3)] {
+    let version = Version::base(SpecId::BOGOTA);
+    for (budget_per_max_gas, priority, basefee) in
+        [(1, 1, 0), (9, 2, 3), (10, 0, 3), (3, 3, 3), (4, 3, 3)]
+    {
         for assertion_fails in [false, true] {
             let mut suffix = vec![frame(FrameMode::Sender, BODY)];
             if assertion_fails {
-                suffix.push(frame(FrameMode::PostTx, OTHER));
+                suffix.push(frame(FrameMode::Assert, OTHER));
             }
             let mut case = base_case(
                 &format!(
-                    "paid_cap_{cap}_priority_{priority}_base_{basefee}_assert_{assertion_fails}"
+                    "paid_budget_{budget_per_max_gas}_priority_{priority}_base_{basefee}_assert_{assertion_fails}"
                 ),
                 &[0x60, 42, 0x5f, 0x55, 0x00],
                 &revert,
                 suffix,
             );
             case.basefee = basefee;
-            case.tx.fees.max_fee_per_gas = U256::from(cap);
+            case.tx.fees.max_fee =
+                U256::from(FrameGas::calculate(&case.tx, version).unwrap().maximum)
+                    * U256::from(budget_per_max_gas);
             case.tx.fees.max_priority_fee_per_gas = U256::from(priority);
             cases.push(case);
         }
@@ -427,7 +457,8 @@ fn additional_cases() -> Vec<Case> {
         let mut case =
             base_case(&format!("nonzero_original_refund_{values:?}"), &store, &[], suffix);
         case.storage.push((BODY, U256::ZERO, U256::from(7)));
-        case.tx.fees.max_fee_per_gas = U256::from(3);
+        case.tx.fees.max_fee =
+            U256::from(FrameGas::calculate(&case.tx, version).unwrap().maximum) * U256::from(3);
         case.tx.fees.max_priority_fee_per_gas = U256::from(1);
         cases.push(case);
     }
@@ -436,9 +467,9 @@ fn additional_cases() -> Vec<Case> {
         payer.flags = 1;
         let mut suffix = vec![payer, frame(FrameMode::Sender, BODY)];
         if assertion_fails {
-            // APPROVE is forbidden in POST_TX, so the payer contract also supplies
+            // APPROVE is forbidden in ASSERT, so the payer contract also supplies
             // a deterministic failing assertion after its successful payment prefix.
-            suffix.push(frame(FrameMode::PostTx, OTHER));
+            suffix.push(frame(FrameMode::Assert, OTHER));
         }
         let mut case = base_case(
             &format!("external_payer_assert_{assertion_fails}"),
@@ -447,7 +478,8 @@ fn additional_cases() -> Vec<Case> {
             suffix,
         );
         case.sender_code = Bytes::from_static(&[0x60, 2, 0x5f, 0x5f, 0xaa]);
-        case.tx.fees.max_fee_per_gas = U256::from(9);
+        case.tx.fees.max_fee =
+            U256::from(FrameGas::calculate(&case.tx, version).unwrap().maximum) * U256::from(9);
         case.tx.fees.max_priority_fee_per_gas = U256::from(2);
         case.basefee = 3;
         cases.push(case);
@@ -494,5 +526,82 @@ fn additional_cases() -> Vec<Case> {
         &[],
         vec![frame(FrameMode::Sender, BODY)],
     ));
+    cases
+}
+
+fn assertion_cases() -> Vec<Case> {
+    // Deploy nonempty stored code, change creator/created account nonces and storage,
+    // and emit one event with four topics and a 32-byte data payload ending in 0xab.
+    let body = [
+        0x63, 0x60, 0x01, 0x5f, 0xf3, 0x5f, 0x52, 0x60, 4, 0x60, 28, 0x5f, 0xf0, 0x50, 0x60, 42,
+        0x5f, 0x55, 0x60, 0xab, 0x5f, 0x52, 0x60, 0x44, 0x60, 0x33, 0x60, 0x22, 0x60, 0x11, 0x60,
+        32, 0x5f, 0xa4, 0x00,
+    ];
+    let mut cases = Vec::new();
+    for keyed in [false, true] {
+        for selector in 0..=0x1au8 {
+            let event_index = u8::from((0x12..=0x18).contains(&selector));
+            let query = [0x60, event_index, 0x60, selector, 0xb6, 0x5f, 0x52, 0x60, 32, 0x5f, 0xf3];
+            let mut transfer = frame(FrameMode::Sender, BODY);
+            transfer.value = U256::from(7);
+            transfer.limits.state = 1_000_000;
+            let mut case = base_case(
+                &format!("txtrace_net_changes_{selector:02x}_keyed_{keyed}"),
+                &body,
+                &query,
+                vec![transfer, frame(FrameMode::Assert, OTHER)],
+            );
+            if keyed {
+                case.tx.nonce_keys = Some(vec![U256::ZERO]);
+            }
+            case.expected_success = Some(true);
+            cases.push(case);
+        }
+    }
+    for selector in [0, 1, 2, 3, 0x11, 0x19, 0x1a] {
+        let query = [0x60, 1, 0x60, selector, 0xb6, 0x00];
+        let mut case = base_case(
+            &format!("txtrace_scalar_rejects_nonzero_index_{selector:02x}"),
+            &body,
+            &query,
+            vec![frame(FrameMode::Sender, BODY), frame(FrameMode::Assert, OTHER)],
+        );
+        case.tx.frames[1].limits.state = 1_000_000;
+        case.expected_success = Some(false);
+        cases.push(case);
+    }
+    for (index, memory, offset, len) in [
+        (U256::ZERO, U256::ZERO, U256::ZERO, 32),
+        (U256::ZERO, U256::ZERO, U256::from(31), 4),
+        (U256::ZERO, U256::from(1), U256::ZERO, 33),
+        (U256::ZERO, U256::MAX, U256::MAX, 0),
+        (U256::from(1), U256::ZERO, U256::ZERO, 32),
+        (U256::MAX, U256::ZERO, U256::ZERO, 0),
+    ] {
+        let mut query = Vec::new();
+        for operand in [U256::from(len), offset, memory, index] {
+            query.push(0x7f);
+            query.extend_from_slice(&operand.to_be_bytes::<32>());
+        }
+        query.extend_from_slice(&[0xb7, 0x60, 64, 0x5f, 0xf3]);
+        let mut case = base_case(
+            &format!("eventdatacopy_{index}_{memory}_{offset}_{len}"),
+            &body,
+            &query,
+            vec![frame(FrameMode::Sender, BODY), frame(FrameMode::Assert, OTHER)],
+        );
+        case.tx.frames[1].limits.state = 1_000_000;
+        case.expected_success = Some(index.is_zero());
+        cases.push(case);
+    }
+    let mut old_copy = base_case(
+        "old_eventdatacopy_byte_is_undefined",
+        &body,
+        &[0x5f, 0x5f, 0x5f, 0x5f, 0xb8, 0x00],
+        vec![frame(FrameMode::Sender, BODY), frame(FrameMode::Assert, OTHER)],
+    );
+    old_copy.tx.frames[1].limits.state = 1_000_000;
+    old_copy.expected_success = Some(false);
+    cases.push(old_copy);
     cases
 }

@@ -231,12 +231,11 @@ fn frame_transaction(key: u64, nonce: u64, value: u64, assertion: bool) -> Recov
                 body_frame(FrameMode::Verify, FRAME_SENDER, 0, 2),
                 body_frame(FrameMode::Verify, PAYER, 0, 1),
                 body_frame(FrameMode::Sender, STORAGE, value, 0),
-                body_frame(FrameMode::PostTx, ASSERTION, u64::from(assertion), 0),
+                body_frame(FrameMode::Assert, ASSERTION, u64::from(assertion), 0),
             ],
             fees: TransactionFees {
-                max_fee_per_gas: U256::ONE,
+                max_fee: U256::from(10_000_000),
                 max_priority_fee_per_gas: U256::ONE,
-                ..Default::default()
             },
             ..Default::default()
         }),

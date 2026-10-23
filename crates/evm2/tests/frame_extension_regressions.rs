@@ -192,7 +192,7 @@ fn tx(frames: Vec<Frame>) -> Recovered<TxEnvelope> {
         TxEnvelope::Eip8141(TxEip8141 {
             chain_id: 1,
             sender: SENDER,
-            nonce_keys: Some(vec![U256::ZERO]),
+            nonce_keys: Some(vec![]),
             frames,
             ..Default::default()
         }),
@@ -235,7 +235,7 @@ fn custom_type_family_preserves_extensions_precompile_context_and_frame_hooks() 
         frame(FrameMode::Verify, SENDER, 0),
         frame(FrameMode::Default, CUSTOM, 0),
         frame(FrameMode::Sender, CUSTOM, 0),
-        frame(FrameMode::PostTx, CUSTOM, 0),
+        frame(FrameMode::Assert, CUSTOM, 0),
     ]);
     let result = evm.transact(&tx).unwrap().commit();
     assert!(result.status);
@@ -271,7 +271,7 @@ fn custom_type_family_preserves_extensions_precompile_context_and_frame_hooks() 
             (0, FrameMode::Verify),
             (1, FrameMode::Default),
             (2, FrameMode::Sender),
-            (3, FrameMode::PostTx)
+            (3, FrameMode::Assert)
         ]
     );
     assert_eq!(evm.ext().completed, 1);

@@ -639,6 +639,7 @@ fn build_tx(
         chain_id: raw.chain_id.or(chain_id),
         gas_price: raw.gas_price,
         max_fee_per_gas: raw.max_fee_per_gas,
+        max_fee: raw.max_fee,
         max_priority_fee_per_gas: raw.max_priority_fee_per_gas,
         access_list: access_list(raw, indexes.data)?,
         authorization_list: signed_authorizations(raw.authorization_list.as_deref())?,
@@ -668,6 +669,7 @@ mod tests {
     use super::*;
     use alloy_primitives::LogData;
     use evm2::interpreter::op;
+    use serde_json::json;
 
     #[cfg(feature = "jit")]
     const BYTECODE_RET42: &[u8] =
@@ -800,6 +802,32 @@ mod tests {
             panic!("expected EIP-2930 transaction");
         };
         assert_eq!(inner.access_list[0].address, second_address);
+    }
+
+    #[test]
+    fn build_frame_tx_reads_the_full_width_total_fee_budget_from_state_json() {
+        let raw = serde_json::from_value::<TransactionParts>(json!({
+            "type": "0x6",
+            "chainId": "0x1",
+            "sender": Address::repeat_byte(0x11),
+            "nonce": "0x0",
+            "data": ["0x"],
+            "gasLimit": ["0x0"],
+            "value": ["0x0"],
+            "frames": [],
+            "maxFee": U256::MAX,
+            "maxPriorityFeePerGas": U256::MAX - U256::ONE,
+            "maxFeePerGas": "0x1",
+            "maxFeePerBlobGas": "0x1",
+        }))
+        .unwrap();
+        let tx = build_tx(&raw, &TxPartIndices { data: 0, gas: 0, value: 0 }, None).unwrap();
+        let fees = &tx.inner().as_eip8141().unwrap().fees;
+        assert_eq!(fees.max_fee, U256::MAX);
+        assert_eq!(fees.max_priority_fee_per_gas, U256::MAX - U256::ONE);
+        let reference = crate::reference_tx(&tx).unwrap().frame_transaction.unwrap();
+        assert_eq!(reference.max_fee, fees.max_fee);
+        assert_eq!(reference.max_priority_fee_per_gas, fees.max_priority_fee_per_gas);
     }
 
     #[cfg(feature = "jit")]

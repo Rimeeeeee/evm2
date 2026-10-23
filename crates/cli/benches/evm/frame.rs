@@ -137,11 +137,11 @@ fn frames(slots: u8) -> Case {
             TxEnvelope::Eip8141(TxEip8141 {
                 chain_id: 1,
                 sender: CALLER,
-                nonce_keys: Some(vec![U256::ZERO]),
+                nonce_keys: Some(vec![]),
                 frames: [
                     (FrameMode::Verify, CALLER, 3),
                     (FrameMode::Sender, BODY, 0),
-                    (FrameMode::PostTx, ASSERTION, 0),
+                    (FrameMode::Assert, ASSERTION, 0),
                 ]
                 .into_iter()
                 .map(|(mode, target, flags)| Frame {

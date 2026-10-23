@@ -1,13 +1,13 @@
 use alloy_consensus::{
-    EthereumTxEnvelope, TxEip4844, TxEip8141, TypedTransaction,
+    EthereumTxEnvelope, Transaction, TxEip4844, TxEip8141, TypedTransaction,
     transaction::{Recovered, SignerRecoverable},
 };
 use alloy_eips::{
-    Decodable2718,
+    Decodable2718, Typed2718,
     eip7702::SignedAuthorization,
     eip8141::{
         Frame, FrameAddress, FrameLimits, FrameMode, FrameSignature, SignatureMessage,
-        SignatureScheme, TransactionFees,
+        SignatureScheme, TransactionFees, nonce_calldata,
     },
 };
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256};
@@ -17,6 +17,10 @@ use alloy_rpc_types_eth::{
 };
 use evm2::ethereum::{RecoveredTxEnvelope, TxEnvelope};
 use k256::ecdsa::SigningKey;
+use revm::{
+    context::TxEnv,
+    context_interface::{either::Either, transaction::FrameTransaction},
+};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Access list entry shared by EEST fixture formats.
@@ -101,7 +105,7 @@ fn normalize_authorization_value(value: &mut serde_json::Value) {
 
 /// Error while building a consensus transaction from fixture fields.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum TxBuildError {
+pub enum TxBuildError {
     /// Numeric value overflowed the target type.
     #[error("value overflows {0}")]
     Overflow(&'static str),
@@ -135,6 +139,8 @@ pub(crate) struct TxFields {
     pub(crate) gas_price: Option<U256>,
     /// EIP-1559 max fee.
     pub(crate) max_fee_per_gas: Option<U256>,
+    /// EIP-8141 total signed fee budget.
+    pub(crate) max_fee: Option<U256>,
     /// EIP-1559 priority fee.
     pub(crate) max_priority_fee_per_gas: Option<U256>,
     /// EIP-2930 access list.
@@ -155,9 +161,16 @@ pub(crate) struct TxFields {
 
 /// Builds an evm2 recovered transaction envelope from common fixture fields.
 pub(crate) fn build_recovered_tx(fields: TxFields) -> Result<RecoveredTxEnvelope, TxBuildError> {
-    if fields.tx_type == Some(6) || fields.frames.is_some() {
-        return build_frame_tx(fields);
-    }
+    let caller = fields.caller;
+    let tx = if fields.tx_type == Some(6) || fields.frames.is_some() {
+        TypedTransaction::Eip8141(build_frame_tx(fields)?)
+    } else {
+        build_request_tx(fields)?
+    };
+    Ok(recovered_envelope(tx, caller))
+}
+
+fn build_request_tx(fields: TxFields) -> Result<TypedTransaction, TxBuildError> {
     let mut request = TransactionRequest::default()
         .from(fields.caller)
         .gas_limit(fields.gas_limit)
@@ -213,63 +226,19 @@ pub(crate) fn build_recovered_tx(fields: TxFields) -> Result<RecoveredTxEnvelope
         request.blob_versioned_hashes = Some(fields.blob_versioned_hashes);
     }
 
-    let tx =
-        request.build_consensus_tx().map_err(|err| TxBuildError::BuildTransaction(err.error))?;
-    Ok(recovered_envelope(tx, fields.caller))
+    request.build_consensus_tx().map_err(|err| TxBuildError::BuildTransaction(err.error))
 }
 
-fn build_frame_tx(fields: TxFields) -> Result<RecoveredTxEnvelope, TxBuildError> {
-    let invalid = |reason: &str| TxBuildError::BuildTransaction(reason.into());
+fn build_frame_tx(fields: TxFields) -> Result<TxEip8141, TxBuildError> {
     let frames = fields
         .frames
-        .ok_or_else(|| invalid("type 6 requires frames"))?
+        .ok_or_else(|| TxBuildError::BuildTransaction("type 6 requires frames".into()))?
         .into_iter()
-        .map(|frame| {
-            let mode = u8::try_from(frame.mode)
-                .ok()
-                .and_then(FrameMode::try_from_u8)
-                .ok_or_else(|| invalid("invalid frame mode"))?;
-            let target = FrameAddress::try_from(
-                frame.target.as_ref().map_or(&[][..], |target| target.as_ref()),
-            )
-            .map_err(|error| invalid(&error.to_string()))?;
-            Ok(Frame {
-                mode,
-                target,
-                flags: frame.flags.try_into().map_err(|_| TxBuildError::Overflow("frame flags"))?,
-                limits: FrameLimits {
-                    execution: frame
-                        .gas_limit
-                        .try_into()
-                        .map_err(|_| TxBuildError::Overflow("frame execution gas"))?,
-                    state: frame
-                        .state_gas_limit
-                        .try_into()
-                        .map_err(|_| TxBuildError::Overflow("frame state gas"))?,
-                },
-                value: frame.value,
-                data: frame.data,
-            })
-        })
+        .map(Frame::try_from)
         .collect::<Result<_, TxBuildError>>()?;
-    let signatures = fields
-        .signatures
-        .into_iter()
-        .map(|signature| {
-            Ok(FrameSignature {
-                scheme: u8::try_from(signature.scheme)
-                    .ok()
-                    .and_then(|scheme| SignatureScheme::try_from(scheme).ok())
-                    .ok_or_else(|| invalid("invalid signature scheme"))?,
-                signer: FrameAddress::try_from(signature.signer.as_ref())
-                    .map_err(|error| invalid(&error.to_string()))?,
-                msg: SignatureMessage::try_from(signature.msg.as_ref())
-                    .map_err(|error| invalid(&error.to_string()))?,
-                signature: signature.signature,
-            })
-        })
-        .collect::<Result<_, TxBuildError>>()?;
-    let payload = TxEip8141 {
+    let signatures =
+        fields.signatures.into_iter().map(FrameSignature::try_from).collect::<Result<_, _>>()?;
+    Ok(TxEip8141 {
         chain_id: fields
             .chain_id
             .unwrap_or(U256::ONE)
@@ -281,13 +250,59 @@ fn build_frame_tx(fields: TxFields) -> Result<RecoveredTxEnvelope, TxBuildError>
         frames,
         signatures,
         fees: TransactionFees {
-            max_fee_per_gas: fields.max_fee_per_gas.unwrap_or_default(),
+            max_fee: fields.max_fee.unwrap_or_default(),
             max_priority_fee_per_gas: fields.max_priority_fee_per_gas.unwrap_or_default(),
-            max_fee_per_blob_gas: fields.max_fee_per_blob_gas.unwrap_or_default(),
         },
         blob_versioned_hashes: fields.blob_versioned_hashes,
-    };
-    Ok(Recovered::new_unchecked(TxEnvelope::Eip8141(payload), fields.caller))
+    })
+}
+
+impl TryFrom<TestFrame> for Frame {
+    type Error = TxBuildError;
+
+    fn try_from(frame: TestFrame) -> Result<Self, Self::Error> {
+        Ok(Self {
+            mode: u8::try_from(frame.mode)
+                .ok()
+                .and_then(FrameMode::try_from_u8)
+                .ok_or_else(|| TxBuildError::BuildTransaction("invalid frame mode".into()))?,
+            target: FrameAddress::try_from(
+                frame.target.as_ref().map_or(&[][..], |target| target.as_ref()),
+            )
+            .map_err(|error| TxBuildError::BuildTransaction(error.to_string()))?,
+            flags: frame.flags.try_into().map_err(|_| TxBuildError::Overflow("frame flags"))?,
+            limits: FrameLimits {
+                execution: frame
+                    .gas_limit
+                    .try_into()
+                    .map_err(|_| TxBuildError::Overflow("frame execution gas"))?,
+                state: frame
+                    .state_gas_limit
+                    .try_into()
+                    .map_err(|_| TxBuildError::Overflow("frame state gas"))?,
+            },
+            value: frame.value,
+            data: frame.data,
+        })
+    }
+}
+
+impl TryFrom<TestFrameSignature> for FrameSignature {
+    type Error = TxBuildError;
+
+    fn try_from(signature: TestFrameSignature) -> Result<Self, Self::Error> {
+        Ok(Self {
+            scheme: u8::try_from(signature.scheme)
+                .ok()
+                .and_then(|scheme| SignatureScheme::try_from(scheme).ok())
+                .ok_or_else(|| TxBuildError::BuildTransaction("invalid signature scheme".into()))?,
+            signer: FrameAddress::try_from(signature.signer.as_ref())
+                .map_err(|error| TxBuildError::BuildTransaction(error.to_string()))?,
+            msg: SignatureMessage::try_from(signature.msg.as_ref())
+                .map_err(|error| TxBuildError::BuildTransaction(error.to_string()))?,
+            signature: signature.signature,
+        })
+    }
 }
 
 /// Decodes canonical transaction bytes, including self-authorized frame envelopes.
@@ -350,6 +365,64 @@ fn recovered_envelope(tx: TypedTransaction, caller: Address) -> RecoveredTxEnvel
     }
 }
 
+/// Converts a native recovered envelope without narrowing canonical frame fees or replacing its
+/// sender.
+pub fn reference_tx(recovered: &RecoveredTxEnvelope) -> Result<TxEnv, String> {
+    let tx = recovered.inner();
+    let mut env = TxEnv {
+        tx_type: tx.ty(),
+        caller: recovered.signer(),
+        gas_limit: tx.gas_limit(),
+        gas_price: tx.max_fee_per_gas(),
+        kind: tx.kind(),
+        value: tx.value(),
+        data: tx.input().clone(),
+        nonce: tx.nonce(),
+        chain_id: tx.chain_id(),
+        gas_priority_fee: tx.max_priority_fee_per_gas(),
+        access_list: tx.access_list().cloned().unwrap_or_default(),
+        blob_hashes: tx.blob_versioned_hashes().unwrap_or_default().to_vec(),
+        max_fee_per_blob_gas: tx.max_fee_per_blob_gas().unwrap_or_default(),
+        authorization_list: tx
+            .authorization_list()
+            .unwrap_or_default()
+            .iter()
+            .cloned()
+            .map(Either::Left)
+            .collect(),
+        ..Default::default()
+    };
+    if let Some(tx) = tx.as_eip8141() {
+        let frame = FrameTransaction {
+            nonce_keys: tx.nonce_keys.clone(),
+            nonce_calldata: tx
+                .nonce_keys
+                .as_deref()
+                .map(|keys| nonce_calldata(keys, tx.nonce))
+                .unwrap_or_default(),
+            frames: tx.frames.clone(),
+            signatures: tx.signatures.clone(),
+            signature_hash: tx.signature_hash(),
+            max_fee: tx.fees.max_fee,
+            max_priority_fee_per_gas: tx.fees.max_priority_fee_per_gas,
+        };
+        env.caller = tx.sender;
+        env.kind = TxKind::Call(tx.sender);
+        env.gas_limit = frame.gas_limit(tx.sender).unwrap_or(u64::MAX);
+        env.frame_transaction = Some(Box::new(frame));
+    }
+    Ok(env)
+}
+
+/// Converts a blockchain fixture transaction, preserving authoritative canonical wire bytes.
+pub fn reference_block_transaction(
+    tx: &crate::blockchaintest::Transaction,
+) -> Result<TxEnv, String> {
+    let recovered =
+        crate::blockchaintest::execute::build_tx(tx).map_err(|error| error.to_string())?;
+    reference_tx(&recovered)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,7 +453,7 @@ mod tests {
     fn canonical_frame_bytes_are_authoritative_and_require_exact_input() {
         // Independently assembled type-6 seven-field list with one six-field frame.
         let raw = hex!(
-            "06e70180941111111111111111111111111111111111111111c9c8808080c280808080c0c3808080c0"
+            "06e60180941111111111111111111111111111111111111111c9c8808080c280808080c0c28080c0"
         );
         let recovered = build_recovered_tx_bytes(&raw).unwrap();
         assert_eq!(recovered.signer(), Address::repeat_byte(0x11));
@@ -429,36 +502,103 @@ mod tests {
                     },
                 ],
                 fees: TransactionFees {
-                    max_fee_per_gas: U256::MAX,
+                    max_fee: U256::MAX,
                     max_priority_fee_per_gas: U256::MAX - U256::ONE,
-                    max_fee_per_blob_gas: U256::MAX - U256::from(2),
                 },
                 ..Default::default()
             };
             let recovered = build_recovered_tx_bytes(&tx.encoded_2718()).unwrap();
             assert_eq!(recovered.inner().as_eip8141().unwrap(), &tx);
             let reference = crate::reference_tx(&recovered).unwrap();
+            assert_eq!(reference.nonce, u64::MAX);
             let frame = reference.frame_transaction.unwrap();
-            assert_eq!(frame.max_fee_per_gas, U256::MAX);
+            assert_eq!(frame.max_fee, U256::MAX);
             assert_eq!(frame.max_priority_fee_per_gas, U256::MAX - U256::ONE);
-            assert_eq!(frame.max_fee_per_blob_gas, U256::MAX - U256::from(2));
             assert_eq!(frame.nonce_keys, tx.nonce_keys);
             let mut nonce_calldata = vec![0xe2, 0x01, 0xa0];
             nonce_calldata.extend([0xff; 32]);
-            nonce_calldata.push(0x88);
-            nonce_calldata.extend([0xff; 8]);
             assert_eq!(frame.nonce_calldata, nonce_calldata);
             assert_eq!(frame.signature_hash, tx.signature_hash());
 
             let signature_hash = tx.signature_hash();
-            let mut transformed = tx.clone();
-            transformed.signatures[0].signature = Bytes::new();
-            assert_eq!(signature_hash, keccak256(transformed.encoded_2718()));
-            tx.signatures[0].signature = vec![0x85; length + 1].into();
+            tx.signatures[0].signature = vec![0x85; length].into();
             assert_eq!(tx.signature_hash(), signature_hash);
+            tx.signatures[0].signature = vec![0x85; length + 1].into();
+            assert_ne!(tx.signature_hash(), signature_hash);
+            tx.signatures[0].signature = vec![0x85; length].into();
             tx.signatures[1].signature = vec![0x86; length + 1].into();
             assert_ne!(tx.signature_hash(), signature_hash);
         }
+    }
+
+    #[test]
+    fn frame_signature_hash_commits_to_elided_lengths_as_rlp_integers() {
+        for length in [0, 1, 55, 56, 127, 128, 255, 256] {
+            let tx = TxEip8141 {
+                chain_id: 1,
+                sender: Address::repeat_byte(0x11),
+                signatures: vec![FrameSignature {
+                    scheme: SignatureScheme::Arbitrary,
+                    signature: vec![0x81; length].into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let signature = rlp_list(&[
+                alloy_rlp::encode(u8::from(SignatureScheme::Arbitrary)),
+                vec![0x80],
+                vec![0x80],
+                alloy_rlp::encode(length),
+            ]);
+            let mut sender = vec![0x94];
+            sender.extend_from_slice(tx.sender.as_slice());
+            let mut signing_bytes = vec![6];
+            signing_bytes.extend(rlp_list(&[
+                vec![1],
+                vec![0x80],
+                sender,
+                vec![0xc0],
+                rlp_list(&[signature]),
+                vec![0xc2, 0x80, 0x80],
+                vec![0xc0],
+            ]));
+            assert_eq!(tx.signature_hash(), keccak256(signing_bytes), "length {length}");
+        }
+    }
+
+    fn rlp_list(items: &[Vec<u8>]) -> Vec<u8> {
+        let payload_length = items.iter().map(Vec::len).sum::<usize>();
+        assert!(payload_length <= 55);
+        let mut out = vec![0xc0 + payload_length as u8];
+        for item in items {
+            out.extend_from_slice(item);
+        }
+        out
+    }
+
+    #[test]
+    fn frame_json_uses_the_full_width_total_budget_in_native_and_reference_builders() {
+        let transaction = crate::blockchaintest::Transaction {
+            transaction_type: Some(U256::from(6)),
+            sender: Some(Address::repeat_byte(0x11)),
+            frames: Some(vec![]),
+            max_fee: Some(U256::MAX),
+            max_fee_per_gas: Some(U256::ONE),
+            max_fee_per_blob_gas: Some(U256::ONE),
+            max_priority_fee_per_gas: Some(U256::MAX - U256::ONE),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&transaction).unwrap();
+        assert_eq!(json["maxFee"], serde_json::to_value(U256::MAX).unwrap());
+        let decoded = serde_json::from_value(json).unwrap();
+        let native = crate::blockchaintest::execute::build_tx(&decoded).unwrap();
+        let fees = &native.inner().as_eip8141().unwrap().fees;
+        assert_eq!(fees.max_fee, U256::MAX);
+        assert_eq!(fees.max_priority_fee_per_gas, U256::MAX - U256::ONE);
+        let reference = crate::reference_block_transaction(&decoded).unwrap();
+        let fees = reference.frame_transaction.unwrap();
+        assert_eq!(fees.max_fee, U256::MAX);
+        assert_eq!(fees.max_priority_fee_per_gas, U256::MAX - U256::ONE);
     }
 
     #[test]
@@ -489,5 +629,40 @@ mod tests {
         let mut trailing = expected.to_vec();
         trailing.push(0x80);
         assert!(ReceiptEnvelope::decode_2718_exact(&trailing).is_err());
+    }
+
+    #[test]
+    fn reference_conversion_preserves_invalid_shapes_for_handler_validation() {
+        let payload = TxEip8141 {
+            sender: Address::repeat_byte(0x11),
+            nonce: u64::MAX,
+            nonce_keys: Some(vec![]),
+            frames: vec![Frame {
+                flags: 0xff,
+                limits: FrameLimits { execution: u64::MAX, state: u64::MAX },
+                ..Default::default()
+            }],
+            signatures: vec![FrameSignature {
+                scheme: SignatureScheme::Secp256k1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let recovered = Recovered::new_unchecked(
+            TxEnvelope::Eip8141(payload.clone()),
+            Address::repeat_byte(0x99),
+        );
+        let reference = reference_tx(&recovered).unwrap();
+        assert_eq!(reference.caller, payload.sender);
+        assert_eq!(reference.kind, TxKind::Call(payload.sender));
+        assert_eq!(reference.nonce, u64::MAX);
+        assert_eq!(reference.gas_limit, u64::MAX);
+        let frame = reference.frame_transaction.unwrap();
+        assert_eq!(frame.nonce_keys, Some(vec![]));
+        let mut nonce_calldata = vec![0xc0, 0x88];
+        nonce_calldata.extend([0xff; 8]);
+        assert_eq!(frame.nonce_calldata, nonce_calldata);
+        assert_eq!(frame.frames, payload.frames);
+        assert_eq!(frame.signatures, payload.signatures);
     }
 }

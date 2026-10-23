@@ -39,7 +39,7 @@ fn payload(frames: Vec<Frame>) -> TxEip8141 {
     TxEip8141 {
         chain_id: 1,
         sender: SENDER,
-        nonce_keys: Some(vec![U256::ZERO]),
+        nonce_keys: Some(vec![]),
         frames,
         ..Default::default()
     }
@@ -101,14 +101,6 @@ fn trace(code: &mut Vec<u8>, selector: U256, index: U256, offset: u64) {
     store_output(code, offset);
 }
 
-fn diff(code: &mut Vec<u8>, selector: U256, operand: U256, third: U256, offset: u64) {
-    push(code, third);
-    push(code, operand);
-    push(code, selector);
-    code.push(0xb7);
-    store_output(code, offset);
-}
-
 fn return_memory(code: &mut Vec<u8>, offset: u64, len: u64) {
     push_u64(code, len);
     push_u64(code, offset);
@@ -140,60 +132,60 @@ fn all_assertion_selectors_observe_sorted_net_changes_and_indexed_events() {
     body.extend_from_slice(&[0xf1, 0x50]);
     push_u64(&mut body, 0xabcd);
     store_output(&mut body, 0);
-    // Topics one and two repeat; indexed-topic lookup must count this log once.
+    // Preserve all four topics, including repeated values.
     for value in [0x22, 0x21, 0x21, 0x10, 2, 30] {
         push_u64(&mut body, value);
     }
     body.extend_from_slice(&[0xa4, 0x00]);
-    // The same topic as topic zero is excluded from the indexed-topic lookup.
     let other = [0x60, 11, 0x60, 1, 0x55, 0x60, 0x21, 0x5f, 0x5f, 0xa1, 0x00];
     let deployed = BODY.create(0);
     let deployed_hash = U256::from_be_bytes(keccak256([0x00]).0);
-    let body_hash = U256::from_be_bytes(keccak256(&body).0);
+    let mut nonce_addresses = [SENDER, BODY, deployed];
+    nonce_addresses.sort_unstable();
     let mut assertion = Vec::new();
-    for selector in 0..=0x15 {
+    for selector in 0..=0x1a {
         // Amsterdam's ETH transfer log precedes the explicit LOG4.
-        let index = u64::from((0x0d..=0x13).contains(&selector));
+        let index = u64::from((0x12..=0x18).contains(&selector));
         trace(&mut assertion, U256::from(selector), U256::from(index), selector * 32);
     }
     let queries = [
-        (0x00, word(BODY), U256::from(2), U256::ZERO),
-        (0x01, word(BODY), U256::from(2), U256::from(20)),
-        (0x02, word(BODY), U256::ZERO, U256::from(BALANCE)),
-        (0x03, word(BODY), U256::ZERO, U256::from(BALANCE - 7)),
-        (0x04, word(BODY), U256::ZERO, body_hash),
-        (0x05, word(BODY), U256::ZERO, body_hash),
-        (0x06, word(BODY), U256::ZERO, U256::from(2)),
-        (0x07, word(BODY), U256::from(1), U256::from(1)),
-        (0x08, word(BODY), U256::ZERO, U256::from(1)),
-        (0x09, word(BODY), U256::ZERO, U256::from(1)),
-        (0x0a, word(BODY), U256::ZERO, U256::from(7)),
-        (0x0b, U256::from(0x21), U256::ZERO, U256::from(1)),
-        (0x0c, U256::from(0x21), U256::ZERO, U256::from(1)),
-        (0x04, word(deployed), U256::ZERO, U256::from_be_bytes(KECCAK256_EMPTY.0)),
-        (0x05, word(deployed), U256::ZERO, deployed_hash),
-        (0x0a, word(deployed), U256::ZERO, U256::from(9)),
-        (0x07, word(OTHER), U256::ZERO, U256::from(2)),
-        (0x09, word(OTHER), U256::ZERO, U256::from(2)),
-        (0x0b, U256::from(0x10), U256::ZERO, U256::ZERO),
-        (0x0b, U256::MAX, U256::ZERO, U256::ZERO),
-        (0x0a, U256::MAX, U256::ZERO, U256::ZERO),
+        (0x04, 1, word(BODY)),
+        (0x05, 1, U256::from(BALANCE)),
+        (0x06, 1, U256::from(BALANCE - 7)),
+        (0x04, 2, word(RECEIVER)),
+        (0x05, 2, U256::from(100)),
+        (0x06, 2, U256::from(107)),
+        (0x07, 1, word(BODY)),
+        (0x0a, 1, U256::from(9)),
+        (0x09, 1, U256::from(90)),
+        (0x07, 2, word(OTHER)),
+        (0x0a, 2, U256::from(1)),
+        (0x09, 2, U256::from(11)),
+        (0x0e, 1, word(nonce_addresses[1])),
+        (0x0f, 1, U256::ZERO),
+        (0x10, 1, U256::from(1)),
+        (0x0e, 2, word(nonce_addresses[2])),
+        (0x0f, 2, U256::ZERO),
+        (0x10, 2, U256::from(1)),
+        (0x12, 2, word(OTHER)),
+        (0x13, 2, U256::from(1)),
+        (0x14, 2, U256::from(0x21)),
     ];
-    for (i, &(selector, operand, third, _)) in queries.iter().enumerate() {
-        diff(&mut assertion, U256::from(selector), operand, third, (22 + i as u64) * 32);
+    for (i, &(selector, index, _)) in queries.iter().enumerate() {
+        trace(&mut assertion, U256::from(selector), U256::from(index), (27 + i as u64) * 32);
     }
-    return_memory(&mut assertion, 0, (22 + queries.len() as u64) * 32);
+    return_memory(&mut assertion, 0, (27 + queries.len() as u64) * 32);
     let mut evm = evm(&body, &other, &assertion);
     let mut tx = payload(vec![
         frame(FrameMode::Verify, SENDER),
         frame(FrameMode::Sender, BODY),
         frame(FrameMode::Sender, OTHER),
-        frame(FrameMode::PostTx, ASSERTION),
-        frame(FrameMode::PostTx, ASSERTION),
+        frame(FrameMode::Assert, ASSERTION),
+        frame(FrameMode::Assert, ASSERTION),
     ]);
-    tx.fees.max_fee_per_gas = U256::from(1);
     tx.fees.max_priority_fee_per_gas = U256::from(1);
     let precharge = U256::from(FrameGas::calculate(&tx, evm.version()).unwrap().maximum);
+    tx.fees.max_fee = precharge;
     let result = evm.transact(&recovered(tx)).unwrap().commit();
     assert!(result.status, "{:?}", result.frame);
     let result = result.frame.unwrap();
@@ -202,15 +194,20 @@ fn all_assertion_selectors_observe_sorted_net_changes_and_indexed_events() {
         U256::from(3),
         U256::from(3),
         U256::from(1),
+        U256::from(3),
         word(SENDER),
         U256::from(BALANCE),
         U256::from(BALANCE) - precharge,
         word(BODY),
-        U256::from(2),
         U256::ZERO,
         U256::from(20),
+        U256::from(2),
         word(deployed),
+        U256::from_be_bytes(KECCAK256_EMPTY.0),
         deployed_hash,
+        word(nonce_addresses[0]),
+        U256::ZERO,
+        U256::from(1),
         U256::from(3),
         word(BODY),
         U256::from(4),
@@ -222,9 +219,9 @@ fn all_assertion_selectors_observe_sorted_net_changes_and_indexed_events() {
         precharge,
         word(SENDER),
     ];
-    expected.extend(queries.iter().map(|q| q.3));
+    expected.extend(queries.iter().map(|q| q.2));
     assert_eq!(words(&result.outputs[3]), expected);
-    // A second assertion sees the same frozen view despite TXDIFF's extra live reads.
+    // A second assertion sees the same immutable in-flight view.
     assert_eq!(result.outputs[3], result.outputs[4]);
     assert_eq!(result.precharge, precharge);
 }
@@ -232,29 +229,19 @@ fn all_assertion_selectors_observe_sorted_net_changes_and_indexed_events() {
 #[test]
 fn selector_and_index_operands_are_checked_at_full_width() {
     let mut cases = Vec::new();
-    for selector in 0..=0x15 {
+    for selector in 0..=0x1a {
         let mut code = Vec::new();
         trace(&mut code, U256::from(selector), U256::MAX, 0);
         cases.push(code);
     }
-    for selector in [U256::from(0x16), U256::from(0x100), U256::MAX] {
+    for selector in [U256::from(0x1b), U256::from(0x100), U256::MAX] {
         let mut code = Vec::new();
         trace(&mut code, selector, U256::ZERO, 0);
         cases.push(code);
     }
-    for selector in [U256::from(0x0d), U256::from(0x100), U256::MAX] {
+    for selector in [0, 1, 2, 3, 0x11, 0x19, 0x1a] {
         let mut code = Vec::new();
-        diff(&mut code, selector, word(BODY), U256::ZERO, 0);
-        cases.push(code);
-    }
-    for selector in [2, 3, 4, 5, 6, 8, 10, 11] {
-        let mut code = Vec::new();
-        diff(&mut code, U256::from(selector), word(BODY), U256::from(1), 0);
-        cases.push(code);
-    }
-    for selector in [7, 9, 12] {
-        let mut code = Vec::new();
-        diff(&mut code, U256::from(selector), word(BODY), U256::MAX, 0);
+        trace(&mut code, U256::from(selector), U256::from(1), 0);
         cases.push(code);
     }
     for (i, code) in cases.iter().enumerate() {
@@ -262,7 +249,7 @@ fn selector_and_index_operands_are_checked_at_full_width() {
         let tx = recovered(payload(vec![
             frame(FrameMode::Verify, SENDER),
             frame(FrameMode::Sender, BODY),
-            frame(FrameMode::PostTx, ASSERTION),
+            frame(FrameMode::Assert, ASSERTION),
         ]));
         let result = evm.transact(&tx).unwrap().commit();
         assert!(!result.status, "case {i}");
@@ -292,13 +279,13 @@ fn event_copy_bounds_and_zero_length_follow_return_data_rules() {
         for value in [U256::from(len), offset, memory, index] {
             push(&mut assertion, value);
         }
-        assertion.push(0xb8);
+        assertion.push(0xb7);
         return_memory(&mut assertion, 0, len);
         let mut evm = evm(&body, &[], &assertion);
         let tx = recovered(payload(vec![
             frame(FrameMode::Verify, SENDER),
             frame(FrameMode::Sender, BODY),
-            frame(FrameMode::PostTx, ASSERTION),
+            frame(FrameMode::Assert, ASSERTION),
         ]));
         let result = evm.transact(&tx).unwrap().discard().frame.unwrap();
         assert_eq!(result.stops[2], stop, "index {index}, offset {offset}, len {len}");
@@ -313,24 +300,23 @@ fn reverted_logs_and_restored_slots_are_absent_and_views_reset_between_transacti
     let reverted = [0x60, 2, 0x5f, 0x55, 0x5f, 0x5f, 0xa0, 0x5f, 0x5f, 0xfd];
     let mut assertion = Vec::new();
     trace(&mut assertion, U256::from(1), U256::ZERO, 0);
-    trace(&mut assertion, U256::from(12), U256::ZERO, 32);
-    diff(&mut assertion, U256::from(10), word(BODY), U256::ZERO, 64);
-    return_memory(&mut assertion, 0, 96);
+    trace(&mut assertion, U256::from(0x11), U256::ZERO, 32);
+    return_memory(&mut assertion, 0, 64);
     let mut evm = evm(&body, &reverted, &assertion);
     let first = recovered(payload(vec![
         frame(FrameMode::Verify, SENDER),
         frame(FrameMode::Sender, BODY),
         frame(FrameMode::Sender, OTHER),
-        frame(FrameMode::PostTx, ASSERTION),
+        frame(FrameMode::Assert, ASSERTION),
     ]));
     let result = evm.transact(&first).unwrap().commit().frame.unwrap();
     assert_eq!(result.receipts[2].status, FrameStatus::Failure);
-    assert_eq!(words(&result.outputs[3]), [U256::ZERO, U256::from(1), U256::ZERO]);
+    assert_eq!(words(&result.outputs[3]), [U256::ZERO, U256::from(1)]);
     let mut second =
-        payload(vec![frame(FrameMode::Verify, SENDER), frame(FrameMode::PostTx, ASSERTION)]);
+        payload(vec![frame(FrameMode::Verify, SENDER), frame(FrameMode::Assert, ASSERTION)]);
     second.nonce = 1;
     let result = evm.transact(&recovered(second)).unwrap().commit().frame.unwrap();
-    assert_eq!(words(&result.outputs[1]), [U256::ZERO; 3]);
+    assert_eq!(words(&result.outputs[1]), [U256::ZERO; 2]);
 }
 
 #[test]
@@ -357,6 +343,39 @@ fn assertion_opcodes_are_unavailable_to_body_and_ordinary_transactions() {
         let result = evm.transact(&ordinary).unwrap().discard();
         assert!(!result.status);
         assert_eq!(result.stop, InstrStop::OpcodeNotFound);
+    }
+}
+
+#[test]
+fn keyed_nonce_approval_does_not_invent_an_account_nonce_change() {
+    let mut assertion = Vec::new();
+    trace(&mut assertion, U256::from(3), U256::ZERO, 0);
+    trace(&mut assertion, U256::from(1), U256::ZERO, 32);
+    return_memory(&mut assertion, 0, 64);
+    let mut evm = evm(&[], &[], &assertion);
+    let mut tx =
+        payload(vec![frame(FrameMode::Verify, SENDER), frame(FrameMode::Assert, ASSERTION)]);
+    tx.nonce_keys = Some(vec![U256::from(7)]);
+    let result = evm.transact(&recovered(tx)).unwrap().commit();
+    assert!(result.status, "{:?}", result.frame);
+    assert_eq!(words(&result.frame.unwrap().outputs[1]), [U256::ZERO, U256::from(1)]);
+    assert_eq!(evm.state_mut().account(&SENDER).unwrap().nonce(), 0);
+}
+
+#[test]
+fn old_event_copy_byte_is_undefined_and_repurposed_byte_requires_four_operands() {
+    for (code, expected) in [
+        (vec![0x5f, 0x5f, 0x5f, 0x5f, 0xb8], InstrStop::OpcodeNotFound),
+        (vec![0x5f, 0x5f, 0x5f, 0xb7], InstrStop::StackUnderflow),
+    ] {
+        let mut evm = evm(&[], &[], &code);
+        let tx = recovered(payload(vec![
+            frame(FrameMode::Verify, SENDER),
+            frame(FrameMode::Assert, ASSERTION),
+        ]));
+        let result = evm.transact(&tx).unwrap().discard();
+        assert!(!result.status);
+        assert_eq!(result.frame.unwrap().stops[1], expected);
     }
 }
 
@@ -540,7 +559,7 @@ fn recent_root_write_is_rejected_in_static_assertions_and_preserves_the_payment_
     let mut evm = evm(&[], &[], &[]);
     install_recent_root(&mut evm);
     evm.set_block(BlockEnvExt { slot_num: U256::from(100), ..*evm.block() });
-    let mut write = frame(FrameMode::PostTx, RECENT_ROOT_ADDRESS);
+    let mut write = frame(FrameMode::Assert, RECENT_ROOT_ADDRESS);
     write.data = vec![0x11; 64].into();
     let tx = recovered(payload(vec![frame(FrameMode::Verify, SENDER), write]));
     let result = evm.transact(&tx).unwrap().commit();

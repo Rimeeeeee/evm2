@@ -715,7 +715,7 @@ impl<T: EvmTypes> Inspector<T> for JsInspector {
                     value: frame.value,
                     input: frame.data.clone(),
                 },
-                kind: if matches!(frame.mode, FrameMode::Verify | FrameMode::PostTx) {
+                kind: if matches!(frame.mode, FrameMode::Verify | FrameMode::Assert) {
                     CallKind::StaticCall
                 } else {
                     CallKind::Call

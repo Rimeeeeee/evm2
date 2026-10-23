@@ -1148,7 +1148,6 @@ impl InstData {
             | op::STATICCALL => true,
             // EIP-2200 rejects SSTORE when the remaining gas is at most the call stipend.
             op::SSTORE => spec_id.enables(SpecId::ISTANBUL),
-            op::TXDIFF => true,
             // EIP-2929 skips cold host loads when the remaining gas cannot cover their cost.
             op::BALANCE
             | op::EXTCODESIZE

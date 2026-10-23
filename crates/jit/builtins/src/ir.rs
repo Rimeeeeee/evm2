@@ -310,7 +310,6 @@ builtins! {
     Sigparam = __revmc_builtin_sigparam(@[ecx] ptr, @[sp] ptr) None,
     Sigdatacopy = __revmc_builtin_sigdatacopy(@[ecx] ptr, @[sp] ptr) None,
     Txtrace = __revmc_builtin_txtrace(@[ecx] ptr, @[sp] ptr) None,
-    Txdiff = __revmc_builtin_txdiff(@[ecx] ptr, @[sp] ptr) None,
     Eventdatacopy = __revmc_builtin_eventdatacopy(@[ecx] ptr, @[sp] ptr) None,
 
     SelfDestruct   = #[NoReturn] __revmc_builtin_selfdestruct(@[ecx] ptr, @[sp] ptr) None,

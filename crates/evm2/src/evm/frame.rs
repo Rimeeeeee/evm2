@@ -1,37 +1,125 @@
-//! Bogota transaction-local approvals and reversible state-gas ownership.
+//! Frame transaction runtime, scoped approvals, and executable-prefix validation.
 
-use crate::{
-    Evm, EvmFeatures, EvmTypes, HostError,
-    interpreter::{GasTracker, InstrStop, Message, MessageResult, MessageResultExt},
+use super::{
+    ExecutionGuard, InterpreterRunner, State, frame_diff::FrameDiff, inspector::Inspector,
 };
-use alloc::vec::Vec;
+use crate::{
+    Evm, EvmFeatures, EvmTypes, EvmTypesHost, HostError,
+    ethereum::{
+        TxEnvelope,
+        eip8141::{self, FrameValidationResult},
+    },
+    interpreter::{GasTracker, InstrStop, Message, MessageResult, MessageResultExt},
+    registry::{HandlerError, HandlerResult},
+};
+use alloc::{sync::Arc, vec::Vec};
+use alloy_consensus::{TxEip8141, transaction::Recovered};
 use alloy_eips::eip8141::{FrameMode, FrameStatus, NONCE_MANAGER, SignatureScheme, nonce_slot};
-use alloy_primitives::{Address, Bytes, KECCAK256_EMPTY, U256, map::HashMap};
+use alloy_primitives::{Address, B256, Bytes, KECCAK256_EMPTY, U256, map::HashMap};
 
-type StorageKey = U256;
+#[cfg(feature = "async")]
+use super::{SendEvmRef, r#async};
+#[cfg(feature = "async")]
+use core::future::Future;
 
 /// EIP-8141 approvals accumulated by successful top-level frames.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct FrameApprovalState {
     /// Account that approved payment.
-    pub payer: Option<Address>,
+    pub(crate) payer: Option<Address>,
     /// Amount actually deducted from the payer at payment approval.
-    pub gas_pre_charge: U256,
+    pub(crate) gas_pre_charge: U256,
     /// Whether execution as the transaction sender has been approved.
-    pub sender_approved: bool,
+    pub(crate) sender_approved: bool,
+}
+
+/// Per-transaction EIP-8141 interpreter runtime state.
+#[derive(Debug)]
+pub(crate) struct FrameTransactionRuntime {
+    pub(crate) payload: Arc<TxEip8141>,
+    pub(crate) signature_hash: B256,
+    pub(crate) max_cost: U256,
+    /// Sender account nonce before any transaction frame executes.
+    pub(crate) legacy_nonce: u64,
+    /// Index of the currently executing top-level frame.
+    pub(crate) current_frame_index: usize,
+    /// Resolved target of the current top-level frame.
+    pub(crate) resolved_target: Address,
+    /// Statuses of completed top-level frames.
+    pub(crate) statuses: Vec<FrameStatus>,
+    /// Execution-gas usage reported by completed top-level frames.
+    pub(crate) execution_gas_used: Vec<u64>,
+    /// State-gas usage reported by completed top-level frames.
+    pub(crate) state_gas_used: Vec<u64>,
+    /// Committed approval state.
+    pub(crate) approval: FrameApprovalState,
+    /// Approval scopes corresponding to active interpreter call frames.
+    scopes: Vec<FrameScope>,
+    /// Approval produced by the completed top-level interpreter frame.
+    root_approval: Option<FrameApprovalState>,
+    /// Revertible state-gas attribution across top-level frames.
+    state_gas: FrameStateGas,
+    /// Assertion snapshot captured on first use in an assertion frame.
+    diff: Option<FrameDiff>,
+}
+
+/// Approval and state-gas checkpoint for one interpreter call.
+#[derive(Clone, Copy, Debug)]
+struct FrameScope {
+    approval: FrameApprovalState,
+    state_gas_checkpoint: usize,
+}
+
+/// State-gas ownership and rollback bookkeeping, separate from approvals.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct FrameStateGas {
+    /// Top-level frame owning each outstanding storage charge.
+    owners: HashMap<(Address, U256), usize>,
+    /// Attribution changes retained across top-level frames.
+    journal: Vec<FrameStateGasJournalEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FrameStateGasJournalEntry {
+    Owner { slot: (Address, U256), previous: Option<usize> },
+    GasUsed { frame_index: usize, previous: u64 },
 }
 
 impl FrameTransactionRuntime {
-    pub(crate) fn tx_param(&self, param: U256, state_left: u64) -> Option<U256> {
+    /// Creates transaction-local state from the validated payload and payment facts.
+    pub(crate) fn new(
+        payload: Arc<TxEip8141>,
+        signature_hash: B256,
+        max_cost: U256,
+        legacy_nonce: u64,
+    ) -> Self {
+        let frame_count = payload.frames.len();
+        Self {
+            resolved_target: payload.sender,
+            payload,
+            signature_hash,
+            max_cost,
+            legacy_nonce,
+            current_frame_index: 0,
+            statuses: Vec::with_capacity(frame_count),
+            execution_gas_used: Vec::with_capacity(frame_count),
+            state_gas_used: Vec::with_capacity(frame_count),
+            approval: FrameApprovalState::default(),
+            scopes: Vec::new(),
+            root_approval: None,
+            state_gas: FrameStateGas::default(),
+            diff: None,
+        }
+    }
+
+    pub(super) fn tx_param(&self, param: U256, state_left: u64) -> Option<U256> {
         let tx = &self.payload;
         Some(match u8::try_from(param).ok()? {
             0 => U256::from(6),
             1 => U256::from(tx.nonce),
             2 => U256::from_be_slice(tx.sender.as_slice()),
             3 => tx.fees.max_priority_fee_per_gas,
-            4 => tx.fees.max_fee_per_gas,
-            5 => tx.fees.max_fee_per_blob_gas,
-            6 => self.max_cost,
+            4 => tx.fees.max_fee,
             7 => U256::from(tx.blob_versioned_hashes.len()),
             8 => U256::from_be_bytes(self.signature_hash.0),
             9 => U256::from(tx.frames.len()),
@@ -48,7 +136,7 @@ impl FrameTransactionRuntime {
         })
     }
 
-    pub(crate) fn param(&self, index: U256, param: U256) -> Option<U256> {
+    pub(super) fn param(&self, index: U256, param: U256) -> Option<U256> {
         let index = usize::try_from(index).ok()?;
         let f = self.payload.frames.get(index)?;
         Some(match u8::try_from(param).ok()? {
@@ -72,7 +160,7 @@ impl FrameTransactionRuntime {
         })
     }
 
-    pub(crate) fn signature_param(&self, index: U256, param: U256) -> Option<U256> {
+    pub(super) fn signature_param(&self, index: U256, param: U256) -> Option<U256> {
         let sig = self.payload.signatures.get(usize::try_from(index).ok()?)?;
         Some(match u8::try_from(param).ok()? {
             0 if sig.scheme != SignatureScheme::Arbitrary => U256::from_be_slice(
@@ -92,23 +180,185 @@ impl FrameTransactionRuntime {
         })
     }
 
-    pub(crate) fn is_post_tx(&self) -> bool {
+    pub(super) fn is_assert(&self) -> bool {
         self.payload
             .frames
             .get(self.current_frame_index)
-            .is_some_and(|f| f.mode == FrameMode::PostTx)
+            .is_some_and(|f| f.mode == FrameMode::Assert)
+    }
+
+    /// Enters an interpreter call frame approval scope.
+    pub(super) fn enter_scope(&mut self) {
+        self.scopes.push(FrameScope {
+            approval: self.current_approval(),
+            state_gas_checkpoint: self.state_gas_checkpoint(),
+        });
+    }
+
+    /// Exits an interpreter call frame, committing approvals only on success.
+    pub(super) fn exit_scope(&mut self, success: bool) {
+        let Some(scope) = self.scopes.pop() else {
+            return;
+        };
+        if success {
+            self.set_scoped_approval(scope.approval);
+        } else {
+            self.revert_state_gas(scope.state_gas_checkpoint);
+        }
+    }
+
+    /// Restores committed approvals after a top-level frame group rolls back.
+    pub(crate) fn restore_approval(&mut self, approval: FrameApprovalState) {
+        self.approval = approval;
+        self.root_approval = None;
+        self.scopes.clear();
+    }
+
+    /// Commits approvals emitted by a successful top-level frame.
+    pub(crate) const fn commit_root_approval(&mut self) {
+        if let Some(state) = self.root_approval.take() {
+            self.approval = state;
+        }
+    }
+
+    /// Returns a checkpoint for state-gas ownership and receipt attribution.
+    pub(crate) const fn state_gas_checkpoint(&self) -> usize {
+        self.state_gas.journal.len()
+    }
+
+    /// Reverts state-gas ownership and receipt attribution to `checkpoint`.
+    pub(crate) fn revert_state_gas(&mut self, checkpoint: usize) {
+        while self.state_gas.journal.len() > checkpoint {
+            match self.state_gas.journal.pop().expect("length checked") {
+                FrameStateGasJournalEntry::Owner { slot, previous } => {
+                    if let Some(owner) = previous {
+                        self.state_gas.owners.insert(slot, owner);
+                    } else {
+                        self.state_gas.owners.remove(&slot);
+                    }
+                }
+                FrameStateGasJournalEntry::GasUsed { frame_index, previous } => {
+                    if let Some(gas_used) = self.state_gas_used.get_mut(frame_index) {
+                        *gas_used = previous;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Attributes a successful storage-creation state-gas charge to the current frame.
+    fn record_sstore_state_gas(&mut self, address: Address, key: U256, amount: u64) {
+        if amount == 0 {
+            return;
+        }
+        let slot = (address, key);
+        let previous_owner = self.state_gas.owners.insert(slot, self.current_frame_index);
+        self.state_gas
+            .journal
+            .push(FrameStateGasJournalEntry::Owner { slot, previous: previous_owner });
+        let gas_used = self
+            .state_gas_used
+            .get_mut(self.current_frame_index)
+            .expect("current frame receipt initialized");
+        let previous = *gas_used;
+        self.state_gas.journal.push(FrameStateGasJournalEntry::GasUsed {
+            frame_index: self.current_frame_index,
+            previous,
+        });
+        *gas_used =
+            gas_used.checked_add(amount).expect("frame state gas is bounded by its u64 limit");
+    }
+
+    /// Applies a storage-restoration refill and returns the amount spendable by this frame.
+    fn refill_sstore_state_gas(&mut self, address: Address, key: U256, amount: u64) -> u64 {
+        if amount == 0 {
+            return 0;
+        }
+        let slot = (address, key);
+        let Some(owner) = self.state_gas.owners.remove(&slot) else {
+            return 0;
+        };
+        self.state_gas
+            .journal
+            .push(FrameStateGasJournalEntry::Owner { slot, previous: Some(owner) });
+        let gas_used =
+            self.state_gas_used.get_mut(owner).expect("outstanding charge owner has a receipt");
+        let previous = *gas_used;
+        self.state_gas
+            .journal
+            .push(FrameStateGasJournalEntry::GasUsed { frame_index: owner, previous });
+        *gas_used = gas_used
+            .checked_sub(amount)
+            .expect("refill cannot exceed its outstanding state-gas charge");
+        if owner == self.current_frame_index { amount } else { 0 }
+    }
+
+    pub(super) fn data(&self, index: U256) -> Option<Bytes> {
+        self.payload.frames.get(usize::try_from(index).ok()?).map(|frame| frame.data.clone())
+    }
+
+    pub(super) fn signature_bytes(&self, index: U256) -> Option<Bytes> {
+        let signature = self.payload.signatures.get(usize::try_from(index).ok()?)?;
+        (signature.scheme == SignatureScheme::Arbitrary).then(|| signature.signature.clone())
+    }
+
+    pub(super) fn sstore_gas(
+        &mut self,
+        address: Address,
+        key: U256,
+        charge: u64,
+        refill: u64,
+    ) -> u64 {
+        self.record_sstore_state_gas(address, key, charge);
+        self.refill_sstore_state_gas(address, key, refill)
+    }
+
+    pub(super) fn trace_value(
+        &mut self,
+        state: &State<'_>,
+        param: U256,
+        index: U256,
+    ) -> Option<U256> {
+        if !self.is_assert() {
+            return None;
+        }
+        self.diff.get_or_insert_with(|| FrameDiff::capture(state)).value(
+            param,
+            index,
+            state.logs(),
+            self.approval,
+        )
+    }
+
+    pub(super) fn event_data(&self, state: &State<'_>, index: U256) -> Option<Bytes> {
+        if !self.is_assert() {
+            return None;
+        }
+        state.logs().get(usize::try_from(index).ok()?).map(|log| log.data.data.clone())
+    }
+
+    fn current_approval(&self) -> FrameApprovalState {
+        self.scopes.last().map_or(self.approval, |scope| scope.approval)
+    }
+
+    fn set_scoped_approval(&mut self, approval: FrameApprovalState) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.approval = approval;
+        } else {
+            self.root_approval = Some(approval);
+        }
     }
 }
 
 impl<T: EvmTypes> Evm<'_, T> {
-    pub(crate) fn apply_frame_approval(
+    pub(super) fn apply_frame_approval(
         &mut self,
         address: Address,
         scope: U256,
         state_left: u64,
     ) -> Result<u64, HostError> {
         let rt = self.frame_tx.as_ref().ok_or(InstrStop::OpcodeNotFound)?;
-        if rt.is_post_tx() {
+        if rt.is_assert() {
             return Err(InstrStop::StateChangeDuringStaticCall.into());
         }
         let f = &rt.payload.frames[rt.current_frame_index];
@@ -116,7 +366,7 @@ impl<T: EvmTypes> Evm<'_, T> {
         if address != rt.resolved_target || scope == 0 || scope & !(f.flags & 3) != 0 {
             return Err(InstrStop::Revert.into());
         }
-        let old = rt.approval_stack.last().copied().unwrap_or(rt.approval);
+        let old = rt.current_approval();
         let sender = rt.payload.sender;
         let execution = scope & 2 != 0;
         let payment = scope & 1 != 0;
@@ -127,7 +377,7 @@ impl<T: EvmTypes> Evm<'_, T> {
             return Err(InstrStop::Revert.into());
         }
         let keys = rt.payload.nonce_keys.clone();
-        let keyed = keys.as_ref().is_some_and(|keys| keys != &[U256::ZERO]);
+        let keyed = keys.as_ref().is_some_and(|keys| !keys.is_empty());
         let sequence = rt.payload.nonce;
         let maximum = rt.max_cost;
         let mut charged = 0u64;
@@ -171,7 +421,8 @@ impl<T: EvmTypes> Evm<'_, T> {
                 return Err(InstrStop::OutOfGas.into());
             }
             if keyed {
-                let next = sequence.checked_add(1).ok_or(InstrStop::OutOfGas)?;
+                // MAX is the single-use marker: consuming it exhausts the selected keys.
+                let next = sequence.saturating_add(1);
                 for key in keys.unwrap() {
                     self.state
                         .storage(&NONCE_MANAGER)?
@@ -195,15 +446,11 @@ impl<T: EvmTypes> Evm<'_, T> {
             gas_pre_charge: precharge,
             sender_approved: old.sender_approved || execution,
         };
-        if let Some(current) = rt.approval_stack.last_mut() {
-            *current = next;
-        } else {
-            rt.root_approval = Some(next);
-        }
+        rt.set_scoped_approval(next);
         Ok(charged)
     }
 
-    pub(crate) fn execute_default_frame(
+    pub(super) fn execute_default_frame(
         &mut self,
         message: &Message<T>,
     ) -> Result<Option<MessageResult<T>>, crate::ExecutionError> {
@@ -247,183 +494,127 @@ impl<T: EvmTypes> Evm<'_, T> {
         gas.settle_gas(stop);
         Ok(Some(MessageResultExt { stop, gas, output: Bytes::new(), ..Default::default() }))
     }
+
+    /// Invokes a frame lifecycle hook while preventing inspector mutation.
+    pub(crate) fn inspect_frame(&mut self, f: impl FnOnce(&mut dyn Inspector<T>, &mut Self)) {
+        let guard = self.enter_execution();
+        if let Some(inspector) = guard.evm.inspector.as_deref_mut() {
+            // SAFETY: the execution guard prevents replacing the boxed inspector.
+            let inspector = unsafe { &mut *(inspector as *mut dyn Inspector<T>) };
+            f(inspector, guard.evm);
+        }
+    }
+
+    /// Runs executable-prefix validation with the normal execution mutation guard.
+    fn simulate_frames<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        assert!(!self.running, "prefix validation cannot interrupt active execution");
+        let runner = self.interpreter_runner.take();
+        let mut execution = self.enter_execution();
+        execution.discard_on_drop = true;
+        let guard = FrameSimulationGuard { execution, runner };
+        f(guard.execution.evm)
+    }
 }
 
-/// Per-transaction EIP-8141 interpreter runtime state.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct FrameTransactionRuntime {
-    pub diff: Option<super::frame_diff::FrameDiff>,
-    pub payload: alloc::sync::Arc<alloy_consensus::TxEip8141>,
-    pub signature_hash: alloy_primitives::B256,
-    pub max_cost: U256,
-    /// Sender account nonce before any transaction frame executes.
-    pub legacy_nonce: u64,
-    /// Index of the currently executing top-level frame.
-    pub current_frame_index: usize,
-    /// Resolved target of the current top-level frame.
-    pub resolved_target: Address,
-    /// Statuses of completed top-level frames.
-    pub statuses: Vec<FrameStatus>,
-    /// Execution-gas usage reported by completed top-level frames.
-    pub execution_gas_used: Vec<u64>,
-    /// State-gas usage reported by completed top-level frames.
-    pub state_gas_used: Vec<u64>,
-    /// Committed approval state.
-    pub approval: FrameApprovalState,
-    /// Approval scopes corresponding to active interpreter call frames.
-    pub approval_stack: Vec<FrameApprovalState>,
-    /// Approval produced by the completed top-level interpreter frame.
-    pub root_approval: Option<FrameApprovalState>,
-    /// Revertible state-gas attribution across top-level frames.
-    state_gas: FrameStateGas,
+struct FrameSimulationGuard<'guard, 'evm, T: EvmTypesHost> {
+    execution: ExecutionGuard<'guard, 'evm, T>,
+    runner: Option<Arc<dyn InterpreterRunner<T>>>,
 }
 
-/// State-gas ownership and rollback bookkeeping, separate from approvals.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct FrameStateGas {
-    /// Top-level frame owning each outstanding storage charge.
-    owners: HashMap<(Address, StorageKey), usize>,
-    /// Attribution changes retained across top-level frames.
-    journal: Vec<FrameStateGasJournalEntry>,
-    /// Checkpoints for active interpreter call frames.
-    checkpoints: Vec<usize>,
+impl<T: EvmTypesHost> Drop for FrameSimulationGuard<'_, '_, T> {
+    fn drop(&mut self) {
+        self.execution.evm.interpreter_runner = self.runner.take();
+    }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum FrameStateGasJournalEntry {
-    Owner { slot: (Address, StorageKey), previous: Option<usize> },
-    GasUsed { frame_index: usize, previous: u64 },
-}
-
-impl FrameTransactionRuntime {
-    /// Creates runtime state for a frame transaction.
-    pub(crate) fn new(resolved_target: Address) -> Self {
-        Self { resolved_target, ..Self::default() }
-    }
-
-    /// Creates runtime state with capacity for all top-level frame results.
-    pub(crate) fn with_capacity(resolved_target: Address, frame_count: usize) -> Self {
-        Self {
-            statuses: Vec::with_capacity(frame_count),
-            execution_gas_used: Vec::with_capacity(frame_count),
-            state_gas_used: Vec::with_capacity(frame_count),
-            ..Self::new(resolved_target)
-        }
-    }
-
-    /// Enters an interpreter call frame approval scope.
-    pub(crate) fn enter_scope(&mut self) {
-        let state = self.approval_stack.last().copied().unwrap_or(self.approval);
-        self.approval_stack.push(state);
-        self.state_gas.checkpoints.push(self.state_gas.journal.len());
-    }
-
-    /// Exits an interpreter call frame, committing approvals only on success.
-    pub(crate) fn exit_scope(&mut self, success: bool) {
-        let state = self.approval_stack.pop();
-        let state_gas_checkpoint = self.state_gas.checkpoints.pop();
-        if !success && let Some(checkpoint) = state_gas_checkpoint {
-            self.revert_state_gas(checkpoint);
-        }
-        let Some(state) = state else {
-            return;
-        };
-        if !success {
-            return;
-        }
-        if let Some(parent) = self.approval_stack.last_mut() {
-            *parent = state;
-        } else {
-            self.root_approval = Some(state);
-        }
-    }
-
-    /// Commits approvals emitted by a successful top-level frame.
-    pub(crate) const fn commit_root_approval(&mut self) {
-        if let Some(state) = self.root_approval.take() {
-            self.approval = state;
-        }
-    }
-
-    /// Returns a checkpoint for state-gas ownership and receipt attribution.
-    pub(crate) const fn state_gas_checkpoint(&self) -> usize {
-        self.state_gas.journal.len()
-    }
-
-    /// Reverts state-gas ownership and receipt attribution to `checkpoint`.
-    pub(crate) fn revert_state_gas(&mut self, checkpoint: usize) {
-        while self.state_gas.journal.len() > checkpoint {
-            match self.state_gas.journal.pop().expect("length checked") {
-                FrameStateGasJournalEntry::Owner { slot, previous } => {
-                    if let Some(owner) = previous {
-                        self.state_gas.owners.insert(slot, owner);
-                    } else {
-                        self.state_gas.owners.remove(&slot);
-                    }
-                }
-                FrameStateGasJournalEntry::GasUsed { frame_index, previous } => {
-                    if let Some(gas_used) = self.state_gas_used.get_mut(frame_index) {
-                        *gas_used = previous;
-                    }
-                }
-            }
-        }
-    }
-
-    /// Attributes a successful storage-creation state-gas charge to the current frame.
-    pub(crate) fn record_sstore_state_gas(
+impl<'a, T: EvmTypes<Tx = TxEnvelope>> Evm<'a, T> {
+    /// Validates all signatures, executes only the payable prefix, and discards all effects.
+    ///
+    /// Prefix execution always uses the interpreter, including when full transactions use a
+    /// compiled runner. This preserves per-opcode admission observations in reverted calls.
+    pub fn validate_frame_prefix(
         &mut self,
-        address: Address,
-        key: StorageKey,
-        amount: u64,
-    ) {
-        if amount == 0 {
-            return;
-        }
-        let slot = (address, key);
-        let previous_owner = self.state_gas.owners.insert(slot, self.current_frame_index);
-        self.state_gas
-            .journal
-            .push(FrameStateGasJournalEntry::Owner { slot, previous: previous_owner });
-        let gas_used = self
-            .state_gas_used
-            .get_mut(self.current_frame_index)
-            .expect("current frame receipt initialized");
-        let previous = *gas_used;
-        self.state_gas.journal.push(FrameStateGasJournalEntry::GasUsed {
-            frame_index: self.current_frame_index,
-            previous,
-        });
-        *gas_used =
-            gas_used.checked_add(amount).expect("frame state gas is bounded by its u64 limit");
+        tx: &Recovered<T::Tx>,
+        prefix_end: usize,
+    ) -> HandlerResult<FrameValidationResult> {
+        self.simulate_frames(|host| {
+            let payload = tx.inner().as_eip8141().ok_or(HandlerError::InvalidFrameTransaction(
+                "prefix requires a frame transaction",
+            ))?;
+            eip8141::validate_prefix(host, payload, prefix_end)
+        })
     }
 
-    /// Applies a storage-restoration refill and returns the amount spendable by this frame.
-    pub(crate) fn refill_sstore_state_gas(
-        &mut self,
-        address: Address,
-        key: StorageKey,
-        amount: u64,
-    ) -> u64 {
-        if amount == 0 {
-            return 0;
+    /// Executes and discards a frame validation prefix on an async host fiber.
+    ///
+    /// Async database and inspector operations may suspend while validating the prefix.
+    /// Dropping the future cancels execution and discards approvals, nonce writes, and
+    /// transaction scratch, just like the synchronous prefix API.
+    #[cfg(feature = "async")]
+    pub fn validate_frame_prefix_async<'fut>(
+        &'fut mut self,
+        tx: &'fut Recovered<T::Tx>,
+        prefix_end: usize,
+    ) -> impl Future<Output = r#async::AsyncResult<FrameValidationResult, HandlerError>> + 'fut
+    {
+        let stack = self.async_stack();
+        // SAFETY: The future exclusively borrows the EVM and its stack slot until dropped.
+        unsafe {
+            r#async::on_local_fiber_result_with_stack(stack, move || {
+                self.validate_frame_prefix(tx, prefix_end)
+            })
         }
-        let slot = (address, key);
-        let Some(owner) = self.state_gas.owners.remove(&slot) else {
-            return 0;
-        };
-        self.state_gas
-            .journal
-            .push(FrameStateGasJournalEntry::Owner { slot, previous: Some(owner) });
-        let gas_used =
-            self.state_gas_used.get_mut(owner).expect("outstanding charge owner has a receipt");
-        let previous = *gas_used;
-        self.state_gas
-            .journal
-            .push(FrameStateGasJournalEntry::GasUsed { frame_index: owner, previous });
-        *gas_used = gas_used
-            .checked_sub(amount)
-            .expect("refill cannot exceed its outstanding state-gas charge");
-        if owner == self.current_frame_index { amount } else { 0 }
+    }
+
+    /// Executes a frame validation prefix on an async host fiber with a `Send` future.
+    ///
+    /// As with [`Self::transact_async_send`], first verify the current erased database,
+    /// precompiles, and optional inspector using [`Self::evm_is_send`] or
+    /// [`Self::evm_is_send_with_inspector`]. Cancellation discards all prefix effects.
+    #[cfg(feature = "async")]
+    pub fn validate_frame_prefix_async_send<'fut>(
+        &'fut mut self,
+        tx: &'fut Recovered<T::Tx>,
+        prefix_end: usize,
+    ) -> impl Future<Output = r#async::AsyncResult<FrameValidationResult, HandlerError>> + Send + 'fut
+    where
+        T::SpecId: Send,
+        T::EvmExt: Send,
+        T::MessageExt: Send,
+        T::MessageResultExt: Send,
+        T::TxEnvExt: Send,
+        T::TxResultExt: Send,
+        T::BlockEnvExt: Send,
+    {
+        self.assert_erased_send();
+        let stack = self.async_stack();
+        let evm = SendEvmRef { evm: self };
+        // SAFETY: The future owns the exclusive EVM borrow and its erased fields were
+        // checked above. The reusable stack remains borrowed until the future is dropped.
+        unsafe {
+            r#async::on_fiber_result_with_stack(stack, move || {
+                let SendEvmRef { evm } = evm;
+                evm.validate_frame_prefix(tx, prefix_end)
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn txparam_exposes_signed_fee_budget_and_rejects_removed_fee_selectors() {
+        let mut tx = TxEip8141::default();
+        tx.fees.max_priority_fee_per_gas = U256::from(7);
+        tx.fees.max_fee = U256::MAX;
+        let runtime = FrameTransactionRuntime::new(Arc::new(tx), B256::ZERO, U256::from(19), 0);
+        assert_eq!(runtime.tx_param(U256::from(3), 0), Some(U256::from(7)));
+        assert_eq!(runtime.tx_param(U256::from(4), 0), Some(U256::MAX));
+        for removed in [5, 6] {
+            assert_eq!(runtime.tx_param(U256::from(removed), 0), None);
+        }
+        assert_eq!(runtime.tx_param(U256::from(7), 0), Some(U256::ZERO));
     }
 }

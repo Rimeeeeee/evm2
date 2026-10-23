@@ -3,7 +3,7 @@
 use alloy_consensus::{TxEip8141, transaction::Recovered};
 use alloy_eips::eip8141::{
     EXPIRY_DATA_LENGTH, EXPIRY_VERIFIER, Frame, FrameLimits, FrameMode, FrameSignature, SECP256K1N,
-    SECP256R1N, SignatureMessage, SignatureScheme,
+    SECP256R1N, SignatureMessage, SignatureScheme, validate_nonce_keys,
 };
 use alloy_primitives::{Address, B256, U256};
 use evm2::{
@@ -40,7 +40,7 @@ fn payload() -> TxEip8141 {
     TxEip8141 {
         chain_id: 1,
         sender: SENDER,
-        nonce_keys: Some(vec![U256::ZERO]),
+        nonce_keys: Some(vec![]),
         frames: vec![frame(FrameMode::Verify, SENDER, 3), frame(FrameMode::Sender, BODY, 0)],
         ..Default::default()
     }
@@ -124,19 +124,9 @@ fn malformed_frame_structure_and_nonce_schemas_are_rejected_without_reads() {
             "EIP-8141 frame count must be in 1..=64",
         ),
         (
-            "post suffix",
-            |tx| tx.frames[0].mode = FrameMode::PostTx,
-            "EIP-7906 POST_TX frames must form a trailing suffix",
-        ),
-        (
-            "blob cap without hashes",
-            |tx| tx.fees.max_fee_per_blob_gas = U256::from(1),
-            "blob fee is non-zero without blob hashes",
-        ),
-        (
-            "hash without blob cap",
-            |tx| tx.blob_versioned_hashes.push(B256::ZERO),
-            "blob hashes require a non-zero blob fee",
+            "assert suffix",
+            |tx| tx.frames[0].mode = FrameMode::Assert,
+            "EIP-7906 ASSERT frames must form a trailing suffix",
         ),
         ("reserved flags", |tx| tx.frames[1].flags = 0x80, "reserved EIP-8141 frame flag is set"),
         (
@@ -184,20 +174,20 @@ fn malformed_frame_structure_and_nonce_schemas_are_rejected_without_reads() {
             "atomic batch frames must not approve payment or execution",
         ),
         (
-            "atomic post successor",
+            "atomic assert successor",
             |tx| {
                 tx.frames[1].flags = 4;
-                tx.frames.push(frame(FrameMode::PostTx, BODY, 0));
+                tx.frames.push(frame(FrameMode::Assert, BODY, 0));
             },
-            "EIP-7906 atomic batch cannot contain a POST_TX frame",
+            "EIP-7906 atomic batch cannot contain an ASSERT frame",
         ),
         (
-            "post atomic",
+            "assert atomic",
             |tx| {
-                tx.frames[1].mode = FrameMode::PostTx;
+                tx.frames[1].mode = FrameMode::Assert;
                 tx.frames[1].flags = 4;
             },
-            "EIP-7906 atomic batch cannot contain a POST_TX frame",
+            "EIP-7906 atomic batch cannot contain an ASSERT frame",
         ),
         (
             "expiry fields",
@@ -251,9 +241,9 @@ fn malformed_frame_structure_and_nonce_schemas_are_rejected_without_reads() {
             "invalid or repeated expiry verifier frame",
         ),
         (
-            "post value",
+            "assert value",
             |tx| {
-                tx.frames[1].mode = FrameMode::PostTx;
+                tx.frames[1].mode = FrameMode::Assert;
                 tx.frames[1].value = U256::from(1);
             },
             "frame value is only valid in sender mode",
@@ -264,19 +254,9 @@ fn malformed_frame_structure_and_nonce_schemas_are_rejected_without_reads() {
             "nonce payload does not match activation",
         ),
         (
-            "no nonce keys",
-            |tx| tx.nonce_keys = Some(vec![]),
-            "EIP-8250 requires between 1 and 16 nonce keys",
-        ),
-        (
             "17 nonce keys",
             |tx| tx.nonce_keys = Some((1..=17).map(U256::from).collect()),
-            "EIP-8250 requires between 1 and 16 nonce keys",
-        ),
-        (
-            "zero mixed",
-            |tx| tx.nonce_keys = Some(vec![U256::ZERO, U256::from(1)]),
-            "EIP-8250 nonce key zero must be the only key",
+            validate_nonce_keys(&(1..=17).map(U256::from).collect::<Vec<_>>()).unwrap_err(),
         ),
         (
             "duplicate keys",
@@ -450,24 +430,17 @@ fn resource_fee_and_blob_validation_precedes_database_reads() {
         block,
         HandlerError::InvalidChainId { expected: 1, got: 2 },
     ));
-    let mut priority = tx.clone();
-    priority.fees.max_priority_fee_per_gas = U256::from(1);
-    cases.push(("priority", priority, version, block, HandlerError::PriorityFeeGreaterThanMaxFee));
     let mut priced_block = block;
     priced_block.basefee = U256::from(10);
     cases.push((
-        "fee cap",
+        "base-fee budget",
         tx.clone(),
         version,
         priced_block,
-        HandlerError::FeeCapLessThanBaseFee {
-            max_fee_per_gas: U256::ZERO,
-            base_fee: U256::from(10),
-        },
+        invalid("max fee below required base-fee budget"),
     ));
     let mut blobs = tx.clone();
     blobs.blob_versioned_hashes = vec![blob_hash(); version.max_blobs_per_tx + 1];
-    blobs.fees.max_fee_per_blob_gas = U256::from(1);
     cases.push((
         "blob count",
         blobs,
@@ -480,7 +453,6 @@ fn resource_fee_and_blob_validation_precedes_database_reads() {
     ));
     let mut blob_version = tx.clone();
     blob_version.blob_versioned_hashes.push(B256::ZERO);
-    blob_version.fees.max_fee_per_blob_gas = U256::from(1);
     cases.push((
         "blob version",
         blob_version,
@@ -490,25 +462,30 @@ fn resource_fee_and_blob_validation_precedes_database_reads() {
     ));
     let mut blob_fee = tx.clone();
     blob_fee.blob_versioned_hashes.push(blob_hash());
-    blob_fee.fees.max_fee_per_blob_gas = U256::from(1);
+    blob_fee.fees.max_fee = U256::from(2 * 131_072 - 1);
     let mut blob_block = block;
     blob_block.blob_basefee = U256::from(2);
     cases.push((
-        "blob fee",
+        "blob base-fee budget",
         blob_fee,
         version,
         blob_block,
-        HandlerError::BlobFeeCapLessThanBlobBaseFee {
-            max_fee_per_blob_gas: U256::from(1),
-            blob_base_fee: U256::from(2),
-        },
+        invalid("max fee below required base-fee budget"),
     ));
     let mut overflow = tx;
-    overflow.fees.max_fee_per_gas = U256::MAX;
-    cases.push(("payment overflow", overflow, version, block, invalid("payment overflow")));
+    overflow.fees.max_fee = U256::MAX;
+    let mut expensive_execution = block;
+    expensive_execution.basefee = U256::MAX;
+    cases.push((
+        "payment overflow",
+        overflow,
+        version,
+        expensive_execution,
+        invalid("payment overflow"),
+    ));
     let mut blobs = payload();
     blobs.blob_versioned_hashes.push(blob_hash());
-    blobs.fees.max_fee_per_blob_gas = U256::MAX;
+    blobs.fees.max_fee = U256::MAX;
     let mut expensive_blobs = block;
     expensive_blobs.blob_basefee = U256::MAX;
     cases.push((
@@ -529,7 +506,7 @@ fn resource_fee_and_blob_validation_precedes_database_reads() {
 fn competing_errors_follow_static_preparation_order_and_valid_payload_reaches_db() {
     let mut tx = payload();
     tx.frames.clear();
-    tx.nonce_keys = Some(vec![]);
+    tx.nonce_keys = Some((1..=17).map(U256::from).collect());
     assert_static_error(
         "frame count before nonce keys",
         tx,
@@ -537,19 +514,19 @@ fn competing_errors_follow_static_preparation_order_and_valid_payload_reaches_db
     );
     let mut tx = payload();
     tx.frames[1].flags = 0x80;
-    tx.nonce_keys = Some(vec![]);
+    tx.nonce_keys = Some((1..=17).map(U256::from).collect());
     assert_static_error(
         "structure before nonce keys",
         tx,
         invalid("reserved EIP-8141 frame flag is set"),
     );
     let mut tx = payload();
-    tx.nonce_keys = Some(vec![]);
+    tx.nonce_keys = Some((1..=17).map(U256::from).collect());
     tx.nonce = u64::MAX;
     assert_static_error(
         "keys before sequence",
         tx,
-        invalid("EIP-8250 requires between 1 and 16 nonce keys"),
+        invalid(validate_nonce_keys(&(1..=17).map(U256::from).collect::<Vec<_>>()).unwrap_err()),
     );
     let mut tx = payload();
     tx.nonce = u64::MAX;
@@ -625,6 +602,16 @@ fn valid_structure_boundaries_reach_database_validation() {
     tx.nonce_keys = Some((1..=16).map(U256::from).collect());
     cases.push(("16 keys", tx, version));
     let mut tx = payload();
+    tx.nonce_keys = Some(vec![U256::ZERO]);
+    cases.push(("zero keyed domain", tx, version));
+    let mut tx = payload();
+    tx.nonce_keys = Some(vec![U256::ZERO, U256::from(1)]);
+    cases.push(("zero mixed with another key", tx, version));
+    let mut tx = payload();
+    tx.nonce_keys = Some(vec![U256::ZERO]);
+    tx.nonce = u64::MAX;
+    cases.push(("single-use zero keyed domain", tx, version));
+    let mut tx = payload();
     tx.nonce_keys = None;
     let mut legacy = version;
     legacy.features.remove(EvmFeatures::EIP8250);
@@ -646,8 +633,13 @@ fn valid_structure_boundaries_reach_database_validation() {
     cases.push(("constrained expiry", tx, version));
     let mut tx = payload();
     tx.blob_versioned_hashes = vec![blob_hash(); version.max_blobs_per_tx];
-    tx.fees.max_fee_per_blob_gas = U256::from(1);
     cases.push(("maximum blob count", tx, version));
+    let mut tx = payload();
+    tx.fees.max_fee = U256::MAX;
+    cases.push(("maximum aggregate budget", tx, version));
+    let mut tx = payload();
+    tx.fees.max_priority_fee_per_gas = U256::MAX;
+    cases.push(("maximum priority with zero budget", tx, version));
     for (name, tx, version) in cases {
         let (mut evm, reads) = evm(version, BlockEnvExt::default());
         assert!(

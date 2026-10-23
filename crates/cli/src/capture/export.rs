@@ -6,7 +6,7 @@ use alloy_consensus::{
     EthereumTxEnvelope, Header, TxEip4844,
     transaction::{Transaction as _, to_eip155_value},
 };
-use alloy_eips::{Encodable2718, eip2930::AccessList, eip7702::SignedAuthorization};
+use alloy_eips::{Encodable2718, Typed2718, eip2930::AccessList, eip7702::SignedAuthorization};
 use alloy_primitives::{Address, B256, Bytes, FixedBytes, U256};
 use evm2::SpecId;
 use evm2_eest::{
@@ -221,16 +221,15 @@ fn export_transaction(tx: &EthereumTxEnvelope<TxEip4844>, signer: Address) -> Tr
             sender: Some(frame.sender),
             nonce: U256::from(frame.nonce),
             chain_id: Some(U256::from(frame.chain_id)),
-            max_fee_per_gas: Some(frame.fees.max_fee_per_gas),
+            max_fee: Some(frame.fees.max_fee),
             max_priority_fee_per_gas: Some(frame.fees.max_priority_fee_per_gas),
-            max_fee_per_blob_gas: Some(frame.fees.max_fee_per_blob_gas),
             blob_versioned_hashes: frame.blob_versioned_hashes.clone(),
             hash: Some(*tx.tx_hash()),
             ..Default::default()
         };
     }
     let signature = tx.signature().expect("frame envelopes were handled above");
-    let tx_type = tx_type(tx);
+    let tx_type = tx.ty();
     Transaction {
         txbytes: None,
         frames: None,
@@ -250,6 +249,7 @@ fn export_transaction(tx: &EthereumTxEnvelope<TxEip4844>, signer: Address) -> Tr
         chain_id: tx.chain_id().map(U256::from),
         access_list: tx.access_list().map(export_access_list),
         max_fee_per_gas: tx.tx_type().is_dynamic_fee().then(|| U256::from(tx.max_fee_per_gas())),
+        max_fee: None,
         max_priority_fee_per_gas: tx.max_priority_fee_per_gas().map(U256::from),
         blob_versioned_hashes: tx.blob_versioned_hashes().unwrap_or_default().to_vec(),
         max_fee_per_blob_gas: tx.max_fee_per_blob_gas().map(U256::from),
@@ -260,17 +260,6 @@ fn export_transaction(tx: &EthereumTxEnvelope<TxEip4844>, signer: Address) -> Tr
 
 fn signature_v(tx_type: u8, y_parity: bool, chain_id: Option<u64>) -> u128 {
     if tx_type == 0 { to_eip155_value(y_parity, chain_id) } else { u128::from(y_parity as u8) }
-}
-
-const fn tx_type(tx: &EthereumTxEnvelope<TxEip4844>) -> u8 {
-    match tx {
-        EthereumTxEnvelope::Legacy(_) => 0,
-        EthereumTxEnvelope::Eip2930(_) => 1,
-        EthereumTxEnvelope::Eip1559(_) => 2,
-        EthereumTxEnvelope::Eip4844(_) => 3,
-        EthereumTxEnvelope::Eip7702(_) => 4,
-        EthereumTxEnvelope::Eip8141(_) => 6,
-    }
 }
 
 fn export_access_list(access_list: &AccessList) -> Vec<AccessListItem> {
@@ -321,10 +310,13 @@ mod tests {
             }],
             ..Default::default()
         };
-        payload.fees.max_fee_per_gas = U256::MAX;
+        payload.fees.max_fee = U256::MAX;
         let envelope = EthereumTxEnvelope::<TxEip4844>::Eip8141(payload.clone().seal_slow());
         let exported = export_transaction(&envelope, Address::ZERO);
         assert_eq!(exported.sender, Some(sender));
+        assert_eq!(exported.max_fee, Some(U256::MAX));
+        assert_eq!(exported.max_fee_per_gas, None);
+        assert_eq!(exported.max_fee_per_blob_gas, None);
         assert_eq!(exported.txbytes.as_ref().unwrap().as_ref(), envelope.encoded_2718().as_slice());
         let encoded = serde_json::to_vec(&exported).unwrap();
         let replay = serde_json::from_slice::<Transaction>(&encoded).unwrap();
@@ -332,7 +324,7 @@ mod tests {
         assert_eq!(reference.caller, sender);
         assert_eq!(reference.nonce, payload.nonce);
         let frame = reference.frame_transaction.unwrap();
-        assert_eq!(frame.max_fee_per_gas, U256::MAX);
+        assert_eq!(frame.max_fee, U256::MAX);
         assert_eq!(frame.nonce_keys, payload.nonce_keys);
         assert_eq!(frame.frames, payload.frames);
         assert_eq!(frame.signatures, payload.signatures);

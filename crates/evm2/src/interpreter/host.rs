@@ -209,7 +209,7 @@ pub trait Host<T: EvmTypesHost> {
     }
 
     /// Whether the current top-level frame is a read-only assertion.
-    fn is_post_tx_frame(&self) -> bool {
+    fn is_assert_frame(&self) -> bool {
         false
     }
 
@@ -234,23 +234,12 @@ pub trait Host<T: EvmTypesHost> {
         refill
     }
 
-    /// Reads a recorded transaction trace value in POST_TX mode.
+    /// Reads a recorded transaction trace value in ASSERT mode.
     fn txtrace(&mut self, _param: Word, _index: Word) -> Option<Word> {
         None
     }
 
-    /// Performs a Bogota diff lookup, returning its value and cold-access indicator.
-    fn txdiff(
-        &mut self,
-        _param: Word,
-        _in2: Word,
-        _in3: Word,
-        _skip_cold: bool,
-    ) -> Result<(Word, bool), HostError> {
-        Err(InstrStop::OpcodeNotFound.into())
-    }
-
-    /// Reads one recorded event's data in POST_TX mode.
+    /// Reads one recorded event's data in ASSERT mode.
     fn event_data(&self, _index: Word) -> Option<Bytes> {
         None
     }

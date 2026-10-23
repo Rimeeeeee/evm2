@@ -244,7 +244,7 @@ evm_features! {
     EIP8141,
     /// Bogota keyed nonce payload and protocol transitions.
     EIP8250,
-    /// Bogota POST_TX assertion instructions.
+    /// Bogota ASSERT assertion instructions.
     EIP7906,
     /// Explicit simulation-only allowance for unsigned frame requests. Off by default.
     FRAME_SIGNATURE_PLACEHOLDERS,

@@ -58,8 +58,11 @@ fn transaction(keyed: bool) -> Recovered<TxEnvelope> {
         TxEnvelope::Eip8141(TxEip8141 {
             chain_id: 1,
             sender: SENDER,
-            fees: TransactionFees { max_fee_per_gas: U256::from(1), ..Default::default() },
-            nonce_keys: Some(vec![U256::from(u8::from(keyed))]),
+            fees: TransactionFees {
+                max_fee: U256::from(1_000_000),
+                max_priority_fee_per_gas: U256::ONE,
+            },
+            nonce_keys: Some(if keyed { vec![U256::from(1)] } else { vec![] }),
             frames: vec![Frame {
                 mode: FrameMode::Verify,
                 flags: 3,

@@ -561,8 +561,7 @@ opcodes! {
     0xB4 => SIGPARAM => sigparam => stack_io(2, 1);
     0xB5 => SIGDATACOPY => sigdatacopy => stack_io(4, 0);
     0xB6 => TXTRACE => txtrace => stack_io(2, 1);
-    0xB7 => TXDIFF => txdiff => stack_io(3, 1);
-    0xB8 => EVENTDATACOPY => eventdatacopy => stack_io(4, 0);
+    0xB7 => EVENTDATACOPY => eventdatacopy => stack_io(4, 0);
     // 0xB9
     // 0xBA
     // 0xBB

@@ -92,7 +92,7 @@ fn reserved_zero_signature_message_is_rejected_even_with_placeholders() {
         {
             let mut evm = evm(APPROVE_BOTH, &[]);
             set_placeholders(&mut evm, placeholders);
-            let mut tx = payload(vec![frame(FrameMode::Verify, SENDER, 3)], vec![U256::ZERO]);
+            let mut tx = payload(vec![frame(FrameMode::Verify, SENDER, 3)], vec![]);
             tx.signatures.push(FrameSignature {
                 scheme,
                 msg: SignatureMessage::Explicit(B256::ZERO),
@@ -127,7 +127,7 @@ fn nonzero_arbitrary_message_and_unsigned_simulation_placeholders_remain_valid()
     for scheme in [SignatureScheme::Arbitrary, SignatureScheme::Secp256k1, SignatureScheme::P256] {
         let mut evm = evm(APPROVE_BOTH, &[]);
         set_placeholders(&mut evm, true);
-        let mut tx = payload(vec![frame(FrameMode::Verify, SENDER, 3)], vec![U256::ZERO]);
+        let mut tx = payload(vec![frame(FrameMode::Verify, SENDER, 3)], vec![]);
         tx.signatures.push(FrameSignature {
             scheme,
             msg: SignatureMessage::Explicit(B256::with_last_byte(1)),
@@ -153,7 +153,7 @@ fn delegating_sender(parent_exit: &[u8]) -> Vec<u8> {
 
 #[test]
 fn nested_approval_commits_only_after_its_parent_succeeds() {
-    for keys in [vec![U256::ZERO], vec![U256::from(7), U256::MAX]] {
+    for keys in [vec![], vec![U256::from(7), U256::MAX]] {
         let mut evm = evm(&delegating_sender(&[0x00]), APPROVE_BOTH);
         let mut delegated = frame(FrameMode::Default, SENDER, 3);
         delegated.data = U256::from(1).to_be_bytes::<32>().to_vec().into();
@@ -163,6 +163,7 @@ fn nested_approval_commits_only_after_its_parent_succeeds() {
         let outcome = result.frame.unwrap();
         assert_eq!(outcome.payer, SENDER);
         assert_eq!(outcome.receipts[0].status, FrameStatus::Success);
+        assert_eq!(nonce(&mut evm, U256::ZERO), U256::from(u8::from(keys.is_empty())));
         for key in keys {
             assert_eq!(nonce(&mut evm, key), U256::from(1));
         }
@@ -172,7 +173,7 @@ fn nested_approval_commits_only_after_its_parent_succeeds() {
 #[test]
 fn reverted_or_halted_parent_discards_nested_approval_and_nonce_debits() {
     for parent_exit in [&[0x5f, 0x5f, 0xfd][..], &[0xfe][..]] {
-        for keys in [vec![U256::ZERO], vec![U256::from(7), U256::MAX]] {
+        for keys in [vec![], vec![U256::from(7), U256::MAX]] {
             let mut evm = evm(&delegating_sender(parent_exit), APPROVE_BOTH);
             let mut delegated = frame(FrameMode::Default, SENDER, 3);
             delegated.data = U256::from(1).to_be_bytes::<32>().to_vec().into();
@@ -186,6 +187,7 @@ fn reverted_or_halted_parent_discards_nested_approval_and_nonce_debits() {
             assert_eq!(outcome.receipts[0].status, FrameStatus::Failure);
             assert_eq!(outcome.receipts[0].gas_used.state, 0);
             assert_eq!(outcome.receipts[1].status, FrameStatus::Success);
+            assert_eq!(nonce(&mut evm, U256::ZERO), U256::from(u8::from(keys.is_empty())));
             for key in keys {
                 assert_eq!(nonce(&mut evm, key), U256::from(1));
             }
@@ -286,7 +288,7 @@ fn atomic_restore_rollback_restores_the_original_frames_state_gas_ownership() {
             restore.limits.state = 0;
             frames.push(restore);
         }
-        let result = evm.transact(&recovered(payload(frames, vec![U256::ZERO]))).unwrap().commit();
+        let result = evm.transact(&recovered(payload(frames, vec![]))).unwrap().commit();
         let outcome = result.frame.unwrap();
         let slot_cost = u64::from(evm.version().gas_params.get(GasId::SstoreSetState));
         assert_eq!(outcome.receipts[1].gas_used.state, if final_restore { 0 } else { slot_cost });
@@ -308,10 +310,7 @@ fn later_frame_can_cancel_an_earlier_frames_storage_clear_refund() {
     let clear = frame(FrameMode::Sender, BODY, 0);
     let mut rewrite = frame(FrameMode::Sender, BODY, 0);
     rewrite.data = U256::from(9).to_be_bytes::<32>().to_vec().into();
-    let tx = recovered(payload(
-        vec![frame(FrameMode::Verify, SENDER, 3), clear, rewrite],
-        vec![U256::ZERO],
-    ));
+    let tx = recovered(payload(vec![frame(FrameMode::Verify, SENDER, 3), clear, rewrite], vec![]));
     let result = evm.transact(&tx).unwrap().commit();
     assert_eq!(result.refunded, 0);
     assert_eq!(result.state_gas_spent, 0);
@@ -330,13 +329,14 @@ fn a_nested_external_callee_cannot_approve_the_top_level_targets_scope() {
         0x5f, 0x52, // Return the child success flag as the direct approval's output.
         0x60, 3, 0x60, 32, 0x5f, 0xaa,
     ]);
-    for keys in [vec![U256::ZERO], vec![U256::from(7), U256::MAX]] {
+    for keys in [vec![], vec![U256::from(7), U256::MAX]] {
         let mut evm = evm(&sender, APPROVE_BOTH);
         let tx = recovered(payload(vec![frame(FrameMode::Default, SENDER, 3)], keys.clone()));
         let result = evm.transact(&tx).unwrap().commit();
         let outcome = result.frame.unwrap();
         assert_eq!(outcome.payer, SENDER);
         assert_eq!(outcome.outputs[0].as_ref(), [0; 32]);
+        assert_eq!(nonce(&mut evm, U256::ZERO), U256::from(u8::from(keys.is_empty())));
         for key in keys {
             assert_eq!(nonce(&mut evm, key), U256::from(1));
         }

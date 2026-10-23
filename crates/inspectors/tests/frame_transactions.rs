@@ -49,8 +49,8 @@ fn native_finalization_reconciles_assertion_rollback_and_skipped_frames() {
     let frames = [
         (FrameMode::Verify, sender, 3),
         (FrameMode::Sender, body, 0),
-        (FrameMode::PostTx, assertion, 0),
-        (FrameMode::PostTx, assertion, 0),
+        (FrameMode::Assert, assertion, 0),
+        (FrameMode::Assert, assertion, 0),
     ]
     .into_iter()
     .map(|(mode, target, flags)| Frame {
@@ -65,7 +65,7 @@ fn native_finalization_reconciles_assertion_rollback_and_skipped_frames() {
         TxEnvelope::Eip8141(TxEip8141 {
             chain_id: 1,
             sender,
-            nonce_keys: Some(vec![U256::ZERO]),
+            nonce_keys: Some(vec![]),
             frames,
             ..Default::default()
         }),
@@ -126,7 +126,7 @@ fn transaction(frames: Vec<Frame>) -> Recovered<TxEnvelope> {
         TxEnvelope::Eip8141(TxEip8141 {
             chain_id: 1,
             sender: Address::with_last_byte(0xa0),
-            nonce_keys: Some(vec![U256::ZERO]),
+            nonce_keys: Some(vec![]),
             frames,
             ..Default::default()
         }),
@@ -160,11 +160,15 @@ fn default_verification_transaction() -> (Address, Recovered<TxEnvelope>) {
     let mut tx = TxEip8141 {
         chain_id: 1,
         sender,
-        nonce_keys: Some(vec![U256::ZERO]),
+        nonce_keys: Some(vec![]),
         frames: vec![frame(FrameMode::Verify, sender, 3)],
         ..Default::default()
     };
-    tx.signatures.push(FrameSignature { scheme: SignatureScheme::Secp256k1, ..Default::default() });
+    tx.signatures.push(FrameSignature {
+        scheme: SignatureScheme::Secp256k1,
+        signature: vec![0; 65].into(),
+        ..Default::default()
+    });
     let (sig, recid) = key.sign_prehash_recoverable(tx.signature_hash().as_slice());
     let mut signature = vec![recid.to_byte()];
     signature.extend_from_slice(sig.to_bytes().as_slice());
@@ -369,7 +373,7 @@ fn assertion_failure_preserves_payment_prefix_logs_and_the_block_log_offset() {
         .transact(&transaction(vec![
             frame(FrameMode::Default, sender, 3),
             frame(FrameMode::Sender, body, 0),
-            frame(FrameMode::PostTx, assertion, 0),
+            frame(FrameMode::Assert, assertion, 0),
         ]))
         .unwrap()
         .discard();
@@ -455,8 +459,8 @@ mod js {
         let tx = transaction(vec![
             frame(FrameMode::Verify, sender, 3),
             frame(FrameMode::Sender, body, 0),
-            frame(FrameMode::PostTx, assertion, 0),
-            frame(FrameMode::PostTx, assertion, 0),
+            frame(FrameMode::Assert, assertion, 0),
+            frame(FrameMode::Assert, assertion, 0),
         ]);
         evm.set_inspector(DebugInspector::Js(Box::new(
             JsInspector::new(TRACER.into(), json!(null)).unwrap(),
