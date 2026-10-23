@@ -324,7 +324,8 @@ fn keyed(reads: usize) -> Case {
                         mode,
                         target: target.into(),
                         flags,
-                        limits: FrameLimits { execution: 1_000_000, state: 300_000 },
+                        // Eight fresh keyed nonces cost 8 * 97_920 state gas at Bogota.
+                        limits: FrameLimits { execution: 1_000_000, state: 1_000_000 },
                         ..Default::default()
                     })
                     .collect(),
@@ -486,7 +487,8 @@ fn first_use() -> Case {
     }
     let mut tx = case.tx.inner().as_eip8141().unwrap().clone();
     for frame in &mut tx.frames {
-        frame.limits.state = 500_000;
+        // Sixteen fresh slots cost 16 * 97_920 state gas at Bogota.
+        frame.limits.state = 2_000_000;
     }
     case.tx = Recovered::new_unchecked(TxEnvelope::Eip8141(tx), Address::ZERO);
     case
@@ -588,14 +590,14 @@ fn bench_tracing(group: &mut BenchmarkGroup<'_, WallTime>, case: &Case) {
     group.bench_function(format!("{}/tracing_record_drop", case.name), |b| {
         b.iter(|| {
             evm.set_inspector(TracingInspector::new(config));
-            black_box(evm.call_tx(black_box(&case.tx)).unwrap());
+            drop(black_box(evm.call_tx(black_box(&case.tx)).unwrap()));
             black_box(evm.clear_inspector_as::<TracingInspector>().unwrap());
         });
     });
     group.bench_function(format!("{}/parity_record_render", case.name), |b| {
         b.iter(|| {
             evm.set_inspector(TracingInspector::new(config));
-            black_box(evm.call_tx(black_box(&case.tx)).unwrap());
+            drop(black_box(evm.call_tx(black_box(&case.tx)).unwrap()));
             let inspector = *evm.clear_inspector_as::<TracingInspector>().unwrap();
             black_box(inspector.into_parity_builder().vm_trace());
         });
@@ -704,11 +706,11 @@ mod allocation {
         COUNTS.with(|counts| counts.set(Some(Counts::default())));
         let mut evm = case.evm();
         for _ in 0..10 {
-            black_box(evm.call_tx(&case.tx).unwrap());
+            drop(black_box(evm.call_tx(&case.tx).unwrap()));
         }
         let warm = COUNTS.with(|counts| counts.get().unwrap());
         for _ in 0..ITERATIONS {
-            black_box(evm.call_tx(&case.tx).unwrap());
+            drop(black_box(evm.call_tx(&case.tx).unwrap()));
         }
         let after = COUNTS.with(|counts| counts.get().unwrap());
         drop(evm);
