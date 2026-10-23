@@ -897,7 +897,13 @@ fn payment_approval_honors_balance_top_up_independently_of_fee_and_balance_check
                     // The sender pays for this transaction. Read its balance after APPROVE,
                     // before settlement, so later refunds cannot hide an unwanted top-up.
                     let mut evm = evm(&[0x33, 0x31, 0x5f, 0x52, 0x60, 32, 0x5f, 0xf3], &[]);
-                    let sender = evm.overlay_db_mut().cache.accounts.get_mut(&SENDER).unwrap();
+                    let sender = evm
+                        .database_as_mut::<InMemoryDB>()
+                        .unwrap()
+                        .cache
+                        .accounts
+                        .get_mut(&SENDER)
+                        .unwrap();
                     sender.as_mut().unwrap().balance = initial_balance;
                     let mut version = *evm.version();
                     for (feature, enabled) in [
