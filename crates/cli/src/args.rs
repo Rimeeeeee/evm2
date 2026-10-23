@@ -118,7 +118,10 @@ mod tests {
 
     #[test]
     fn parse_block_range_rejects_reversed_range() {
-        assert!(parse_block_range("12-10").unwrap_err().contains("greater"));
+        assert_eq!(
+            parse_block_range("12-10").unwrap_err(),
+            "range start 12 is greater than end 10"
+        );
     }
 
     #[cfg(feature = "jit")]

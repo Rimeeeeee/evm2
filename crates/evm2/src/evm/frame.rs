@@ -7,6 +7,7 @@ use crate::{
     Evm, EvmFeatures, EvmTypes, EvmTypesHost, HostError,
     ethereum::{
         TxEnvelope,
+        eip7906::TxTraceParam,
         eip8141::{self, FrameValidationResult},
     },
     interpreter::{GasTracker, InstrStop, Message, MessageResult, MessageResultExt},
@@ -61,6 +62,8 @@ pub(crate) struct FrameTransactionRuntime {
     state_gas: FrameStateGas,
     /// Assertion snapshot captured on first use in an assertion frame.
     diff: Option<FrameDiff>,
+    /// Canonical nonce-key digest, computed once for the immutable transaction payload.
+    nonce_keys_hash: Option<B256>,
 }
 
 /// Approval and state-gas checkpoint for one interpreter call.
@@ -94,6 +97,8 @@ impl FrameTransactionRuntime {
         legacy_nonce: u64,
     ) -> Self {
         let frame_count = payload.frames.len();
+        let nonce_keys_hash =
+            payload.nonce_keys.as_deref().map(alloy_eips::eip8141::nonce_keys_hash);
         Self {
             resolved_target: payload.sender,
             payload,
@@ -109,6 +114,7 @@ impl FrameTransactionRuntime {
             root_approval: None,
             state_gas: FrameStateGas::default(),
             diff: None,
+            nonce_keys_hash,
         }
     }
 
@@ -128,9 +134,7 @@ impl FrameTransactionRuntime {
             12 => U256::from(state_left),
             13 if tx.nonce_keys.is_some() => U256::from(self.legacy_nonce),
             14 => U256::from(tx.nonce_keys.as_ref()?.len()),
-            15 => U256::from_be_bytes(
-                alloy_eips::eip8141::nonce_keys_hash(tx.nonce_keys.as_deref()?).0,
-            ),
+            15 => U256::from_be_bytes(self.nonce_keys_hash?.0),
             16 => tx.nonce_keys.as_ref()?.first().copied().unwrap_or_default(),
             _ => return None,
         })
@@ -322,12 +326,32 @@ impl FrameTransactionRuntime {
         if !self.is_assert() {
             return None;
         }
-        self.diff.get_or_insert_with(|| FrameDiff::capture(state)).value(
-            param,
-            index,
-            state.logs(),
-            self.approval,
-        )
+        let selector = TxTraceParam::try_from(u8::try_from(param).ok()?).ok()?;
+        if selector.requires_zero_index() && !index.is_zero() {
+            return None;
+        }
+        let index = usize::try_from(index).ok()?;
+        let logs = state.logs();
+        Some(match selector {
+            TxTraceParam::EventsCount => U256::from(logs.len()),
+            TxTraceParam::EventAddress => U256::from_be_slice(logs.get(index)?.address.as_slice()),
+            TxTraceParam::EventTopicCount => U256::from(logs.get(index)?.data.topics().len()),
+            TxTraceParam::EventTopic0
+            | TxTraceParam::EventTopic1
+            | TxTraceParam::EventTopic2
+            | TxTraceParam::EventTopic3 => U256::from_be_bytes(
+                logs.get(index)?.data.topics().get(usize::from(u8::from(selector) - 0x14))?.0,
+            ),
+            TxTraceParam::EventDataLength => U256::from(logs.get(index)?.data.data.len()),
+            TxTraceParam::GasPreCharge => self.approval.gas_pre_charge,
+            TxTraceParam::GasPayerAddress => U256::from_be_slice(self.approval.payer?.as_slice()),
+            selector => {
+                return self
+                    .diff
+                    .get_or_insert_with(|| FrameDiff::capture(state))
+                    .value(selector, index);
+            }
+        })
     }
 
     pub(super) fn event_data(&self, state: &State<'_>, index: U256) -> Option<Bytes> {
@@ -435,7 +459,10 @@ impl<T: EvmTypes> Evm<'_, T> {
             let fees = self.feature(EvmFeatures::FEE_CHARGE);
             if fees {
                 self.state.account(&address)?.set_balance(balance.saturating_sub(maximum));
-            } else if !self.feature(EvmFeatures::BALANCE_CHECK) && balance < maximum {
+            } else if !self.feature(EvmFeatures::BALANCE_CHECK)
+                && self.feature(EvmFeatures::BALANCE_TOP_UP)
+                && balance < maximum
+            {
                 self.state.account(&address)?.set_balance(maximum);
             }
             precharge = if fees { balance.min(maximum) } else { U256::ZERO };
@@ -603,6 +630,9 @@ impl<'a, T: EvmTypes<Tx = TxEnvelope>> Evm<'a, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::evm::CacheDB;
+    use alloy_eips::eip8141::Frame;
+    use alloy_primitives::{Log, LogData, b256, keccak256};
 
     #[test]
     fn txparam_exposes_signed_fee_budget_and_rejects_removed_fee_selectors() {
@@ -616,5 +646,123 @@ mod tests {
             assert_eq!(runtime.tx_param(U256::from(removed), 0), None);
         }
         assert_eq!(runtime.tx_param(U256::from(7), 0), Some(U256::ZERO));
+    }
+
+    #[test]
+    fn txparam_caches_canonical_nonce_key_hashes_without_collapsing_absent_and_empty_keys() {
+        let mut zero_key_preimage = [0; 64];
+        zero_key_preimage[31] = 1;
+        let keys = (0..16).map(U256::from).collect::<Vec<_>>();
+        let mut max_keys_preimage = [0; 17 * 32];
+        max_keys_preimage[31] = 16;
+        for (index, key) in keys.iter().enumerate() {
+            max_keys_preimage[(index + 1) * 32..(index + 2) * 32]
+                .copy_from_slice(&key.to_be_bytes::<32>());
+        }
+        for (keys, expected) in [
+            (None, None),
+            (
+                Some(alloc::vec![]),
+                Some(b256!("290decd9548b62a8d60345a988386fc84ba6bc95484008f6362f93160ef3e563")),
+            ),
+            (Some(alloc::vec![U256::ZERO]), Some(keccak256(zero_key_preimage))),
+            (
+                Some(alloc::vec![U256::ONE]),
+                Some(b256!("cc69885fda6bcc1a4ace058b4a62bf5e179ea78fd58a1ccd71c22cc9b688792f")),
+            ),
+            (Some(keys), Some(keccak256(max_keys_preimage))),
+        ] {
+            let runtime = FrameTransactionRuntime::new(
+                Arc::new(TxEip8141 { nonce_keys: keys.clone(), ..Default::default() }),
+                B256::ZERO,
+                U256::ZERO,
+                7,
+            );
+            assert_eq!(runtime.nonce_keys_hash, expected);
+            for _ in 0..32 {
+                assert_eq!(
+                    runtime.tx_param(U256::from(15), 0),
+                    expected.map(|hash| U256::from_be_bytes(hash.0))
+                );
+                assert_eq!(
+                    runtime.tx_param(U256::from(14), 0),
+                    keys.as_ref().map(|keys| U256::from(keys.len()))
+                );
+                assert_eq!(
+                    runtime.tx_param(U256::from(16), 0),
+                    keys.as_ref().map(|keys| keys.first().copied().unwrap_or_default())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cheap_and_invalid_txtrace_queries_leave_the_state_diff_unmaterialized() {
+        let changed = Address::with_last_byte(5);
+        let payer = Address::with_last_byte(9);
+        let mut state = State::new(CacheDB::default());
+        state.account(&changed).unwrap().set_balance(U256::from(11));
+        state.storage(&changed).unwrap().into_slot(U256::ONE).unwrap().set(U256::from(12));
+        state.log(Log {
+            address: changed,
+            data: LogData::new_unchecked(
+                (1..=4).map(B256::with_last_byte).collect(),
+                Bytes::from_static(&[7, 8, 9]),
+            ),
+        });
+        state.log(Log { address: changed, data: LogData::default() });
+        let mut runtime = FrameTransactionRuntime::new(
+            Arc::new(TxEip8141 {
+                frames: alloc::vec![Frame { mode: FrameMode::Assert, ..Default::default() }],
+                ..Default::default()
+            }),
+            B256::ZERO,
+            U256::ZERO,
+            0,
+        );
+        runtime.approval = FrameApprovalState {
+            payer: Some(payer),
+            gas_pre_charge: U256::from(17),
+            sender_approved: true,
+        };
+        for (selector, expected) in [
+            (TxTraceParam::EventsCount, 2),
+            (TxTraceParam::EventAddress, 5),
+            (TxTraceParam::EventTopicCount, 4),
+            (TxTraceParam::EventTopic0, 1),
+            (TxTraceParam::EventTopic1, 2),
+            (TxTraceParam::EventTopic2, 3),
+            (TxTraceParam::EventTopic3, 4),
+            (TxTraceParam::EventDataLength, 3),
+            (TxTraceParam::GasPreCharge, 17),
+            (TxTraceParam::GasPayerAddress, 9),
+        ] {
+            assert_eq!(
+                runtime.trace_value(&state, U256::from(u8::from(selector)), U256::ZERO),
+                Some(U256::from(expected))
+            );
+            assert!(runtime.diff.is_none());
+        }
+        for (selector, index) in [
+            (U256::MAX, U256::ZERO),
+            (U256::from(0xff), U256::ZERO),
+            (U256::ZERO, U256::ONE),
+            (U256::from(0x11), U256::ONE),
+            (U256::from(0x19), U256::ONE),
+            (U256::from(0x1a), U256::ONE),
+            (U256::from(4), U256::MAX),
+            (U256::from(0x12), U256::from(2)),
+            (U256::from(0x14), U256::ONE),
+        ] {
+            assert_eq!(runtime.trace_value(&state, selector, index), None);
+            assert!(runtime.diff.is_none());
+        }
+        runtime.approval.payer = None;
+        assert_eq!(runtime.trace_value(&state, U256::from(0x1a), U256::ZERO), None);
+        assert!(runtime.diff.is_none());
+        assert_eq!(runtime.trace_value(&state, U256::ONE, U256::ZERO), Some(U256::ONE));
+        assert!(runtime.diff.is_some());
+        assert_eq!(runtime.trace_value(&state, U256::from(0x0a), U256::ZERO), Some(U256::ONE));
+        assert_eq!(runtime.trace_value(&state, U256::from(0x09), U256::ZERO), Some(U256::from(12)));
     }
 }

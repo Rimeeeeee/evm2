@@ -3,14 +3,15 @@ use super::{
     execute::{ExecuteConfig, ExecutionMode, execute_test_suite},
 };
 use crate::harness::{TestSuite, run_json_harnesses};
-#[cfg(feature = "jit")]
-use crate::{
-    blockchaintest::execute::execute_test_suites, execution::CompiledMode, harness::compiled_roots,
-};
 use libtest_mimic::Failed;
 use std::{
     path::{Path, PathBuf},
     process::ExitCode,
+};
+
+#[cfg(feature = "jit")]
+use crate::{
+    blockchaintest::execute::execute_test_suites, execution::CompiledMode, harness::compiled_roots,
 };
 
 /// Runs the cargo-nextest blockchain test harness.

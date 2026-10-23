@@ -190,7 +190,7 @@ pub enum SpecName {
     Osaka,
     /// Amsterdam.
     Amsterdam,
-    /// Bogota devnet 1.
+    /// Bogota devnet 2.
     Bogota,
 }
 

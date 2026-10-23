@@ -1,6 +1,4 @@
 use evm2::{BaseEvmTypes, Evm, NoopInspector};
-#[cfg(feature = "jit")]
-use evm2_jit_runtime::{evm2_evm::run_interpreter, runtime::JitBackend};
 use std::{error::Error, fmt};
 
 #[cfg(feature = "jit")]
@@ -8,6 +6,8 @@ use evm2::{
     InterpreterRunner,
     interpreter::{InstrStop, Interpreter},
 };
+#[cfg(feature = "jit")]
+use evm2_jit_runtime::{evm2_evm::run_interpreter, runtime::JitBackend};
 #[cfg(feature = "jit")]
 use std::sync::{
     Arc,
@@ -157,6 +157,7 @@ impl ExecutionResources {
         }
         Ok(())
     }
+
     #[cfg(not(feature = "jit"))]
     pub(crate) const fn verify_backend(&self) -> Result<(), ExecutionResourceError> {
         Ok(())

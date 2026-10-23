@@ -254,15 +254,19 @@ impl Transaction for TxEnvelope {
     fn authorization_list(&self) -> Option<&[alloy_eips::eip7702::SignedAuthorization]> {
         delegate!(self, authorization_list)
     }
+
     fn max_fee_per_gas_u256(&self) -> U256 {
         delegate!(self, max_fee_per_gas_u256)
     }
+
     fn max_priority_fee_per_gas_u256(&self) -> Option<U256> {
         delegate!(self, max_priority_fee_per_gas_u256)
     }
+
     fn max_fee_per_blob_gas_u256(&self) -> Option<U256> {
         delegate!(self, max_fee_per_blob_gas_u256)
     }
+
     fn effective_gas_price_u256(&self, base_fee: Option<u64>) -> U256 {
         delegate!(self, effective_gas_price_u256, base_fee)
     }
@@ -998,7 +1002,7 @@ mod tests {
     use crate::{
         BaseEvmTypes, ExecutionConfig, Precompiles,
         env::{BlockEnvExt, TxEnvExt},
-        evm::InMemoryDB,
+        evm::{InMemoryDB, handler::TxHandlerHooks},
         interpreter::{Host, InstrStop, op},
         registry::TxRegistry,
     };
@@ -1010,8 +1014,6 @@ mod tests {
     fn adjusted_floor_gas_controls_validation_and_settlement(
         #[values(31_049, 31_050)] gas_limit: u64,
     ) {
-        use crate::evm::handler::TxHandlerHooks;
-
         struct CalldataSurcharge;
 
         impl TxHandlerHooks<BaseEvmTypes> for CalldataSurcharge {

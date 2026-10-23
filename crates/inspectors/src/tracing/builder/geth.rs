@@ -1,4 +1,5 @@
 //! Geth trace builder
+
 use crate::tracing::{
     final_refunded,
     tx_state::TxState,

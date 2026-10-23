@@ -16,6 +16,9 @@ pub use crypto::*;
 mod env;
 pub use env::*;
 
+mod frame;
+pub use frame::*;
+
 mod host;
 pub use host::*;
 
@@ -32,6 +35,3 @@ pub mod i256;
 
 #[cfg(test)]
 mod macro_tests;
-
-mod frame;
-pub use frame::*;

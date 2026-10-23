@@ -174,7 +174,7 @@ impl ParityTraceBuilder {
         let mut trace_res = self.into_trace_results(result, trace_types);
 
         // check the state diff case
-        if let Some(ref mut state_diff) = trace_res.state_diff {
+        if let Some(state_diff) = &mut trace_res.state_diff {
             populate_state_diff(state_diff, db, state)?;
         }
 
@@ -283,7 +283,7 @@ impl ParityTraceBuilder {
                 if node.trace.frame_transaction_root {
                     self.make_frame_transaction_vm_trace(node)
                 } else {
-                    self.make_vm_trace(node)
+                    self.make_vm_trace(&self.nodes)
                 }
             })
             .unwrap_or_default()
@@ -292,14 +292,15 @@ impl ParityTraceBuilder {
     /// Returns a VM trace with the recorded bytecode.
     ///
     /// Iteratively creates a VM trace by traversing the recorded nodes in the arena
-    fn make_vm_trace(&self, start: &CallTraceNode) -> VmTrace {
-        let mut child_idx_stack = Vec::with_capacity(self.nodes.len());
-        let mut sub_stack = Vec::with_capacity(self.nodes.len());
+    fn make_vm_trace(&self, nodes: &[CallTraceNode]) -> VmTrace {
+        let start = &nodes[0];
+        let mut child_idx_stack = Vec::with_capacity(nodes.len());
+        let mut sub_stack = Vec::with_capacity(nodes.len());
 
         // Excluded precompile calls are recorded without being attached to their parent, in call
         // order.
         let mut precompiles = HashMap::<usize, Vec<&CallTraceNode>>::default();
-        for node in self.nodes.iter().filter(|node| node.is_precompile()) {
+        for node in nodes.iter().filter(|node| node.is_precompile()) {
             if let Some(parent) = node.parent {
                 precompiles.entry(parent).or_default().push(node);
             }
@@ -386,9 +387,13 @@ impl ParityTraceBuilder {
         let ops = root
             .children
             .iter()
-            .filter_map(|child| {
+            .enumerate()
+            .filter_map(|(index, child)| {
                 let node = &self.nodes[*child];
                 let trace = &node.trace;
+                // Calls are recorded depth first. Include excluded precompiles between roots,
+                // while bounding scratch allocation and indexing to this frame's subtree.
+                let end = root.children.get(index + 1).copied().unwrap_or(self.nodes.len());
                 trace.entered_evm.then(|| VmInstruction {
                     pc: trace.frame_index.expect("top-level frame index"),
                     cost: trace.gas_limit,
@@ -398,7 +403,7 @@ impl ParityTraceBuilder {
                         mem: None,
                         store: None,
                     }),
-                    sub: Some(self.make_vm_trace(node)),
+                    sub: Some(self.make_vm_trace(&self.nodes[*child..end])),
                     op: None,
                     idx: None,
                 })

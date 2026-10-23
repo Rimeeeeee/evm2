@@ -20,8 +20,6 @@ use crate::{
 use alloy_primitives::Bytes;
 use crossbeam_channel as chan;
 use rayon::{ThreadPool, ThreadPoolBuilder};
-#[cfg(feature = "llvm")]
-use std::{cell::RefCell, fs::File, io::Read, time::Instant};
 use std::{
     sync::{
         Arc,
@@ -37,6 +35,8 @@ use crate::{
     llvm::{JitDylibGuard, orc::ResourceTracker},
     runtime::config::JitMode,
 };
+#[cfg(feature = "llvm")]
+use std::{cell::RefCell, fs::File, io::Read, time::Instant};
 
 #[cfg(all(feature = "llvm", unix))]
 type OutOfProcessHelper = Option<Arc<super::out_of_process::HelperProcess>>;
@@ -806,6 +806,7 @@ mod lifecycle_tests {
             ["first-exit", "second-enter", "second-exit", "tls-enter", "tls-exit", "owner-exit"]
         );
     }
+
     #[test]
     fn shutdown_joins_remaining_workers_before_reporting_a_panic() {
         let mut pool = workers(0);
@@ -820,7 +821,7 @@ mod lifecycle_tests {
             let error = pool.shutdown().unwrap_err();
             assert!(pool.threads.is_empty());
             assert_eq!(exited_rx.try_recv(), Ok(()));
-            assert!(error.to_string().contains("1 compile worker thread(s) panicked"));
+            assert_eq!(error.to_string(), "1 compile worker thread(s) panicked");
             pool.shutdown().unwrap();
         });
         release.send(()).unwrap();

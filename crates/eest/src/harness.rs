@@ -1,12 +1,13 @@
 use crate::discover::find_json_tests;
-#[cfg(feature = "jit")]
-use crate::execution::CompiledMode;
 use libtest_mimic::{Arguments, Failed, Trial};
 use std::{
     env,
     path::{Path, PathBuf},
     process::ExitCode,
 };
+
+#[cfg(feature = "jit")]
+use crate::execution::CompiledMode;
 
 const NEXTEST_ENV: &str = "NEXTEST";
 const COMPILED_EEST_SUBSET_ENV: &str = "EVM2_COMPILED_EEST_SUBSET";

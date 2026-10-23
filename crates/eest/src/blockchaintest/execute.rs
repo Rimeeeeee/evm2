@@ -9,8 +9,6 @@ use super::{
         Withdrawal,
     },
 };
-#[cfg(feature = "jit")]
-use crate::compiled::{self, FileSummary};
 use crate::{
     dump,
     execute::state_root_from_database,
@@ -42,9 +40,17 @@ use evm2::{
     },
     registry::HandlerError,
 };
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Write,
+    mem,
+    path::Path,
+};
+
+#[cfg(feature = "jit")]
+use crate::compiled::{self, FileSummary};
 #[cfg(feature = "jit")]
 use std::path::PathBuf;
-use std::{mem, path::Path};
 
 pub use crate::execution::ExecutionMode;
 
@@ -1367,15 +1373,10 @@ fn format_bal_diff(
     built: &alloy_eip7928::BlockAccessList,
     expected: &alloy_eip7928::BlockAccessList,
 ) -> String {
-    use std::{
-        collections::{BTreeMap, BTreeSet},
-        fmt::Write,
-    };
-
-    let built: BTreeMap<_, _> = built.iter().map(|account| (account.address, account)).collect();
-    let expected: BTreeMap<_, _> =
-        expected.iter().map(|account| (account.address, account)).collect();
-    let addresses: BTreeSet<_> = built.keys().chain(expected.keys()).copied().collect();
+    let built = built.iter().map(|account| (account.address, account)).collect::<BTreeMap<_, _>>();
+    let expected =
+        expected.iter().map(|account| (account.address, account)).collect::<BTreeMap<_, _>>();
+    let addresses = built.keys().chain(expected.keys()).copied().collect::<BTreeSet<_>>();
 
     let mut out = String::new();
     for address in addresses {
@@ -1478,13 +1479,12 @@ fn fork_to_spec_id(fork: ForkSpec) -> SpecId {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        super::types::{SealEngine, State},
-        *,
-    };
+    use super::*;
+    use crate::blockchaintest::types::{DecodedBlock, SealEngine, State};
+    use std::collections::BTreeMap;
+
     #[cfg(feature = "jit")]
     use evm2::interpreter::op;
-    use std::collections::BTreeMap;
 
     #[cfg(feature = "jit")]
     const BYTECODE_STORE42: &[u8] = &[op::PUSH1, 0x42, op::PUSH0, op::SSTORE, op::STOP];
@@ -1614,17 +1614,6 @@ mod tests {
 
     #[test]
     fn blockchain_tests_apply_ommer_rewards_before_merge() {
-        use super::{
-            super::types::{
-                Account, Block, BlockHeader, BlockchainTest, BlockchainTestCase, DecodedBlock,
-                ForkSpec, SealEngine, State,
-            },
-            ExecuteConfig, NoopHook, ONE_ETHER, execute_suite,
-        };
-        use crate::filter::NameFilter;
-        use alloy_primitives::{Address, B256, U256};
-        use std::{collections::BTreeMap, path::Path};
-
         let miner = Address::with_last_byte(1);
         let ommer_miner = Address::with_last_byte(2);
         let genesis_hash = B256::with_last_byte(1);
@@ -1712,16 +1701,6 @@ mod tests {
 
     #[test]
     fn receipt_root_check_rejects_invalid_empty_block_root() {
-        use super::{
-            super::types::{
-                Block, BlockHeader, BlockchainTest, BlockchainTestCase, ForkSpec, SealEngine, State,
-            },
-            ExecuteConfig, ExecutionMode, NoopHook, execute_str,
-        };
-        use crate::filter::NameFilter;
-        use alloy_primitives::{B256, U256};
-        use std::{collections::BTreeMap, path::Path};
-
         let genesis_hash = B256::with_last_byte(1);
         let suite = BlockchainTest(BTreeMap::from([(
             "invalid-receipt-root".to_string(),
@@ -1770,16 +1749,6 @@ mod tests {
 
     #[test]
     fn rejects_block_with_wrong_parent_hash() {
-        use super::{
-            super::types::{
-                Block, BlockHeader, BlockchainTest, BlockchainTestCase, ForkSpec, SealEngine, State,
-            },
-            ExecuteConfig, NoopHook, execute_str,
-        };
-        use crate::filter::NameFilter;
-        use alloy_primitives::{B256, U256};
-        use std::{collections::BTreeMap, path::Path};
-
         let genesis_hash = B256::with_last_byte(1);
         let block_hash = B256::with_last_byte(2);
         let suite = BlockchainTest(BTreeMap::from([(
@@ -1828,16 +1797,6 @@ mod tests {
 
     #[test]
     fn discards_expected_block_with_wrong_parent_hash() {
-        use super::{
-            super::types::{
-                Block, BlockHeader, BlockchainTest, BlockchainTestCase, ForkSpec, SealEngine, State,
-            },
-            ExecuteConfig, NoopHook, execute_str,
-        };
-        use crate::filter::NameFilter;
-        use alloy_primitives::{B256, U256};
-        use std::{collections::BTreeMap, path::Path};
-
         let genesis_hash = B256::with_last_byte(1);
         let suite = BlockchainTest(BTreeMap::from([(
             "expected-wrong-parent-hash".to_string(),
@@ -1881,16 +1840,6 @@ mod tests {
 
     #[test]
     fn rejects_case_with_wrong_last_block_hash() {
-        use super::{
-            super::types::{
-                Block, BlockHeader, BlockchainTest, BlockchainTestCase, ForkSpec, SealEngine, State,
-            },
-            ExecuteConfig, NoopHook, execute_str,
-        };
-        use crate::filter::NameFilter;
-        use alloy_primitives::{B256, U256};
-        use std::{collections::BTreeMap, path::Path};
-
         let genesis_hash = B256::with_last_byte(1);
         let block_hash = B256::with_last_byte(2);
         let suite = BlockchainTest(BTreeMap::from([(
@@ -2071,15 +2020,6 @@ mod tests {
 
     #[test]
     fn json_outcome_reports_pass_and_failure() {
-        use super::{
-            super::{
-                error::{TestError, TestErrorKind},
-                types::ForkSpec,
-            },
-            json_outcome_value,
-        };
-        use alloy_primitives::B256;
-
         let root = B256::with_last_byte(7);
         let pass = json_outcome_value("case-a", ForkSpec::Byzantium, &Ok(Some(root)));
         assert_eq!(pass["pass"], true);
@@ -2087,7 +2027,7 @@ mod tests {
         assert_eq!(pass["stateRoot"], serde_json::to_value(root).unwrap());
         assert_eq!(pass["errorMsg"], "");
 
-        let failure: Result<Option<B256>, TestError> = Err(TestError::case(
+        let failure = Err(TestError::case(
             std::path::Path::new("f.json"),
             "case-b",
             TestErrorKind::UnexpectedFailure("boom".to_string()),
@@ -2095,6 +2035,9 @@ mod tests {
         let fail = json_outcome_value("case-b", ForkSpec::Byzantium, &failure);
         assert_eq!(fail["pass"], false);
         assert_eq!(fail["stateRoot"], serde_json::to_value(B256::ZERO).unwrap());
-        assert!(fail["errorMsg"].as_str().unwrap().contains("boom"));
+        assert_eq!(
+            fail["errorMsg"],
+            "Path: f.json\nName: case-b\nError: unexpected execution failure: boom"
+        );
     }
 }

@@ -2,8 +2,6 @@ use crate::tracing::{
     FourByteInspector, MuxInspector, TracingInspector, TracingInspectorConfig, TransactionContext,
     final_refunded,
 };
-#[cfg(feature = "js-tracer")]
-use alloc::boxed::Box;
 use alloy_consensus::{Transaction, transaction::Recovered};
 use alloy_primitives::{Address, Log, U256};
 use alloy_rpc_types_eth::TransactionInfo;
@@ -19,6 +17,9 @@ use evm2::{
     interpreter::{Interpreter, Message, MessageResult},
 };
 use thiserror::Error;
+
+#[cfg(feature = "js-tracer")]
+use alloc::boxed::Box;
 
 /// Inspector for the `debug` API
 ///

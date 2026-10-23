@@ -153,7 +153,7 @@ fn evm(codes: &[(Address, &[u8])]) -> Evm<'static, BaseEvmTypes> {
     )
 }
 
-fn default_verification_transaction() -> (Address, Recovered<TxEnvelope>) {
+fn default_verification_transaction(data: Bytes) -> (Address, Recovered<TxEnvelope>) {
     let key = SigningKey::from_slice(&[0x11; 32]).unwrap();
     let sender =
         Address::from_raw_public_key(&key.verifying_key().to_sec1_point(false).as_bytes()[1..]);
@@ -161,7 +161,7 @@ fn default_verification_transaction() -> (Address, Recovered<TxEnvelope>) {
         chain_id: 1,
         sender,
         nonce_keys: Some(vec![]),
-        frames: vec![frame(FrameMode::Verify, sender, 3)],
+        frames: vec![Frame { data, ..frame(FrameMode::Verify, sender, 3) }],
         ..Default::default()
     };
     tx.signatures.push(FrameSignature {
@@ -179,7 +179,7 @@ fn default_verification_transaction() -> (Address, Recovered<TxEnvelope>) {
 #[test]
 fn native_default_account_verification_is_visible_in_debug_and_mux_results() {
     for mux in [false, true] {
-        let (sender, tx) = default_verification_transaction();
+        let (sender, tx) = default_verification_transaction(Bytes::new());
         let mut evm = evm(&[(sender, &[])]);
         let opts = if mux {
             serde_json::json!({ "tracer": "muxTracer", "tracerConfig": { "callTracer": { "onlyTopCall": true } } })
@@ -467,7 +467,7 @@ mod js {
 
     #[test]
     fn javascript_default_verification_without_interpreter_emits_one_enter_and_exit() {
-        let (sender, tx) = default_verification_transaction();
+        let (sender, tx) = default_verification_transaction(Bytes::new());
         let mut evm = evm(&[(sender, &[])]);
         evm.set_inspector(JsInspector::new(TRACER.into(), json!(null)).unwrap());
         let result = evm.transact(&tx).unwrap().detach();
@@ -629,5 +629,113 @@ mod js {
         assert_eq!(actual["frames"][4][4], "0x2a");
         assert!(actual["frames"][4][3].as_u64().unwrap() > 0);
         assert_eq!(actual["frames"][4][7], 1);
+    }
+}
+
+#[test]
+fn synthetic_and_executed_frames_respect_input_recording() {
+    let sender = Address::with_last_byte(0xa0);
+    let body = Address::with_last_byte(0xb0);
+    let assertion = Address::with_last_byte(0xc0);
+    let input = Bytes::from_static(&[1, 2, 3]);
+    for config in [
+        TracingInspectorConfig::none(),
+        TracingInspectorConfig::parity_vm_trace(),
+        TracingInspectorConfig::default_parity(),
+    ] {
+        let mut evm = evm(&[
+            (sender, &[0x60, 3, 0x5f, 0x5f, 0xaa]),
+            (body, &[0x00]),
+            (assertion, &[0x5f, 0x5f, 0xfd]),
+        ]);
+        let mut frames = [
+            (FrameMode::Verify, sender, 3),
+            (FrameMode::Sender, body, 0),
+            (FrameMode::Assert, assertion, 0),
+            (FrameMode::Assert, assertion, 0),
+        ]
+        .into_iter()
+        .map(|(mode, target, flags)| Frame { data: input.clone(), ..frame(mode, target, flags) })
+        .collect::<Vec<_>>();
+        frames[1].value = U256::from(2_000_000_000u64);
+        evm.set_inspector(TracingInspector::new(config));
+        let result = evm.call_tx(&transaction(frames)).unwrap();
+        assert!(!result.status);
+        let inspector = evm.clear_inspector_as::<TracingInspector>().unwrap();
+        let nodes = inspector.traces().nodes();
+        assert_eq!(nodes[0].children.len(), 4);
+        let expected = if config.record_inputs { input.clone() } else { Bytes::new() };
+        for (index, entered_evm) in [true, false, true, false].into_iter().enumerate() {
+            let trace = &nodes[nodes[0].children[index]].trace;
+            assert_eq!(trace.entered_evm, entered_evm, "frame {index}");
+            assert_eq!(trace.data, expected, "frame {index}, config={config:?}");
+        }
+        assert!(!nodes[nodes[0].children[1]].trace.success);
+        assert!(nodes[nodes[0].children[3]].trace.skipped);
+    }
+}
+
+#[test]
+fn synthetic_default_verification_respects_input_recording() {
+    let input = Bytes::from_static(&[1, 2, 3]);
+    for config in [
+        TracingInspectorConfig::none(),
+        TracingInspectorConfig::parity_vm_trace(),
+        TracingInspectorConfig::default_parity(),
+    ] {
+        let (sender, tx) = default_verification_transaction(input.clone());
+        let mut evm = evm(&[(sender, &[])]);
+        evm.set_inspector(TracingInspector::new(config));
+        assert!(evm.call_tx(&tx).unwrap().status);
+        let inspector = evm.clear_inspector_as::<TracingInspector>().unwrap();
+        let nodes = inspector.traces().nodes();
+        assert_eq!(nodes[0].children.len(), 1);
+        let trace = &nodes[nodes[0].children[0]].trace;
+        assert!(!trace.entered_evm);
+        assert_eq!(trace.data, if config.record_inputs { input.clone() } else { Bytes::new() });
+    }
+}
+
+#[test]
+fn many_frame_vm_traces_keep_nested_calls_and_excluded_precompiles_in_each_subtree() {
+    let sender = Address::with_last_byte(0xa0);
+    let body = Address::with_last_byte(0xb0);
+    let child = Address::with_last_byte(0xd0);
+    let mut code = Vec::new();
+    for target in [child, Address::with_last_byte(4), child] {
+        code.extend_from_slice(&[0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x73]);
+        code.extend_from_slice(target.as_slice());
+        code.extend_from_slice(&[0x5a, 0xf1, 0x50]);
+    }
+    code.push(0x00);
+    let mut evm = evm(&[
+        (sender, &[0x60, 3, 0x5f, 0x5f, 0xaa]),
+        (body, &code),
+        (child, &[0x60, 42, 0x50, 0x00]),
+    ]);
+    evm.set_inspector(TracingInspector::new(
+        TracingInspectorConfig::parity_vm_trace().set_exclude_precompile_calls(true),
+    ));
+    let frames = core::iter::once(frame(FrameMode::Verify, sender, 3))
+        .chain(core::iter::repeat_n(frame(FrameMode::Sender, body, 0), 63))
+        .collect();
+    assert!(evm.call_tx(&transaction(frames)).unwrap().status);
+    let inspector = evm.clear_inspector_as::<TracingInspector>().unwrap();
+    let vm = inspector.into_parity_builder().vm_trace();
+    assert_eq!(vm.ops.len(), 64);
+    for (index, operation) in vm.ops.iter().enumerate() {
+        assert_eq!(operation.pc, index);
+        let trace = operation.sub.as_ref().unwrap();
+        if index == 0 {
+            continue;
+        }
+        assert_eq!(trace.code.as_ref(), code.as_slice());
+        let children =
+            trace.ops.iter().filter_map(|operation| operation.sub.as_ref()).collect::<Vec<_>>();
+        assert_eq!(children.len(), 3, "frame {index}");
+        assert_eq!(children[0].ops.len(), 3, "first child in frame {index}");
+        assert!(children[1].code.is_empty());
+        assert!(children[1].ops.is_empty(), "excluded precompile in frame {index}");
+        assert_eq!(children[2].ops.len(), 3, "last child in frame {index}");
     }
 }

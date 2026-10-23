@@ -335,7 +335,7 @@ pub enum ForkSpec {
     BPO2ToAmsterdamAtTime15k,
     /// Amsterdam.
     Amsterdam,
-    /// Bogota devnet 1.
+    /// Bogota devnet 2.
     Bogota,
     /// Amsterdam to Bogota at timestamp 15000.
     AmsterdamToBogotaAtTime15k,

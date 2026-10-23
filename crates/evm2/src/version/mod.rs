@@ -876,8 +876,22 @@ evm_versions! {
     }
 
     BOGOTA {
-        features: [EIP8141, EIP8250, EIP7906,],
-        ops: [APPROVE: ZERO, TXPARAM: BASE, FRAMEDATALOAD: VERYLOW, FRAMEDATACOPY: VERYLOW, FRAMEPARAM: BASE, SIGPARAM: BASE, SIGDATACOPY: VERYLOW, TXTRACE: WARM_STORAGE_READ_COST, EVENTDATACOPY: VERYLOW,],
+        features: [
+            EIP8141,
+            EIP8250,
+            EIP7906,
+        ],
+        ops: [
+            APPROVE: ZERO,
+            TXPARAM: BASE,
+            FRAMEDATALOAD: VERYLOW,
+            FRAMEDATACOPY: VERYLOW,
+            FRAMEPARAM: BASE,
+            SIGPARAM: BASE,
+            SIGDATACOPY: VERYLOW,
+            TXTRACE: WARM_STORAGE_READ_COST,
+            EVENTDATACOPY: VERYLOW,
+        ],
     }
 }
 

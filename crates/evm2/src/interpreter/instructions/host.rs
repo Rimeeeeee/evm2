@@ -143,14 +143,15 @@ fn log_common<T: EvmTypesHost>(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::{
         SpecId,
-        interpreter::{InstrStop, MessageExt, MessageKind, Word, op},
+        interpreter::{MessageExt, MessageKind, Word, op},
         storage_key::StorageKey,
         test_utils::{RunConfig, TestHost, push, run},
     };
     use alloc::vec::Vec;
-    use alloy_primitives::{Address, B256, Bytes};
+    use alloy_primitives::{Address, Bytes};
     use core::assert_matches;
 
     #[test]

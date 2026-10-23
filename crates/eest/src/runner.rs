@@ -3,10 +3,11 @@ use crate::{
     execute::{ExecuteConfig, ExecutionMode, execute_test_suite},
     harness::{TestSuite, descend_all, run_json_harnesses},
 };
-#[cfg(feature = "jit")]
-use crate::{execute::execute_test_suites, execution::CompiledMode, harness::compiled_roots};
 use libtest_mimic::Failed;
 use std::{path::PathBuf, process::ExitCode};
+
+#[cfg(feature = "jit")]
+use crate::{execute::execute_test_suites, execution::CompiledMode, harness::compiled_roots};
 
 /// Runs the cargo-nextest state test harness.
 pub fn run() -> ExitCode {

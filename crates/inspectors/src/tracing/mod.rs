@@ -801,7 +801,7 @@ impl<T: EvmTypes> Inspector<T> for TracingInspector {
             self.start_trace_on_call(
                 0,
                 frame.resolved_target(sender),
-                frame.data.clone(),
+                if self.config.record_inputs { frame.data.clone() } else { Bytes::new() },
                 frame.value,
                 if matches!(frame.mode, FrameMode::Verify | FrameMode::Assert) {
                     CallKind::StaticCall
@@ -828,7 +828,7 @@ impl<T: EvmTypes> Inspector<T> for TracingInspector {
 
     fn frame_transaction_end(&mut self, result: &evm2::TxResult<T>, _host: &mut T::Host<'_>) {
         let outcome = result.frame.as_ref().expect("native frame outcome");
-        let frames = self.frame_transaction.as_ref().unwrap();
+        let frames = self.frame_transaction.take().unwrap();
         for (index, receipt) in outcome.receipts.iter().enumerate() {
             let node = frames.nodes[index].expect("every frame has a trace node");
             let end = frames.nodes[index + 1..]

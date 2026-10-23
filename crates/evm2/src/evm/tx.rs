@@ -398,7 +398,7 @@ pub struct TxResultWithState<T: EvmTypesHost = crate::BaseEvmTypes> {
 
 #[cfg(test)]
 mod tests {
-    use super::TxResultExt;
+    use super::*;
 
     fn result(
         total_gas_spent: u64,

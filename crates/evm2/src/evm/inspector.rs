@@ -170,7 +170,7 @@ impl<'a, T: EvmTypesHost> core::ops::DerefMut for dyn Inspector<T> + 'a {
 
 #[cfg(test)]
 mod tests {
-    use super::Inspector;
+    use super::*;
     use crate::{
         BaseEvmTypes, DatabaseError, Evm, EvmTypesHost, Precompiles, SpecId,
         bytecode::Bytecode,

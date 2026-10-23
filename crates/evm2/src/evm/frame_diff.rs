@@ -1,9 +1,9 @@
-//! Deterministic in-flight Bogota assertion diff and event indexes.
+//! Deterministic in-flight Bogota assertion state diffs.
 
-use super::{State, frame::FrameApprovalState};
+use super::State;
 use crate::ethereum::eip7906::TxTraceParam;
 use alloc::vec::Vec;
-use alloy_primitives::{Address, Log, U256};
+use alloy_primitives::{Address, U256};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct FrameDiff {
@@ -45,52 +45,34 @@ impl FrameDiff {
         diff
     }
 
-    pub(super) fn value(
-        &self,
-        param: U256,
-        index: U256,
-        logs: &[Log],
-        approval: FrameApprovalState,
-    ) -> Option<U256> {
-        let selector = TxTraceParam::try_from(u8::try_from(param).ok()?).ok()?;
-        if selector.requires_zero_index() && !index.is_zero() {
-            return None;
-        }
-        let i = usize::try_from(index).ok()?;
+    pub(super) fn value(&self, selector: TxTraceParam, index: usize) -> Option<U256> {
         Some(match selector {
             TxTraceParam::BalancesChanged => U256::from(self.balances.len()),
             TxTraceParam::SlotsChanged => U256::from(self.slots.len()),
             TxTraceParam::CodesChanged => U256::from(self.codes.len()),
             TxTraceParam::NoncesChanged => U256::from(self.nonces.len()),
             TxTraceParam::BalanceChangeAddress => {
-                U256::from_be_slice(self.balances.get(i)?.0.as_slice())
+                U256::from_be_slice(self.balances.get(index)?.0.as_slice())
             }
-            TxTraceParam::BalanceBefore => self.balances.get(i)?.1,
-            TxTraceParam::BalanceAfter => self.balances.get(i)?.2,
-            TxTraceParam::SlotChangeAddress => U256::from_be_slice(self.slots.get(i)?.0.as_slice()),
-            TxTraceParam::SlotValueBefore => self.slots.get(i)?.2,
-            TxTraceParam::SlotValueAfter => self.slots.get(i)?.3,
-            TxTraceParam::SlotKey => self.slots.get(i)?.1,
-            TxTraceParam::CodeChangeAddress => U256::from_be_slice(self.codes.get(i)?.0.as_slice()),
-            TxTraceParam::CodeHashBefore => self.codes.get(i)?.1,
-            TxTraceParam::CodeHashAfter => self.codes.get(i)?.2,
+            TxTraceParam::BalanceBefore => self.balances.get(index)?.1,
+            TxTraceParam::BalanceAfter => self.balances.get(index)?.2,
+            TxTraceParam::SlotChangeAddress => {
+                U256::from_be_slice(self.slots.get(index)?.0.as_slice())
+            }
+            TxTraceParam::SlotValueBefore => self.slots.get(index)?.2,
+            TxTraceParam::SlotValueAfter => self.slots.get(index)?.3,
+            TxTraceParam::SlotKey => self.slots.get(index)?.1,
+            TxTraceParam::CodeChangeAddress => {
+                U256::from_be_slice(self.codes.get(index)?.0.as_slice())
+            }
+            TxTraceParam::CodeHashBefore => self.codes.get(index)?.1,
+            TxTraceParam::CodeHashAfter => self.codes.get(index)?.2,
             TxTraceParam::NonceChangeAddress => {
-                U256::from_be_slice(self.nonces.get(i)?.0.as_slice())
+                U256::from_be_slice(self.nonces.get(index)?.0.as_slice())
             }
-            TxTraceParam::NonceBefore => U256::from(self.nonces.get(i)?.1),
-            TxTraceParam::NonceAfter => U256::from(self.nonces.get(i)?.2),
-            TxTraceParam::EventsCount => U256::from(logs.len()),
-            TxTraceParam::EventAddress => U256::from_be_slice(logs.get(i)?.address.as_slice()),
-            TxTraceParam::EventTopicCount => U256::from(logs.get(i)?.data.topics().len()),
-            TxTraceParam::EventTopic0
-            | TxTraceParam::EventTopic1
-            | TxTraceParam::EventTopic2
-            | TxTraceParam::EventTopic3 => U256::from_be_bytes(
-                logs.get(i)?.data.topics().get(usize::from(u8::from(selector) - 0x14))?.0,
-            ),
-            TxTraceParam::EventDataLength => U256::from(logs.get(i)?.data.data.len()),
-            TxTraceParam::GasPreCharge => approval.gas_pre_charge,
-            TxTraceParam::GasPayerAddress => U256::from_be_slice(approval.payer?.as_slice()),
+            TxTraceParam::NonceBefore => U256::from(self.nonces.get(index)?.1),
+            TxTraceParam::NonceAfter => U256::from(self.nonces.get(index)?.2),
+            _ => return None,
         })
     }
 }

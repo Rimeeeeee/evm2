@@ -1732,24 +1732,31 @@ impl<'a, T: EvmTypes> Host<T> for Evm<'a, T> {
     fn frame_transaction_active(&self) -> bool {
         self.frame_tx.is_some()
     }
+
     fn frame_tx_param(&self, param: Word, state_left: u64) -> Option<Word> {
         self.frame_tx.as_ref()?.tx_param(param, state_left)
     }
+
     fn frame_data(&self, index: Word) -> Option<Bytes> {
         self.frame_tx.as_ref()?.data(index)
     }
+
     fn frame_param(&self, index: Word, param: Word) -> Option<Word> {
         self.frame_tx.as_ref()?.param(index, param)
     }
+
     fn frame_signature_param(&self, index: Word, param: Word) -> Option<Word> {
         self.frame_tx.as_ref()?.signature_param(index, param)
     }
+
     fn frame_signature_bytes(&self, index: Word) -> Option<Bytes> {
         self.frame_tx.as_ref()?.signature_bytes(index)
     }
+
     fn is_assert_frame(&self) -> bool {
         self.frame_tx.as_ref().is_some_and(|rt| rt.is_assert())
     }
+
     fn approve_frame(
         &mut self,
         address: Address,
@@ -1758,6 +1765,7 @@ impl<'a, T: EvmTypes> Host<T> for Evm<'a, T> {
     ) -> Result<u64, HostError> {
         self.apply_frame_approval(address, scope, state_left)
     }
+
     fn frame_sstore_gas(&mut self, address: Address, key: Word, charge: u64, refill: u64) -> u64 {
         if let Some(rt) = &mut self.frame_tx {
             rt.sstore_gas(address, key, charge, refill)
@@ -1765,9 +1773,11 @@ impl<'a, T: EvmTypes> Host<T> for Evm<'a, T> {
             refill
         }
     }
+
     fn txtrace(&mut self, param: Word, index: Word) -> Option<Word> {
         self.frame_tx.as_mut()?.trace_value(&self.state, param, index)
     }
+
     fn event_data(&self, index: Word) -> Option<Bytes> {
         self.frame_tx.as_ref()?.event_data(&self.state, index)
     }
@@ -2315,7 +2325,6 @@ mod tests {
 
     #[test]
     fn owned_database_error_survives_nested_precompile_calls() {
-        use crate::{DatabaseError, evm::bal::BalError};
         let precompiles = precompiles_with([
             test_precompile(TEST_PRECOMPILE, |evm, _, _| {
                 let mut child = precompile_message(INNER_TEST_PRECOMPILE);

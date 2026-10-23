@@ -1,5 +1,3 @@
-#[cfg(feature = "jit")]
-use crate::compiled::{self, FileSummary};
 use crate::{
     dump,
     error::{TestError, TestErrorKind},
@@ -36,9 +34,12 @@ use evm2::{
     registry::HandlerError,
 };
 use serde_json::json;
+use std::{collections::BTreeMap, path::Path};
+
+#[cfg(feature = "jit")]
+use crate::compiled::{self, FileSummary};
 #[cfg(feature = "jit")]
 use std::path::PathBuf;
-use std::{collections::BTreeMap, path::Path};
 
 pub use crate::execution::ExecutionMode;
 

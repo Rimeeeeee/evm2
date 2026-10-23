@@ -50,6 +50,7 @@ paste.workspace = true
 tracing-subscriber = { workspace = true, features = ["fmt"] }
 
 [build-dependencies]
+# llvm
 evm2-jit-build = { workspace = true, optional = true }
 
 [features]

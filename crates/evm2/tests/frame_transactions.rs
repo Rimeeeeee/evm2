@@ -20,6 +20,7 @@ use evm2::{
     ethereum::{TxEnvelope, eip8141::FrameGas, ethereum_tx_registry},
     evm::{AccountInfo, Bal, BlockAccessIndex, Database, Db, InMemoryDB},
     interpreter::{GasTracker, InstrStop},
+    registry::HandlerError,
     version::GasId,
 };
 use k256::ecdsa::SigningKey;
@@ -843,4 +844,139 @@ fn disabling_base_fee_checks_keeps_zero_budget_simulation_coherent() {
     assert_eq!(U256::from_be_slice(&frame.outputs[1][..32]), U256::ZERO);
     assert_eq!(U256::from_be_slice(&frame.outputs[1][32..]), U256::from(7));
     assert_eq!(evm.state_mut().account(&SENDER).unwrap().balance(), U256::from(1_000_000_000));
+}
+
+#[test]
+fn custom_refund_quotients_keep_prefix_and_full_execution_consistent() {
+    let tx =
+        recovered(payload(vec![frame(FrameMode::Verify, SENDER), frame(FrameMode::Sender, BODY)]));
+    let mut expected_prefix = None;
+    let mut uncapped = None;
+    for quotient in [1, 0, 2, 5] {
+        let mut evm = evm(&[0x5f, 0x5f, 0x55, 0x00], &[]);
+        evm.overlay_db_mut().insert_account_storage(&BODY, &U256::ZERO, &U256::ONE);
+        let mut version = *evm.version();
+        version.gas_params.set(GasId::MaxRefundQuotient, quotient);
+        evm.set_execution_config(
+            ExecutionConfig::for_spec_and_version(SpecId::BOGOTA, version),
+            SpecId::BOGOTA,
+            ethereum_tx_registry(SpecId::BOGOTA),
+            Precompiles::base(SpecId::BOGOTA),
+        );
+        let prefix = evm.validate_frame_prefix(&tx, 1).unwrap();
+        assert_eq!(prefix, *expected_prefix.get_or_insert(prefix));
+        assert_eq!(evm.state_mut().account(&SENDER).unwrap().nonce(), 0);
+        let result = evm.transact(&tx).unwrap().commit();
+        assert!(result.status);
+        let available_refund = u64::from(version.gas_params.get(GasId::SstoreClearingSlotRefund));
+        assert_eq!(
+            result.refunded,
+            available_refund.min(result.total_gas_spent / u64::from(quotient.max(1)))
+        );
+        assert!(result.refunded > 0);
+        if quotient <= 1 {
+            assert_eq!(result, *uncapped.get_or_insert_with(|| result.clone()));
+        }
+        assert_eq!(evm.state_mut().account(&SENDER).unwrap().nonce(), 1);
+        assert_eq!(
+            evm.state_mut().storage(&BODY).unwrap().into_slot(U256::ZERO).unwrap().current(),
+            U256::ZERO
+        );
+    }
+}
+
+#[test]
+fn payment_approval_honors_balance_top_up_independently_of_fee_and_balance_checks() {
+    for fee_charge in [false, true] {
+        for balance_check in [false, true] {
+            for balance_top_up in [false, true] {
+                for initial_balance in [U256::from(7), U256::from(1_000_000_000)] {
+                    let label = format!(
+                        "fee_charge={fee_charge}, balance_check={balance_check}, balance_top_up={balance_top_up}, balance={initial_balance}"
+                    );
+                    // The sender pays for this transaction. Read its balance after APPROVE,
+                    // before settlement, so later refunds cannot hide an unwanted top-up.
+                    let mut evm = evm(&[0x33, 0x31, 0x5f, 0x52, 0x60, 32, 0x5f, 0xf3], &[]);
+                    let sender = evm.overlay_db_mut().cache.accounts.get_mut(&SENDER).unwrap();
+                    sender.as_mut().unwrap().balance = initial_balance;
+                    let mut version = *evm.version();
+                    for (feature, enabled) in [
+                        (EvmFeatures::FEE_CHARGE, fee_charge),
+                        (EvmFeatures::BALANCE_CHECK, balance_check),
+                        (EvmFeatures::BALANCE_TOP_UP, balance_top_up),
+                    ] {
+                        version.features.set(feature, enabled);
+                    }
+                    evm.set_execution_config(
+                        ExecutionConfig::for_spec_and_version(SpecId::BOGOTA, version),
+                        SpecId::BOGOTA,
+                        ethereum_tx_registry(SpecId::BOGOTA),
+                        Precompiles::base(SpecId::BOGOTA),
+                    );
+                    let mut payload = payload(vec![
+                        frame(FrameMode::Verify, SENDER),
+                        frame(FrameMode::Sender, BODY),
+                    ]);
+                    payload.fees.max_fee = U256::from(1_000_000_000);
+                    payload.fees.max_priority_fee_per_gas = U256::ONE;
+                    let escrow =
+                        U256::from(FrameGas::calculate(&payload, &version).unwrap().maximum);
+                    let tx = recovered(payload);
+                    let prefix = evm.validate_frame_prefix(&tx, 1);
+                    assert_eq!(
+                        evm.state_mut().account(&SENDER).unwrap().balance(),
+                        initial_balance
+                    );
+                    assert_eq!(evm.state_mut().account(&SENDER).unwrap().nonce(), 0);
+                    if balance_check && initial_balance < escrow {
+                        assert_eq!(
+                            prefix.unwrap_err(),
+                            HandlerError::InvalidFrameTransaction("VERIFY frame failed"),
+                            "{label}"
+                        );
+                        assert_eq!(
+                            evm.transact(&tx).unwrap_err(),
+                            HandlerError::InvalidFrameTransaction("VERIFY frame failed"),
+                            "{label}"
+                        );
+                        assert_eq!(
+                            evm.state_mut().account(&SENDER).unwrap().balance(),
+                            initial_balance
+                        );
+                        assert_eq!(evm.state_mut().account(&SENDER).unwrap().nonce(), 0);
+                        continue;
+                    }
+                    assert_eq!(prefix.unwrap().max_cost, escrow, "{label}");
+                    let result = evm.transact(&tx).unwrap().commit();
+                    assert!(result.status, "{label}");
+                    let frame = result.frame.as_ref().unwrap();
+                    let expected_balance = if fee_charge {
+                        initial_balance.saturating_sub(escrow)
+                    } else if !balance_check && balance_top_up {
+                        initial_balance.max(escrow)
+                    } else {
+                        initial_balance
+                    };
+                    assert_eq!(U256::from_be_slice(&frame.outputs[1]), expected_balance, "{label}");
+                    assert_eq!(
+                        frame.precharge,
+                        if fee_charge { initial_balance.min(escrow) } else { U256::ZERO },
+                        "{label}"
+                    );
+                    let final_balance = if fee_charge {
+                        expected_balance
+                            + frame.precharge.saturating_sub(U256::from(result.tx_gas_used()))
+                    } else {
+                        expected_balance
+                    };
+                    assert_eq!(
+                        evm.state_mut().account(&SENDER).unwrap().balance(),
+                        final_balance,
+                        "{label}"
+                    );
+                    assert_eq!(evm.state_mut().account(&SENDER).unwrap().nonce(), 1);
+                }
+            }
+        }
+    }
 }

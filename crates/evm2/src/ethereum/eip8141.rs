@@ -271,11 +271,9 @@ fn prepare_payload<T: EvmTypes>(
         .checked_mul(base_fee)
         .and_then(|v| v.checked_add(blob_charge))
         .ok_or(invalid("payment overflow"))?;
-    let budget_left = tx
-        .fees
-        .max_fee
-        .checked_sub(required_max_fee)
-        .ok_or(invalid("max fee below required base-fee budget"))?;
+    let budget_left = tx.fees.max_fee.checked_sub(required_max_fee).ok_or(
+        HandlerError::FrameFeeBudgetTooLow { required: required_max_fee, got: tx.fees.max_fee },
+    )?;
     // The requested tip product can exceed U256 even when the signed budget is valid.
     // Saturating before the minimum preserves the arbitrary-precision result.
     let max_priority_fee =
@@ -573,8 +571,8 @@ fn run<T: EvmTypes>(
     let spent =
         prepared.gas.intrinsic + receipts.iter().map(|r| r.gas_used.execution).sum::<u64>() + state;
     let refund = refunds.into_iter().fold(0i64, i64::saturating_add).max(0) as u64;
-    let refund =
-        refund.min(spent / u64::from(host.version().gas_params.get(GasId::MaxRefundQuotient)));
+    let refund_quotient = u64::from(host.version().gas_params.get(GasId::MaxRefundQuotient)).max(1);
+    let refund = refund.min(spent / refund_quotient);
     let result = TxResultExt {
         status: !failed,
         total_gas_spent: spent,

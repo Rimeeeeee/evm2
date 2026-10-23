@@ -1,8 +1,12 @@
 //! Repeated tracing releases transaction owners and retains only reusable step allocations.
 
 use super::*;
-use alloc::vec;
+use alloc::{
+    sync::{Arc, Weak},
+    vec,
+};
 use alloy_eips::eip8141::FrameLimits;
+use core::ops::Deref;
 use evm2::{
     BaseEvmTypes, Precompiles,
     bytecode::Bytecode,
@@ -86,33 +90,78 @@ fn repeated_frame_and_prefix_resets_bound_the_step_buffer_pool() {
     }
 }
 
+#[derive(Debug)]
+struct OwnedPayload {
+    bytes: Vec<u8>,
+    _alive: Arc<()>,
+}
+
+impl AsRef<[u8]> for OwnedPayload {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+fn tracked_data() -> (Bytes, Weak<()>) {
+    type InnerBytes = <Bytes as Deref>::Target;
+    let alive = Arc::new(());
+    let weak = Arc::downgrade(&alive);
+    let data =
+        Bytes(InnerBytes::from_owner(OwnedPayload { bytes: vec![42; 16_384], _alive: alive }));
+    (data, weak)
+}
+
+#[test]
+fn completed_native_traces_release_unrecorded_frame_payloads_before_reset() {
+    for prefix in [false, true] {
+        let (data, weak) = tracked_data();
+        let tx = transaction(data);
+        let mut evm = evm();
+        evm.set_inspector(TracingInspector::new(TracingInspectorConfig::none()));
+        if prefix {
+            evm.validate_frame_prefix(&tx, 1).unwrap();
+        } else {
+            assert!(evm.call_tx(&tx).unwrap().status);
+        }
+        let inspector = evm.clear_inspector_as::<TracingInspector>().unwrap();
+        drop(tx);
+        assert!(inspector.frame_transaction.is_none());
+        assert!(inspector.traces().nodes().iter().all(|node| node.trace.data.is_empty()));
+        assert!(weak.upgrade().is_none(), "prefix={prefix}");
+    }
+}
+
+#[test]
+fn failed_native_frame_validation_releases_payload_on_reset() {
+    for prefix in [false, true] {
+        let (data, weak) = tracked_data();
+        let tx = transaction(data);
+        let mut evm = evm();
+        evm.database_as_mut::<InMemoryDB>().unwrap().insert_account_info(
+            &SENDER,
+            AccountInfo::default()
+                .with_balance(U256::from(1_000_000_000))
+                .with_code(Bytecode::new_legacy(Bytes::from_static(&[0x5f, 0x5f, 0xfd]))),
+        );
+        evm.set_inspector(TracingInspector::new(TracingInspectorConfig::none()));
+        if prefix {
+            assert!(evm.validate_frame_prefix(&tx, 1).is_err());
+        } else {
+            assert!(evm.call_tx(&tx).is_err());
+        }
+        let mut inspector = evm.clear_inspector_as::<TracingInspector>().unwrap();
+        drop(tx);
+        assert!(inspector.frame_transaction.is_some());
+        assert!(weak.upgrade().is_some());
+        inspector.fuse();
+        assert!(weak.upgrade().is_none(), "prefix={prefix}");
+    }
+}
+
 #[cfg(feature = "js-tracer")]
 mod js {
     use super::*;
     use crate::tracing::js::JsInspector;
-    use alloc::sync::{Arc, Weak};
-    use core::ops::Deref;
-
-    #[derive(Debug)]
-    struct OwnedPayload {
-        bytes: Vec<u8>,
-        _alive: Arc<()>,
-    }
-
-    impl AsRef<[u8]> for OwnedPayload {
-        fn as_ref(&self) -> &[u8] {
-            &self.bytes
-        }
-    }
-
-    fn tracked_data() -> (Bytes, Weak<()>) {
-        type InnerBytes = <Bytes as Deref>::Target;
-        let alive = Arc::new(());
-        let weak = Arc::downgrade(&alive);
-        let data =
-            Bytes(InnerBytes::from_owner(OwnedPayload { bytes: vec![42; 16_384], _alive: alive }));
-        (data, weak)
-    }
 
     #[test]
     fn fused_js_tracers_release_frame_payload_and_callback_owners() {

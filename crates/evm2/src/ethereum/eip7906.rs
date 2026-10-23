@@ -1,16 +1,6 @@
-//! [EIP-7906] transaction assertion constants and selector types.
+//! [EIP-7906] transaction assertion selector types.
 //!
 //! [EIP-7906]: <https://eips.ethereum.org/EIPS/eip-7906>
-
-/// `TXTRACE` opcode byte.
-pub const TXTRACE_OPCODE: u8 = 0xB6;
-/// `EVENTDATACOPY` opcode byte.
-pub const EVENTDATACOPY_OPCODE: u8 = 0xB7;
-
-/// Fixed gas charged by `TXTRACE`.
-pub const TXTRACE_GAS_COST: u64 = 100;
-/// Fixed gas charged by `EVENTDATACOPY`, before memory expansion and copying.
-pub const EVENTDATACOPY_GAS_COST: u64 = 3;
 
 /// A `TXTRACE` selector.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

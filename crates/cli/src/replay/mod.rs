@@ -251,32 +251,32 @@ fn collect_json_files_into(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-const fn replay_state_execution_mode(_command: &Replay) -> StateTestExecutionMode {
-    if _command.revm {
+const fn replay_state_execution_mode(command: &Replay) -> StateTestExecutionMode {
+    if command.revm {
         return StateTestExecutionMode::Revm;
     }
     #[cfg(feature = "jit")]
     {
-        if _command.jit {
+        if command.jit {
             return StateTestExecutionMode::Jit;
         }
-        if _command.aot {
+        if command.aot {
             return StateTestExecutionMode::Aot;
         }
     }
     StateTestExecutionMode::Interpreter
 }
 
-const fn replay_blockchain_execution_mode(_command: &Replay) -> BlockchainTestExecutionMode {
-    if _command.revm {
+const fn replay_blockchain_execution_mode(command: &Replay) -> BlockchainTestExecutionMode {
+    if command.revm {
         return BlockchainTestExecutionMode::Revm;
     }
     #[cfg(feature = "jit")]
     {
-        if _command.jit {
+        if command.jit {
             return BlockchainTestExecutionMode::Jit;
         }
-        if _command.aot {
+        if command.aot {
             return BlockchainTestExecutionMode::Aot;
         }
     }
@@ -473,7 +473,7 @@ fn ggas(gas_used: u128) -> f64 {
 
 #[cfg(test)]
 mod collect_tests {
-    use super::collect_json_files;
+    use super::*;
     use std::{
         fs,
         sync::atomic::{AtomicUsize, Ordering},
@@ -516,9 +516,6 @@ mod collect_tests {
 
     #[test]
     fn file_filter_matches_path_or_file_name() {
-        use super::{NameFilter, file_selected};
-        use std::path::Path;
-
         let path = Path::new("test-fixtures/frontier/create/create_one_byte.json");
 
         // An empty filter selects everything.

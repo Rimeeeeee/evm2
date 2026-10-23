@@ -61,15 +61,19 @@ impl RejectReads {
 
 impl Database for RejectReads {
     type Error = std::io::Error;
+
     fn get_account(&mut self, _: &Address) -> Result<Option<AccountInfo>, Self::Error> {
         self.fail()
     }
+
     fn get_code_by_hash(&mut self, _: &B256) -> Result<Bytecode, Self::Error> {
         self.fail()
     }
+
     fn get_storage(&mut self, _: &Address, _: &U256) -> Result<U256, Self::Error> {
         self.fail()
     }
+
     fn get_block_hash(&mut self, _: &U256) -> Result<B256, Self::Error> {
         self.fail()
     }
@@ -437,7 +441,10 @@ fn resource_fee_and_blob_validation_precedes_database_reads() {
         tx.clone(),
         version,
         priced_block,
-        invalid("max fee below required base-fee budget"),
+        HandlerError::FrameFeeBudgetTooLow {
+            required: U256::from(gas.maximum) * U256::from(10),
+            got: tx.fees.max_fee,
+        },
     ));
     let mut blobs = tx.clone();
     blobs.blob_versioned_hashes = vec![blob_hash(); version.max_blobs_per_tx + 1];
@@ -470,7 +477,10 @@ fn resource_fee_and_blob_validation_precedes_database_reads() {
         blob_fee,
         version,
         blob_block,
-        invalid("max fee below required base-fee budget"),
+        HandlerError::FrameFeeBudgetTooLow {
+            required: U256::from(2 * 131_072),
+            got: U256::from(2 * 131_072 - 1),
+        },
     ));
     let mut overflow = tx;
     overflow.fees.max_fee = U256::MAX;

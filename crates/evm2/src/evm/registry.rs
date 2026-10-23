@@ -139,6 +139,14 @@ pub enum HandlerError {
     /// Invalid Bogota frame transaction.
     #[error("invalid frame transaction: {0}")]
     InvalidFrameTransaction(&'static str),
+    /// Frame transaction fee budget does not cover execution and blob base fees.
+    #[error("frame fee budget too low: required {required}, got {got}")]
+    FrameFeeBudgetTooLow {
+        /// Required base-fee budget for all reserved gas and blobs.
+        required: U256,
+        /// Signed maximum total fee.
+        got: U256,
+    },
 }
 
 impl From<DatabaseError> for HandlerError {

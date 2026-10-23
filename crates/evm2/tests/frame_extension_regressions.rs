@@ -64,12 +64,15 @@ impl PrecompileProvider<CustomTypes> for CustomPrecompiles {
     fn addresses(&self) -> Vec<Address> {
         vec![CUSTOM]
     }
+
     fn precompile_ids(&self) -> Vec<(Address, PrecompileId)> {
         vec![(CUSTOM, PrecompileId::Custom(Cow::Borrowed("frame-extension-test")))]
     }
+
     fn contains(&self, address: &Address) -> bool {
         *address == CUSTOM
     }
+
     fn move_precompiles(
         &mut self,
         moves: &[(Address, Address)],
@@ -79,6 +82,7 @@ impl PrecompileProvider<CustomTypes> for CustomPrecompiles {
             None => Ok(()),
         }
     }
+
     fn execute(
         &mut self,
         evm: &mut Evm<'_, CustomTypes>,
@@ -124,6 +128,7 @@ impl Inspector<CustomTypes> for Observe {
         assert_eq!(interp.host().block().ext, Marker(42));
         interp.host().ext_mut().initialized += 1;
     }
+
     fn call(
         &mut self,
         interp: &mut Interpreter<'_, '_, CustomTypes>,
@@ -143,6 +148,7 @@ impl Inspector<CustomTypes> for Observe {
             }
         })
     }
+
     fn call_end(
         &mut self,
         interp: &mut Interpreter<'_, '_, CustomTypes>,
@@ -159,12 +165,15 @@ impl Inspector<CustomTypes> for Observe {
         result.ext = Marker(88);
         interp.host().ext_mut().ends.push((message.depth, result.stop));
     }
+
     fn log(&mut self, _: &Log, host: &mut Evm<'_, CustomTypes>) {
         host.ext_mut().logs += 1;
     }
+
     fn frame_start(&mut self, index: usize, frame: &Frame, host: &mut Evm<'_, CustomTypes>) {
         host.ext_mut().frames.push((index, frame.mode));
     }
+
     fn frame_transaction_end(
         &mut self,
         result: &evm2::TxResult<CustomTypes>,
