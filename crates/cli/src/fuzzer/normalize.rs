@@ -3,7 +3,7 @@ use alloy_eips::eip8141::FrameReceipt;
 use alloy_primitives::{Address, B256, U256, keccak256, map::HashMap};
 use core::convert::Infallible;
 use evm2::evm::{AccountChangeRef, StateChangeSink, StorageChange, registry::HandlerError};
-use revm_bogota::{
+use revm::{
     context_interface::result::{EVMError, InvalidTransaction},
     database::bal::EvmDatabaseError,
 };
@@ -260,7 +260,7 @@ impl StateChangeSink for CanonicalState {
 }
 
 pub(crate) fn state_from_revm(
-    state: &revm_bogota::state::EvmState,
+    state: &revm::state::EvmState,
     original_accounts: &HashMap<Address, CanonicalAccount>,
 ) -> CanonicalState {
     let mut canonical = CanonicalState::default();

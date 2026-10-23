@@ -2,7 +2,7 @@ use crate::fixture::Suites;
 use criterion::{BatchSize, BenchmarkGroup, black_box, measurement::WallTime};
 use evm2::{SpecId, Version};
 use evm2_cli::evm_bench::BenchCase;
-use revm_bogota::{
+use revm::{
     ExecuteEvm, MainBuilder, MainContext,
     context::{BlockEnv, CfgEnv, Context, TxEnv},
     database::{CacheDB, EmptyDB, InMemoryDB},
@@ -12,7 +12,7 @@ use revm_bogota::{
 use std::{borrow::Cow, sync::Arc};
 
 type BenchDB = CacheDB<Arc<InMemoryDB>>;
-type BenchEvm = revm_bogota::MainnetEvm<revm_bogota::handler::MainnetContext<BenchDB>>;
+type BenchEvm = revm::MainnetEvm<revm::handler::MainnetContext<BenchDB>>;
 
 #[derive(Clone)]
 pub(crate) struct PreparedBench {
@@ -78,15 +78,15 @@ impl Runner {
     fn run(
         &mut self,
     ) -> Result<
-        revm_bogota::context_interface::result::ExecResultAndState<
-            revm_bogota::context_interface::result::ExecutionResult<
-                revm_bogota::context_interface::result::HaltReason,
+        revm::context_interface::result::ExecResultAndState<
+            revm::context_interface::result::ExecutionResult<
+                revm::context_interface::result::HaltReason,
             >,
-            revm_bogota::state::EvmState,
+            revm::state::EvmState,
         >,
-        revm_bogota::context_interface::result::EVMError<
-            <BenchDB as revm_bogota::Database>::Error,
-            revm_bogota::context_interface::result::InvalidTransaction,
+        revm::context_interface::result::EVMError<
+            <BenchDB as revm::Database>::Error,
+            revm::context_interface::result::InvalidTransaction,
         >,
     > {
         self.evm.transact(self.tx.clone())
@@ -134,13 +134,12 @@ fn new_evm(cfg: CfgEnv, block: BlockEnv, db: BenchDB) -> BenchEvm {
 fn database(unit: &TestUnit) -> InMemoryDB {
     let mut db = InMemoryDB::new(EmptyDB::new());
     for (address, account) in &unit.pre {
-        let mut info = revm_bogota::state::AccountInfo {
+        let mut info = revm::state::AccountInfo {
             balance: account.balance,
             nonce: account.nonce,
             code: Some(
-                revm_bogota::state::Bytecode::new_raw_checked(account.code.clone()).unwrap_or_else(
-                    |_| revm_bogota::state::Bytecode::new_legacy(account.code.clone()),
-                ),
+                revm::state::Bytecode::new_raw_checked(account.code.clone())
+                    .unwrap_or_else(|_| revm::state::Bytecode::new_legacy(account.code.clone())),
             ),
             ..Default::default()
         };

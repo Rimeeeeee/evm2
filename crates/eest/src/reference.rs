@@ -16,7 +16,7 @@ use evm2::{
     registry::HandlerError,
     version::Version,
 };
-use revm_bogota::{
+use revm::{
     Context, ExecuteEvm, MainBuilder, MainContext,
     context::{
         TxEnv,
@@ -128,12 +128,12 @@ pub(crate) fn execute(
                 .unwrap_or_default();
             db.insert_account_info(
                 address,
-                revm_bogota::state::AccountInfo::default()
+                revm::state::AccountInfo::default()
                     .with_nonce(info.nonce)
                     .with_balance(info.balance)
                     .with_code(
-                        revm_bogota::bytecode::Bytecode::new_raw_checked(code.clone())
-                            .unwrap_or_else(|_| revm_bogota::bytecode::Bytecode::new_legacy(code)),
+                        revm::bytecode::Bytecode::new_raw_checked(code.clone())
+                            .unwrap_or_else(|_| revm::bytecode::Bytecode::new_legacy(code)),
                     ),
             );
         }

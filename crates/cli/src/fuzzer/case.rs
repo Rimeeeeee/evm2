@@ -23,7 +23,7 @@ use evm2::{
     ethereum::{RecoveredTxEnvelope, TxEnvelope},
     interpreter::op,
 };
-use revm_bogota::{
+use revm::{
     context::{BlockEnv as RevmBlockEnv, TxEnv as RevmTxEnv},
     primitives::TxKind as RevmTxKind,
 };

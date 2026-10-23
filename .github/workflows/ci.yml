@@ -5,9 +5,8 @@ permissions:
 
 on:
   push:
-    branches: [main, bogota-plan]
+    branches: [main]
   pull_request:
-  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -40,8 +39,6 @@ jobs:
           output=$(python3 .github/scripts/matrices.py)
           printf '::debug::test-matrix=%s\n' "$output"
           printf 'test-matrix=%s\n' "$output" >> "$GITHUB_OUTPUT"
-      - name: Fixture extraction regressions
-        run: python3 -m unittest discover -s scripts -p test_extract_bogota_fixtures.py
 
   test:
     name: ${{ matrix.name }}
@@ -217,9 +214,10 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu, macos]
-        mode: [jit, aot]
+        mode: [jit]
         include:
-          - mode: aot
+          - os: ubuntu
+            mode: aot
             subset: ci-aot
             filter: test(statetests::aot)
           - mode: jit
@@ -229,11 +227,9 @@ jobs:
             mode: jit
             subset: all
         exclude:
-          # Branch pushes and manual runs test every OS.
+          # Only pushes to main and manual runs test every OS.
           - os: macos
             mode: ${{ contains(fromJSON('["push", "workflow_dispatch"]'), github.event_name) && 'none' || 'jit' }}
-          - os: macos
-            mode: ${{ contains(fromJSON('["push", "workflow_dispatch"]'), github.event_name) && 'none' || 'aot' }}
     steps:
       - name: Secure runner
         uses: tempoxyz/gh-actions/actions/secure-runner@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
@@ -248,7 +244,7 @@ jobs:
         run: .github/scripts/install_llvm.sh macos
       - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
         with:
-          toolchain: nightly-2026-10-08
+          toolchain: stable
       - uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
         if: runner.os == 'Linux'
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
@@ -273,37 +269,6 @@ jobs:
         run: |
           cargo nextest --profile ci run -p evm2-eest --features jit --test eest \
             --ignore-default-filter --no-fail-fast -E "${{ matrix.filter }}"
-      - name: Bogota EEST corpus
-        shell: bash
-        env:
-          INPUT_MODE: ${{ matrix.mode }}
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import urllib.request
-          from scripts.extract_bogota_fixtures import ARCHIVE_NAME, RELEASE
-          tag = RELEASE.replace("@", "%40")
-          url = f"https://github.com/ethereum/execution-specs/releases/download/{tag}/{ARCHIVE_NAME}"
-          urllib.request.urlretrieve(url, "target/bogota-fixtures.tar.gz")
-          PY
-          python3 scripts/extract_bogota_fixtures.py target/bogota-fixtures.tar.gz test-fixtures/bogota
-          export EVM2_ADDITIONAL_TESTS="$PWD/test-fixtures/bogota"
-          export EVM2_FRAME_EXPECTED_FILES="$(python3 -c 'from scripts.extract_bogota_fixtures import EXPECTED_FILES; print(EXPECTED_FILES)')"
-          export EVM2_FRAME_EXPECTED_UNITS="$(python3 -c 'from scripts.extract_bogota_fixtures import EXPECTED_UNITS; print(EXPECTED_UNITS)')"
-          if [[ "$INPUT_MODE" == jit ]]; then
-            for dispatch in auto tco packed single_return unpacked; do
-              EVM2_DISPATCH_BACKEND="$dispatch" cargo nextest --profile ci run --locked -p evm2-eest --features jit --test eest --ignore-default-filter -E 'test(=additional)'
-            done
-            cargo nextest --profile ci run --locked -p evm2-eest --features jit --test eest --ignore-default-filter -E 'test(=additional::inspected)'
-            cargo nextest --profile ci run --locked -p evm2-eest --features jit --test eest --ignore-default-filter -E 'test(=additional::revm)'
-          fi
-          cargo nextest --profile ci run --locked -p evm2-eest --features jit --test eest --ignore-default-filter -E "test(=additional::$INPUT_MODE)"
-      - name: Frame runtime and LLVM configuration regressions
-        if: ${{ matrix.mode == 'jit' }}
-        run: |
-          cargo test --locked -p evm2-jit-runtime --lib frame_tests -- --test-threads=1
-          cargo test --locked -p evm2-jit-llvm --test llvm_config
-          cargo test --locked -p evm2 --example bal_parallel
 
   no-std:
     name: no_std ${{ matrix.target }}

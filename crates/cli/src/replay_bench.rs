@@ -23,7 +23,7 @@ use evm2_eest::{
     },
     execute_blockchain_tests_suite,
 };
-use revm_bogota::{
+use revm::{
     Context, DatabaseCommit, ExecuteEvm, MainBuilder, MainContext, SystemCallEvm,
     context::{BlockEnv as RevmBlockEnv, CfgEnv, ContextTr, JournalTr, TxEnv},
     context_interface::{Cfg, block::BlobExcessGasAndPrice, either::Either},
@@ -655,8 +655,7 @@ fn authorization_list(raw: &Transaction) -> Option<Vec<SignedAuthorization>> {
 // revm side.
 // ---------------------------------------------------------------------------
 
-type RevmEvm<'a> =
-    revm_bogota::MainnetEvm<revm_bogota::handler::MainnetContext<&'a mut RevmInMemoryDB>>;
+type RevmEvm<'a> = revm::MainnetEvm<revm::handler::MainnetContext<&'a mut RevmInMemoryDB>>;
 
 fn revm_pre_state(case: &BlockchainTestCase) -> RevmInMemoryDB {
     let mut database = CacheDB::new(EmptyDB::new());

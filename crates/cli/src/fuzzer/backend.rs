@@ -13,7 +13,7 @@ use evm2::{
     evm::{AccountInfo as Evm2AccountInfo, InMemoryDB},
     interpreter::InstrStop,
 };
-use revm_bogota::{
+use revm::{
     ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext,
     context::{CfgEnv, Context},
     context_interface::{either::Either, result::ExecutionResult},
@@ -107,8 +107,7 @@ impl EvmBackend for Evm2Backend {
     }
 }
 
-type RevmExecutor =
-    revm_bogota::MainnetEvm<revm_bogota::handler::MainnetContext<RevmState<RevmInMemoryDB>>>;
+type RevmExecutor = revm::MainnetEvm<revm::handler::MainnetContext<RevmState<RevmInMemoryDB>>>;
 
 #[derive(Default)]
 pub(crate) struct RevmBackend {
@@ -133,10 +132,9 @@ impl EvmBackend for RevmBackend {
             .with_db(RevmState::builder().with_database(revm_db(case)).build());
         let evm = if let Some(evm) = &mut self.evm {
             evm.ctx = context;
-            evm.instruction =
-                revm_bogota::handler::instructions::EthInstructions::new_mainnet_with_spec(
-                    revm_spec(case.spec),
-                );
+            evm.instruction = revm::handler::instructions::EthInstructions::new_mainnet_with_spec(
+                revm_spec(case.spec),
+            );
             evm
         } else {
             self.evm.insert(context.build_mainnet())
@@ -224,10 +222,10 @@ fn evm2_db(case: &EvmCase) -> InMemoryDB {
 fn revm_db(case: &EvmCase) -> RevmInMemoryDB {
     let mut db = RevmInMemoryDB::new(RevmEmptyDB::new());
     for account in &case.accounts {
-        let mut info = revm_bogota::state::AccountInfo {
+        let mut info = revm::state::AccountInfo {
             balance: account.balance,
             nonce: account.nonce,
-            code: Some(revm_bogota::state::Bytecode::new_legacy(account.code.clone())),
+            code: Some(revm::state::Bytecode::new_legacy(account.code.clone())),
             ..Default::default()
         };
         db.insert_contract(&mut info);

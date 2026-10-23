@@ -19,7 +19,6 @@ use revm::{
     database::{CacheDB, EmptyDB},
     primitives::hardfork::SpecId as RevmSpec,
 };
-use revm_bogota as revm;
 use std::collections::BTreeMap;
 
 const SENDER: Address = Address::with_last_byte(0xa0);
