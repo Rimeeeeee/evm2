@@ -52,6 +52,8 @@ pub struct PreparedFrameTx {
     pub(super) gas: FrameGas,
     /// Transaction-wide lower bound returned by GASPRICE.
     pub(super) gas_price: U256,
+    /// Base fee used for accounting, including simulation overrides.
+    pub(super) base_fee: U256,
     /// Blob fee charged at the current block's blob base fee.
     pub(super) blob_charge: U256,
     /// Amount escrowed at payment approval, bounded by the signed max_fee.
@@ -263,8 +265,10 @@ fn prepare_payload<T: EvmTypes>(
         .and_then(|v| v.checked_mul(host.block.blob_basefee))
         .ok_or(invalid("payment overflow"))?;
     let max_gas = U256::from(gas.maximum);
+    let base_fee =
+        if host.feature(EvmFeatures::BASE_FEE_CHECK) { host.block.basefee } else { U256::ZERO };
     let required_max_fee = max_gas
-        .checked_mul(host.block.basefee)
+        .checked_mul(base_fee)
         .and_then(|v| v.checked_add(blob_charge))
         .ok_or(invalid("payment overflow"))?;
     let budget_left = tx
@@ -277,7 +281,7 @@ fn prepare_payload<T: EvmTypes>(
     let max_priority_fee =
         tx.fees.max_priority_fee_per_gas.saturating_mul(max_gas).min(budget_left);
     let max_cost = required_max_fee + max_priority_fee;
-    let gas_price = host.block.basefee + max_priority_fee / max_gas;
+    let gas_price = base_fee + max_priority_fee / max_gas;
     let signature_hash = tx.signature_hash();
     validate_signatures(tx, signature_hash, placeholders)?;
     if host.feature(EvmFeatures::NONCE_CHECK)
@@ -302,6 +306,7 @@ fn prepare_payload<T: EvmTypes>(
         signature_hash,
         gas,
         gas_price,
+        base_fee,
         blob_charge,
         max_cost,
         legacy_nonce,
@@ -371,7 +376,7 @@ fn validate_structure(tx: &TxEip8141, placeholders: bool) -> HandlerResult<()> {
     if tx.frames.is_empty() || tx.frames.len() > 64 {
         return Err(invalid("EIP-8141 frame count must be in 1..=64"));
     }
-    if !alloy_eips::eip8141::has_valid_assert_suffix(&tx.frames) {
+    if !alloy_eips::eip8141::has_valid_assertion_suffix(&tx.frames) {
         return Err(invalid("EIP-7906 ASSERT frames must form a trailing suffix"));
     }
     let mut expiry = false;
@@ -380,7 +385,7 @@ fn validate_structure(tx: &TxEip8141, placeholders: bool) -> HandlerResult<()> {
         if frame.has_reserved_flags() {
             return Err(invalid("reserved EIP-8141 frame flag is set"));
         }
-        if frame.is_assert() && (frame.is_atomic_batch() || previous_atomic) {
+        if frame.is_assertion() && (frame.is_atomic_batch() || previous_atomic) {
             return Err(invalid("EIP-7906 atomic batch cannot contain an ASSERT frame"));
         }
         if frame.mode != FrameMode::Sender && !frame.value.is_zero() {
@@ -580,6 +585,7 @@ fn run<T: EvmTypes>(
         frame: Some(FrameTransactionResult {
             payer,
             precharge,
+            gas_price: prepared.gas_price,
             assertion_failure,
             rolled_back,
             stops,
@@ -605,7 +611,7 @@ fn settle_fees<T: EvmTypes>(
     }
     let used = U256::from(result.tx_gas_used());
     let base_fee_paid = used
-        .checked_mul(host.block.basefee)
+        .checked_mul(prepared.base_fee)
         .and_then(|value| value.checked_add(prepared.blob_charge))
         .ok_or(invalid("settlement overflow"))?;
     let available_tip =

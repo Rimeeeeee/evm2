@@ -405,6 +405,7 @@ fn assertion_failure_preserves_payment_prefix_logs_and_the_block_log_offset() {
 #[cfg(feature = "js-tracer")]
 mod js {
     use super::*;
+    use evm2::ethereum::eip8141::FrameGas;
     use evm2_inspectors::tracing::js::JsInspector;
     use serde_json::json;
 
@@ -424,6 +425,45 @@ mod js {
             };
         }
     }"#;
+
+    #[test]
+    fn javascript_gas_price_reports_the_transaction_lower_bound() {
+        let sender = Address::with_last_byte(0xa0);
+        let body = Address::with_last_byte(0xb0);
+        let mut evm = evm(&[
+            (sender, &[0x60, 3, 0x5f, 0x5f, 0xaa]),
+            (body, &[0x3a, 0x5f, 0x52, 0x60, 32, 0x5f, 0xf3]),
+        ]);
+        evm.set_block(BlockEnvExt { basefee: U256::from(3), ..Default::default() });
+        let mut payload = TxEip8141 {
+            chain_id: 1,
+            sender,
+            nonce_keys: Some(vec![]),
+            frames: vec![frame(FrameMode::Verify, sender, 3), frame(FrameMode::Sender, body, 0)],
+            ..Default::default()
+        };
+        let maximum = U256::from(FrameGas::calculate(&payload, evm.version()).unwrap().maximum);
+        payload.fees.max_priority_fee_per_gas = U256::from(11);
+        payload.fees.max_fee = maximum * U256::from(3) + maximum / U256::from(2);
+        let tx = Recovered::new_unchecked(TxEnvelope::Eip8141(payload), Address::ZERO);
+        evm.set_inspector(
+            JsInspector::new(
+                r#"{ fault: function() {}, result: function(ctx) { return ctx.gasPrice; } }"#
+                    .into(),
+                json!(null),
+            )
+            .unwrap(),
+        );
+        let result = evm.transact(&tx).unwrap().detach();
+        let outcome = result.result.frame.as_ref().unwrap();
+        assert!(result.result.status);
+        assert_eq!(outcome.gas_price, U256::from(3));
+        assert_eq!(U256::from_be_slice(&outcome.outputs[1]), U256::from(3));
+        let mut inspector = evm.clear_inspector_as::<JsInspector>().unwrap();
+        let block = *evm.block_env();
+        let actual = inspector.json_result(&result, &tx, &block, evm.database_mut()).unwrap();
+        assert_eq!(actual, json!(3));
+    }
 
     #[test]
     fn javascript_default_verification_without_interpreter_emits_one_enter_and_exit() {

@@ -633,6 +633,7 @@ fn valid_structure_boundaries_reach_database_validation() {
     cases.push(("constrained expiry", tx, version));
     let mut tx = payload();
     tx.blob_versioned_hashes = vec![blob_hash(); version.max_blobs_per_tx];
+    tx.fees.max_fee = U256::MAX;
     cases.push(("maximum blob count", tx, version));
     let mut tx = payload();
     tx.fees.max_fee = U256::MAX;

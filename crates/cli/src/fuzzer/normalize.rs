@@ -172,6 +172,9 @@ impl From<HandlerError> for FuzzError {
             HandlerError::InvalidNonce { .. } => Self::InvalidNonce,
             HandlerError::NonceOverflow => Self::NonceOverflow,
             HandlerError::UnsupportedTransactionType(_) => Self::UnsupportedTransactionType,
+            HandlerError::InvalidFrameTransaction("max fee below required base-fee budget") => {
+                Self::Transaction(InvalidTransaction::GasPriceLessThanBasefee)
+            }
             HandlerError::InvalidFrameTransaction(_) => Self::InvalidFrameTransaction,
             HandlerError::MissingChainId => Self::Transaction(InvalidTransaction::MissingChainId),
             HandlerError::RejectCallerWithCode => {
@@ -387,6 +390,10 @@ mod tests {
             (HandlerError::UnsupportedTransactionType(4), InvalidTransaction::Eip7702NotSupported),
             (HandlerError::EmptyBlobs, InvalidTransaction::EmptyBlobs),
             (
+                HandlerError::InvalidFrameTransaction("max fee below required base-fee budget"),
+                InvalidTransaction::GasPriceLessThanBasefee,
+            ),
+            (
                 HandlerError::TooManyBlobs { have: 10, max: 6 },
                 InvalidTransaction::TooManyBlobs { have: 10, max: 6 },
             ),
@@ -402,6 +409,10 @@ mod tests {
 
     #[test]
     fn unmatched_errors_keep_payloads() {
+        assert_ne!(
+            FuzzError::from(HandlerError::InvalidFrameTransaction("fee budget overflow")),
+            FuzzError::from(EVMError::Transaction(InvalidTransaction::GasPriceLessThanBasefee)),
+        );
         assert_ne!(
             FuzzError::from(HandlerError::WrongTransactionType { expected: 1 }),
             FuzzError::from(HandlerError::WrongTransactionType { expected: 2 }),

@@ -619,6 +619,7 @@ impl<'a> State<'a> {
     }
 
     /// Checks slot warmth without loading its account or recording a BAL access.
+    #[cfg(test)]
     pub(crate) fn is_storage_warm(&self, address: &Address, key: &Word) -> bool {
         self.inner.prewarm_set.is_storage_warm(address, key)
             || self

@@ -570,13 +570,15 @@ fn assertion_cases() -> Vec<Case> {
         case.expected_success = Some(false);
         cases.push(case);
     }
-    for (index, memory, offset, len) in [
-        (U256::ZERO, U256::ZERO, U256::ZERO, 32),
-        (U256::ZERO, U256::ZERO, U256::from(31), 4),
-        (U256::ZERO, U256::from(1), U256::ZERO, 33),
-        (U256::ZERO, U256::MAX, U256::MAX, 0),
-        (U256::from(1), U256::ZERO, U256::ZERO, 32),
-        (U256::MAX, U256::ZERO, U256::ZERO, 0),
+    for (index, memory, offset, len, success) in [
+        (U256::ZERO, U256::ZERO, U256::ZERO, 32, true),
+        (U256::ZERO, U256::ZERO, U256::from(31), 4, false),
+        (U256::ZERO, U256::from(1), U256::ZERO, 33, false),
+        (U256::ZERO, U256::from(1), U256::ZERO, 32, true),
+        (U256::ZERO, U256::MAX, U256::from(32), 0, true),
+        (U256::ZERO, U256::MAX, U256::MAX, 0, false),
+        (U256::from(1), U256::ZERO, U256::ZERO, 32, false),
+        (U256::MAX, U256::ZERO, U256::ZERO, 0, false),
     ] {
         let mut query = Vec::new();
         for operand in [U256::from(len), offset, memory, index] {
@@ -591,7 +593,7 @@ fn assertion_cases() -> Vec<Case> {
             vec![frame(FrameMode::Sender, BODY), frame(FrameMode::Assert, OTHER)],
         );
         case.tx.frames[1].limits.state = 1_000_000;
-        case.expected_success = Some(index.is_zero());
+        case.expected_success = Some(success);
         cases.push(case);
     }
     let mut old_copy = base_case(

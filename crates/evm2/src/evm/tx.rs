@@ -4,7 +4,7 @@ use super::{AccountChanges, BlockStateAccumulator, Evm, PendingState, StateChang
 use crate::{EvmTypesHost, interpreter::InstrStop};
 use alloc::vec::Vec;
 use alloy_eips::eip8141::{FrameReceipt, FrameReceiptPayload};
-use alloy_primitives::{Address, Bytes, Log};
+use alloy_primitives::{Address, Bytes, Log, U256};
 use core::fmt;
 use derive_where::derive_where;
 
@@ -159,7 +159,9 @@ pub struct FrameTransactionResult {
     /// Account that approved payment.
     pub payer: Address,
     /// Amount collected at approval, before final settlement.
-    pub precharge: alloy_primitives::U256,
+    pub precharge: U256,
+    /// Transaction-wide lower bound returned by GASPRICE, before final fee settlement.
+    pub gas_price: U256,
     /// Ordered consensus frame receipts.
     pub receipts: Vec<FrameReceipt>,
     /// Index of the failed assertion, if the execution body was rolled back.

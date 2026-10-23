@@ -1,7 +1,9 @@
 //! EIP-8250 empty-list legacy selection, zero keys, and single-use nonce exhaustion.
 
 use alloy_consensus::{TxEip8141, transaction::Recovered};
-use alloy_eips::eip8141::{Frame, FrameLimits, FrameMode, FrameStatus, NONCE_MANAGER, nonce_slot};
+use alloy_eips::eip8141::{
+    Frame, FrameLimits, FrameMode, FrameStatus, NONCE_MANAGER, nonce_keys_hash, nonce_slot,
+};
 use alloy_primitives::{Address, Bytes, U256};
 use evm2::{
     BaseEvmTypes, Evm, Inspector, Precompiles, SpecId,
@@ -364,7 +366,7 @@ fn repeated_prefix_and_discard_do_not_consume_single_use_keys_before_commit() {
             }
             assert_eq!(legacy_nonce(&mut evm), 5);
         }
-        evm.transact(&tx).unwrap().commit();
+        assert!(evm.transact(&tx).unwrap().commit().status);
         for key in keys {
             assert_eq!(keyed_nonce(&mut evm, key), U256::from(u64::MAX));
         }
@@ -412,5 +414,41 @@ fn zero_and_single_use_keys_reconstruct_the_same_bal_in_positioned_execution() {
         assert_eq!(keyed_nonce(&mut serial, U256::from(2)), U256::from(u64::MAX));
         assert_nonce_mismatch(&mut serial, &approval(vec![U256::ZERO, U256::from(3)], u64::MAX));
         assert_eq!(keyed_nonce(&mut serial, U256::from(3)), U256::ZERO);
+    }
+}
+
+#[test]
+fn nonce_introspection_returns_zero_first_key_for_the_empty_legacy_set() {
+    let mut code = Vec::new();
+    for (index, selector) in [1, 13, 14, 15, 16].into_iter().enumerate() {
+        code.extend_from_slice(&[0x60, selector, 0xb0, 0x60, (index * 32) as u8, 0x52]);
+    }
+    code.extend_from_slice(&[0x60, 160, 0x5f, 0xf3]);
+    for inspected in [false, true] {
+        for keys in [vec![], vec![U256::ZERO], vec![U256::from(7)]] {
+            let mut evm = evm(APPROVE_BOTH, &code, 5, inspected);
+            let sequence = if keys.is_empty() { 5 } else { 0 };
+            let result = evm
+                .transact(&payload(
+                    keys.clone(),
+                    sequence,
+                    vec![frame(FrameMode::Verify, SENDER, 3), frame(FrameMode::Default, BODY, 0)],
+                ))
+                .unwrap()
+                .discard();
+            assert!(result.status, "keys={keys:?}, inspected={inspected}");
+            let output = &result.frame.unwrap().outputs[1];
+            let actual = output.chunks_exact(32).map(U256::from_be_slice).collect::<Vec<_>>();
+            assert_eq!(
+                actual,
+                [
+                    U256::from(sequence),
+                    U256::from(5),
+                    U256::from(keys.len()),
+                    U256::from_be_bytes(nonce_keys_hash(&keys).0),
+                    keys.first().copied().unwrap_or_default(),
+                ]
+            );
+        }
     }
 }

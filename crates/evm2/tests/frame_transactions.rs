@@ -13,7 +13,8 @@ use alloy_eips::{
 };
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256};
 use evm2::{
-    BaseEvmTypes, Evm, FrameTransactionResult, Precompiles, SpecId, TxResultExt, Version,
+    BaseEvmTypes, Evm, EvmFeatures, ExecutionConfig, FrameTransactionResult, Precompiles, SpecId,
+    TxResultExt, Version,
     bytecode::Bytecode,
     env::BlockEnvExt,
     ethereum::{TxEnvelope, eip8141::FrameGas, ethereum_tx_registry},
@@ -817,4 +818,29 @@ fn nonce_intrinsic_charges_zero_keys_and_exempts_only_single_use_sequences() {
     // The ordinary sequence encodes as 0x88 followed by eight nonzero bytes.
     assert_eq!(incrementable.intrinsic - single_use.intrinsic, 9 * intrinsic_byte_cost);
     assert_eq!(incrementable.floor - single_use.floor, 9 * floor_byte_cost);
+}
+
+#[test]
+fn disabling_base_fee_checks_keeps_zero_budget_simulation_coherent() {
+    let mut evm = evm(&[0x3a, 0x5f, 0x52, 0x48, 0x60, 32, 0x52, 0x60, 64, 0x5f, 0xf3], &[]);
+    evm.set_block(BlockEnvExt { basefee: U256::from(7), ..Default::default() });
+    let tx =
+        recovered(payload(vec![frame(FrameMode::Verify, SENDER), frame(FrameMode::Sender, BODY)]));
+    assert!(evm.transact(&tx).is_err());
+    let mut version = *evm.version();
+    version.features.remove(EvmFeatures::BASE_FEE_CHECK);
+    evm.set_execution_config(
+        ExecutionConfig::for_spec_and_version(SpecId::BOGOTA, version),
+        SpecId::BOGOTA,
+        ethereum_tx_registry(SpecId::BOGOTA),
+        Precompiles::base(SpecId::BOGOTA),
+    );
+    let result = evm.transact(&tx).unwrap().commit();
+    assert!(result.status);
+    let frame = result.frame.unwrap();
+    assert_eq!(frame.precharge, U256::ZERO);
+    assert_eq!(frame.outputs[1].len(), 64);
+    assert_eq!(U256::from_be_slice(&frame.outputs[1][..32]), U256::ZERO);
+    assert_eq!(U256::from_be_slice(&frame.outputs[1][32..]), U256::from(7));
+    assert_eq!(evm.state_mut().account(&SENDER).unwrap().balance(), U256::from(1_000_000_000));
 }

@@ -131,7 +131,7 @@ impl FrameTransactionRuntime {
             15 => U256::from_be_bytes(
                 alloy_eips::eip8141::nonce_keys_hash(tx.nonce_keys.as_deref()?).0,
             ),
-            16 => *tx.nonce_keys.as_ref()?.first()?,
+            16 => tx.nonce_keys.as_ref()?.first().copied().unwrap_or_default(),
             _ => return None,
         })
     }

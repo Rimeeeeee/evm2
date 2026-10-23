@@ -401,12 +401,8 @@ impl JsInspector {
             ctx.value = U256::ZERO;
             ctx.gas = frame.gas.maximum;
             ctx.intrinsic_gas = frame.gas.intrinsic;
-            ctx.gas_price = frame
-                .payload
-                .fees
-                .max_fee_per_gas
-                .min(block.basefee.saturating_add(frame.payload.fees.max_priority_fee_per_gas))
-                .saturating_to();
+            ctx.gas_price =
+                result.frame.as_ref().map_or(0, |frame| frame.gas_price.saturating_to());
         }
         let ctx = ctx.into_js_object(&mut self.ctx)?;
         if let Some(frame) = &self.frame_transaction
