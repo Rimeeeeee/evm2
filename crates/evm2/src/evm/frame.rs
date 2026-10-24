@@ -25,18 +25,14 @@ use super::{SendEvmRef, r#async};
 #[cfg(feature = "async")]
 use core::future::Future;
 
-/// EIP-8141 approvals accumulated by successful top-level frames.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct FrameApprovalState {
-    /// Account that approved payment.
     pub(crate) payer: Option<Address>,
     /// Amount actually deducted from the payer at payment approval.
     pub(crate) gas_pre_charge: U256,
-    /// Whether execution as the transaction sender has been approved.
     pub(crate) sender_approved: bool,
 }
 
-/// Per-transaction EIP-8141 interpreter runtime state.
 #[derive(Debug)]
 pub(crate) struct FrameTransactionRuntime {
     pub(crate) payload: Arc<TxEip8141>,
@@ -44,17 +40,11 @@ pub(crate) struct FrameTransactionRuntime {
     pub(crate) max_cost: U256,
     /// Sender account nonce before any transaction frame executes.
     pub(crate) legacy_nonce: u64,
-    /// Index of the currently executing top-level frame.
     pub(crate) current_frame_index: usize,
-    /// Resolved target of the current top-level frame.
     pub(crate) resolved_target: Address,
-    /// Statuses of completed top-level frames.
     pub(crate) statuses: Vec<FrameStatus>,
-    /// Execution-gas usage reported by completed top-level frames.
     pub(crate) execution_gas_used: Vec<u64>,
-    /// State-gas usage reported by completed top-level frames.
     pub(crate) state_gas_used: Vec<u64>,
-    /// Committed approval state.
     pub(crate) approval: FrameApprovalState,
     /// Approval scopes corresponding to active interpreter call frames.
     scopes: Vec<FrameScope>,
@@ -68,19 +58,16 @@ pub(crate) struct FrameTransactionRuntime {
     nonce_keys_hash: Option<B256>,
 }
 
-/// Approval and state-gas checkpoint for one interpreter call.
 #[derive(Clone, Copy, Debug)]
 struct FrameScope {
     approval: FrameApprovalState,
     state_gas_checkpoint: usize,
 }
 
-/// State-gas ownership and rollback bookkeeping, separate from approvals.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct FrameStateGas {
     /// Top-level frame owning each outstanding storage charge.
     owners: HashMap<(Address, U256), usize>,
-    /// Attribution changes retained across top-level frames.
     journal: Vec<FrameStateGasJournalEntry>,
 }
 
@@ -91,7 +78,6 @@ enum FrameStateGasJournalEntry {
 }
 
 impl FrameTransactionRuntime {
-    /// Creates transaction-local state from the validated payload and payment facts.
     pub(crate) fn new(
         payload: Arc<TxEip8141>,
         signature_hash: B256,
@@ -193,7 +179,6 @@ impl FrameTransactionRuntime {
             .is_some_and(|f| f.mode == FrameMode::Assert)
     }
 
-    /// Enters an interpreter call frame approval scope.
     pub(super) fn enter_scope(&mut self) {
         self.scopes.push(FrameScope {
             approval: self.current_approval(),
@@ -220,19 +205,16 @@ impl FrameTransactionRuntime {
         self.scopes.clear();
     }
 
-    /// Commits approvals emitted by a successful top-level frame.
     pub(crate) const fn commit_root_approval(&mut self) {
         if let Some(state) = self.root_approval.take() {
             self.approval = state;
         }
     }
 
-    /// Returns a checkpoint for state-gas ownership and receipt attribution.
     pub(crate) const fn state_gas_checkpoint(&self) -> usize {
         self.state_gas.journal.len()
     }
 
-    /// Reverts state-gas ownership and receipt attribution to `checkpoint`.
     pub(crate) fn revert_state_gas(&mut self, checkpoint: usize) {
         while self.state_gas.journal.len() > checkpoint {
             match self.state_gas.journal.pop().expect("length checked") {
@@ -534,7 +516,6 @@ impl<T: EvmTypes> Evm<'_, T> {
         }
     }
 
-    /// Runs executable-prefix validation with the normal execution mutation guard.
     fn simulate_frames<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         assert!(!self.running, "prefix validation cannot interrupt active execution");
         let runner = self.interpreter_runner.take();
@@ -576,9 +557,7 @@ impl<'a, T: EvmTypes<Tx = TxEnvelope>> Evm<'a, T> {
 
     /// Executes and discards a frame validation prefix on an async host fiber.
     ///
-    /// Async database and inspector operations may suspend while validating the prefix.
-    /// Dropping the future cancels execution and discards approvals, nonce writes, and
-    /// transaction scratch, just like the synchronous prefix API.
+    /// Dropping the future cancels execution and discards all prefix effects.
     #[cfg(feature = "async")]
     pub fn validate_frame_prefix_async<'fut>(
         &'fut mut self,

@@ -67,7 +67,7 @@ pub enum SpecId {
     ///
     /// Activated at block TBD
     AMSTERDAM,
-    /// Bogota devnet 2 frame transactions.
+    /// Bogota
     BOGOTA,
 }
 

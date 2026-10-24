@@ -240,15 +240,15 @@ evm_features! {
     ///
     /// Default: on since Amsterdam
     EIP2780,
-    /// Bogota frame transaction execution and introspection.
+    /// Frame transactions and introspection.
     ///
     /// Default: on since Bogota
     EIP8141,
-    /// Bogota keyed nonce payload and protocol transitions.
+    /// Keyed transaction nonces.
     ///
     /// Default: on since Bogota
     EIP8250,
-    /// Bogota ASSERT assertion instructions.
+    /// Transaction assertion instructions.
     ///
     /// Default: on since Bogota
     EIP7906,

@@ -1,10 +1,12 @@
 //! Native Bogota execution, journal, and settlement regressions.
 
-use alloy_consensus::{TxEip8141, TxLegacy, transaction::Recovered};
+mod common;
+
+use alloy_consensus::{TxLegacy, transaction::Recovered};
 use alloy_eips::{
     eip8141::{
-        Frame, FrameLimits, FrameMode, FrameSignature, FrameStatus, NONCE_MANAGER,
-        SignatureMessage, SignatureScheme, nonce_slot,
+        Frame, FrameMode, FrameSignature, FrameStatus, NONCE_MANAGER, SignatureMessage,
+        SignatureScheme, nonce_slot,
     },
     eip8272::{
         RECENT_ROOT_ADDRESS, RECENT_ROOT_CODE, RECENT_ROOT_CODE_HASH, RECENT_ROOT_ENTRY_DOMAIN,
@@ -12,13 +14,16 @@ use alloy_eips::{
     },
 };
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256};
+use common::{
+    APPROVE_BOTH, BODY, CountingRunner, FailingDatabase, SENDER, frame, payload, recovered,
+};
 use evm2::{
     BaseEvmTypes, Evm, EvmFeatures, ExecutionConfig, FrameTransactionResult, Precompiles, SpecId,
     TxResultExt, Version,
     bytecode::Bytecode,
     env::BlockEnvExt,
     ethereum::{TxEnvelope, eip8141::FrameGas, ethereum_tx_registry},
-    evm::{AccountInfo, Bal, BalError, BlockAccessIndex, Database, Db, InMemoryDB},
+    evm::{AccountInfo, Bal, BalError, BlockAccessIndex, Db, InMemoryDB},
     interpreter::{GasTracker, InstrStop},
     registry::HandlerError,
     version::GasId,
@@ -29,55 +34,12 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-const SENDER: Address = Address::with_last_byte(0xa0);
-const BODY: Address = Address::with_last_byte(0xb0);
 const ASSERTION: Address = Address::with_last_byte(0xc0);
 
-fn frame(mode: FrameMode, target: Address) -> Frame {
-    Frame {
-        mode,
-        flags: if mode == FrameMode::Verify { 3 } else { 0 },
-        target: target.into(),
-        limits: FrameLimits { execution: 100_000, state: 300_000 },
-        ..Default::default()
-    }
-}
-
-fn payload(frames: Vec<Frame>) -> TxEip8141 {
-    TxEip8141 {
-        chain_id: 1,
-        sender: SENDER,
-        nonce_keys: Some(vec![]),
-        frames,
-        ..Default::default()
-    }
-}
-
-const fn recovered(tx: TxEip8141) -> Recovered<TxEnvelope> {
-    // An outer recovered sender is deliberately unrelated to the explicit payload sender.
-    Recovered::new_unchecked(TxEnvelope::Eip8141(tx), Address::ZERO)
-}
-
 fn evm(body: &[u8], assertion: &[u8]) -> Evm<'static, BaseEvmTypes> {
-    let mut db = InMemoryDB::default();
+    let mut db = common::database([(SENDER, APPROVE_BOTH), (BODY, body), (ASSERTION, assertion)]);
     db.insert_account_info(&NONCE_MANAGER, AccountInfo::default().with_nonce(1));
-    for (address, code) in
-        [(SENDER, &[0x60, 3, 0x5f, 0x5f, 0xaa][..]), (BODY, body), (ASSERTION, assertion)]
-    {
-        db.insert_account_info(
-            &address,
-            AccountInfo::default()
-                .with_balance(U256::from(1_000_000_000))
-                .with_code(Bytecode::new_legacy(Bytes::copy_from_slice(code))),
-        );
-    }
-    Evm::new(
-        SpecId::BOGOTA,
-        BlockEnvExt::default(),
-        ethereum_tx_registry(SpecId::BOGOTA),
-        db,
-        Precompiles::base(SpecId::BOGOTA),
-    )
+    common::evm(db)
 }
 
 #[test]
@@ -501,20 +463,6 @@ fn preparation_uses_the_active_execution_cap() {
     assert!(evm.transact(&tx).unwrap().discard().status);
 }
 
-#[derive(Debug)]
-struct CountingRunner(Arc<AtomicUsize>);
-
-impl evm2::InterpreterRunner<BaseEvmTypes> for CountingRunner {
-    fn run<'frame, 'host>(
-        &self,
-        _: &mut evm2::interpreter::Interpreter<'frame, 'host, BaseEvmTypes>,
-        _: &mut Evm<'host, BaseEvmTypes>,
-    ) -> Option<InstrStop> {
-        self.0.fetch_add(1, Ordering::Relaxed);
-        None
-    }
-}
-
 #[test]
 fn prefix_forces_interpreted_observation_and_restores_the_full_execution_runner() {
     let mut evm = evm(&[], &[]);
@@ -559,40 +507,11 @@ fn prefix_unwind_discards_approved_nonce_and_restores_runner() {
     assert_eq!(calls.load(Ordering::Relaxed), 1);
 }
 
-struct FailingDatabase(Arc<AtomicUsize>);
-
-impl FailingDatabase {
-    fn fail<T>(&self) -> Result<T, std::io::Error> {
-        self.0.fetch_add(1, Ordering::Relaxed);
-        Err(std::io::Error::other("frame database failure"))
-    }
-}
-
-impl Database for FailingDatabase {
-    type Error = std::io::Error;
-
-    fn get_account(&mut self, _: &Address) -> Result<Option<AccountInfo>, Self::Error> {
-        self.fail()
-    }
-
-    fn get_code_by_hash(&mut self, _: &B256) -> Result<Bytecode, Self::Error> {
-        self.fail()
-    }
-
-    fn get_storage(&mut self, _: &Address, _: &U256) -> Result<U256, Self::Error> {
-        self.fail()
-    }
-
-    fn get_block_hash(&mut self, _: &U256) -> Result<B256, Self::Error> {
-        self.fail()
-    }
-}
-
 #[test]
 fn unused_malformed_signature_precedes_database_reads_and_fatal_errors_survive() {
     let mut evm = evm(&[], &[]);
     let reads = Arc::new(AtomicUsize::new(0));
-    evm.set_database(Db::new(FailingDatabase(reads.clone())));
+    evm.set_database(Db::new(FailingDatabase(reads.clone(), "frame database failure")));
     let mut malformed = payload(vec![frame(FrameMode::Verify, SENDER)]);
     malformed.signatures.push(FrameSignature {
         scheme: SignatureScheme::Secp256k1,

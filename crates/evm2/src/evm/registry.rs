@@ -136,7 +136,7 @@ pub enum HandlerError {
     /// Priority fee is greater than max fee.
     #[error("priority fee greater than max fee")]
     PriorityFeeGreaterThanMaxFee,
-    /// Invalid Bogota frame transaction.
+    /// Invalid frame transaction.
     #[error("invalid frame transaction: {0}")]
     InvalidFrameTransaction(&'static str),
     /// Frame transaction fee budget does not cover execution and blob base fees.

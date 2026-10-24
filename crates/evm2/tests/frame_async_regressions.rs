@@ -2,21 +2,21 @@
 
 #![cfg(feature = "async")]
 
+mod common;
+
 use alloy_consensus::{TxEip8141, transaction::Recovered};
-use alloy_eips::eip8141::{
-    Frame, FrameLimits, FrameMode, FrameReceipt, NONCE_MANAGER, TransactionFees, nonce_slot,
-};
+use alloy_eips::eip8141::{FrameMode, FrameReceipt, NONCE_MANAGER, TransactionFees, nonce_slot};
 use alloy_primitives::{Address, B256, Bytes, U256};
+use common::{APPROVE_BOTH, CountingRunner, SENDER};
 use evm2::{
-    BaseEvmTypes, DatabaseError, Evm, Inspector, InterpreterRunner, Precompiles, SpecId,
+    BaseEvmTypes, DatabaseError, Evm, Inspector, Precompiles,
     bytecode::Bytecode,
-    env::BlockEnvExt,
-    ethereum::{TxEnvelope, ethereum_tx_registry},
+    ethereum::TxEnvelope,
     evm::{
         AccountInfo, DynDatabase, InMemoryDB,
         r#async::{AsyncDatabase, AsyncDb},
     },
-    interpreter::{InstrStop, Interpreter},
+    interpreter::InstrStop,
 };
 use std::{
     future::{Future, pending},
@@ -28,52 +28,27 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
-const SENDER: Address = Address::with_last_byte(0xa0);
 const SUSPEND: Address = Address::with_last_byte(0xfe);
 
 fn database() -> InMemoryDB {
-    let mut database = InMemoryDB::default();
+    let mut database = common::database([(SENDER, APPROVE_BOTH)]);
     database.insert_account_info(&NONCE_MANAGER, AccountInfo::default().with_nonce(1));
-    database.insert_account_info(
-        &SENDER,
-        AccountInfo::default()
-            .with_balance(U256::from(1_000_000_000))
-            .with_code(Bytecode::new_legacy(Bytes::from_static(&[0x60, 3, 0x5f, 0x5f, 0xaa]))),
-    );
     database
 }
 
 fn evm() -> Evm<'static, BaseEvmTypes> {
-    Evm::new(
-        SpecId::BOGOTA,
-        BlockEnvExt::default(),
-        ethereum_tx_registry(SpecId::BOGOTA),
-        database(),
-        Precompiles::base(SpecId::BOGOTA),
-    )
+    common::evm(database())
 }
 
 fn transaction(keyed: bool) -> Recovered<TxEnvelope> {
-    Recovered::new_unchecked(
-        TxEnvelope::Eip8141(TxEip8141 {
-            chain_id: 1,
-            sender: SENDER,
-            fees: TransactionFees {
-                max_fee: U256::from(1_000_000),
-                max_priority_fee_per_gas: U256::ONE,
-            },
-            nonce_keys: Some(if keyed { vec![U256::from(1)] } else { vec![] }),
-            frames: vec![Frame {
-                mode: FrameMode::Verify,
-                flags: 3,
-                target: SENDER.into(),
-                limits: FrameLimits { execution: 100_000, state: 300_000 },
-                ..Default::default()
-            }],
-            ..Default::default()
-        }),
-        Address::ZERO,
-    )
+    common::recovered(TxEip8141 {
+        fees: TransactionFees {
+            max_fee: U256::from(1_000_000),
+            max_priority_fee_per_gas: U256::ONE,
+        },
+        nonce_keys: Some(if keyed { vec![U256::from(1)] } else { vec![] }),
+        ..common::payload(vec![common::frame(FrameMode::Verify, SENDER)])
+    })
 }
 
 fn ready<F: Future>(future: F) -> F::Output {
@@ -122,20 +97,6 @@ fn send_prefix_future_requires_and_preserves_verified_host_fields() {
     assert_eq!(validation.payer, SENDER);
     assert_eq!(validation.prefix_end, 1);
     assert!(evm.transact(&transaction).unwrap().discard().status);
-}
-
-#[derive(Debug)]
-struct CountingRunner(Arc<AtomicUsize>);
-
-impl InterpreterRunner<BaseEvmTypes> for CountingRunner {
-    fn run<'frame, 'host>(
-        &self,
-        _: &mut Interpreter<'frame, 'host, BaseEvmTypes>,
-        _: &mut Evm<'host, BaseEvmTypes>,
-    ) -> Option<InstrStop> {
-        self.0.fetch_add(1, Ordering::Relaxed);
-        None
-    }
 }
 
 struct SuspendAfterApproval(Arc<AtomicUsize>);

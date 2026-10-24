@@ -73,7 +73,6 @@ struct PendingStep {
     active: bool,
 }
 
-/// Envelope metadata and lifecycle state for the synthetic transaction root.
 #[derive(Debug)]
 struct FrameTransactionContext {
     payload: TxEip8141,

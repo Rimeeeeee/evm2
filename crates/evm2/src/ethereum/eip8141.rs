@@ -1,4 +1,4 @@
-//! Bogota frame transaction preparation and ordered execution.
+//! Frame transaction preparation and execution.
 
 use super::{validate_block_gas_limit, validate_chain_id};
 use crate::{
@@ -24,7 +24,7 @@ use alloy_eips::{
 };
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 
-/// Schedule-aware static reservation; state and execution are independent.
+/// Gas reservations for a frame transaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameGas {
     /// Intrinsic execution cost, including all signature verification.
@@ -41,14 +41,11 @@ pub struct FrameGas {
     pub signatures: u64,
 }
 
-/// Prepared native frame transaction. Preparation runs no application calls.
+/// Prepared frame transaction.
 #[derive(Clone, Debug)]
 pub struct PreparedFrameTx {
-    /// Canonical immutable payload with its explicit sender.
     pub(super) payload: Arc<TxEip8141>,
-    /// Canonical Bogota signing hash.
     pub(super) signature_hash: B256,
-    /// Active-schedule gas and reservation metadata.
     pub(super) gas: FrameGas,
     /// Transaction-wide lower bound returned by GASPRICE.
     pub(super) gas_price: U256,
@@ -62,7 +59,7 @@ pub struct PreparedFrameTx {
     pub(super) legacy_nonce: u64,
 }
 
-/// Read-only executable-prefix result consumed by node admission policy.
+/// Result of frame prefix validation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameValidationResult {
     /// Account that successfully approved payment.
@@ -94,7 +91,7 @@ const fn invalid(reason: &'static str) -> HandlerError {
 }
 
 impl FrameGas {
-    /// Computes reservations from the original full-width payload and active schedule.
+    /// Computes gas reservations using the active schedule.
     pub fn calculate(tx: &TxEip8141, version: &Version) -> HandlerResult<Self> {
         let gp = &version.gas_params;
         let nonce_data =

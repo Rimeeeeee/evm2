@@ -1,16 +1,14 @@
 //! Transaction-owner release and safe interpreter reuse after errors and unwinding.
 
-use alloy_consensus::{TxEip8141, TxLegacy, transaction::Recovered};
-use alloy_eips::eip8141::{Frame, FrameLimits, FrameMode};
+mod common;
+
+use alloy_consensus::{TxLegacy, transaction::Recovered};
+use alloy_eips::eip8141::{Frame, FrameMode};
 use alloy_primitives::{Address, Bytes, TxKind, U256};
+use common::{APPROVE_BOTH, BODY, SENDER};
 use core::ops::Deref;
 use evm2::{
-    BaseEvmTypes, Evm, Inspector, Precompiles, SpecId,
-    bytecode::Bytecode,
-    env::BlockEnvExt,
-    ethereum::{TxEnvelope, ethereum_tx_registry},
-    evm::{AccountInfo, InMemoryDB},
-    interpreter::Interpreter,
+    BaseEvmTypes, Evm, Inspector, ethereum::TxEnvelope, evm::AccountInfo, interpreter::Interpreter,
 };
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
@@ -19,9 +17,6 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
 };
-
-const SENDER: Address = Address::with_last_byte(0xa0);
-const BODY: Address = Address::with_last_byte(0xb0);
 
 #[derive(Debug)]
 struct OwnedPayload {
@@ -45,51 +40,21 @@ fn tracked_data() -> (Bytes, Weak<()>) {
 }
 
 fn transaction(data: Bytes, allow_approval: bool) -> Recovered<TxEnvelope> {
-    Recovered::new_unchecked(
-        TxEnvelope::Eip8141(TxEip8141 {
-            chain_id: 1,
-            sender: SENDER,
-            nonce_keys: Some(vec![]),
-            frames: [
-                (FrameMode::Verify, SENDER, if allow_approval { 3 } else { 0 }, Bytes::new()),
-                (FrameMode::Sender, BODY, 0, data),
-            ]
-            .into_iter()
-            .map(|(mode, target, flags, data)| Frame {
-                mode,
-                target: target.into(),
-                flags,
-                data,
-                limits: FrameLimits { execution: 100_000, state: 300_000 },
-                ..Default::default()
-            })
-            .collect(),
-            ..Default::default()
-        }),
-        Address::ZERO,
-    )
+    let frames = [
+        (FrameMode::Verify, SENDER, if allow_approval { 3 } else { 0 }, Bytes::new()),
+        (FrameMode::Sender, BODY, 0, data),
+    ]
+    .into_iter()
+    .map(|(mode, target, flags, data)| Frame { flags, data, ..common::frame(mode, target) })
+    .collect();
+    common::recovered(common::payload(frames))
 }
 
 fn evm() -> Evm<'static, BaseEvmTypes> {
-    let mut db = InMemoryDB::default();
-    for (address, code) in [
-        (SENDER, &[0x60, 3, 0x5f, 0x5f, 0xaa][..]),
-        (BODY, &[0x60, 42, 0x5f, 0x55, 0x5f, 0x5f, 0xa0, 0x00][..]),
-    ] {
-        db.insert_account_info(
-            &address,
-            AccountInfo::default()
-                .with_balance(U256::from(1_000_000_000))
-                .with_code(Bytecode::new_legacy(Bytes::copy_from_slice(code))),
-        );
-    }
-    Evm::new(
-        SpecId::BOGOTA,
-        BlockEnvExt::default(),
-        ethereum_tx_registry(SpecId::BOGOTA),
-        db,
-        Precompiles::base(SpecId::BOGOTA),
-    )
+    common::evm(common::database([
+        (SENDER, APPROVE_BOTH),
+        (BODY, &[0x60, 42, 0x5f, 0x55, 0x5f, 0x5f, 0xa0, 0x00]),
+    ]))
 }
 
 #[test]

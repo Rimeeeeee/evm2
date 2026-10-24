@@ -1,4 +1,4 @@
-//! Runtime operations for compiled Bogota frame instructions.
+//! Runtime operations for compiled frame instructions.
 
 use super::*;
 

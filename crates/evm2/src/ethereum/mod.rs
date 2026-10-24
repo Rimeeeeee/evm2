@@ -51,7 +51,7 @@ pub enum TxEnvelope {
     Eip4844(TxEip4844Variant),
     /// EIP-7702 set-code transaction.
     Eip7702(LazyTxEip7702),
-    /// Bogota frame transaction, with its explicit consensus sender.
+    /// Frame transaction with an explicit sender.
     Eip8141(TxEip8141),
 }
 

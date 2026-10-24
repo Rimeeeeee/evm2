@@ -1,14 +1,17 @@
 //! Frame execution through custom EVM families, precompiles, and inspector overrides.
 
-use alloy_consensus::{TxEip8141, TxLegacy, transaction::Recovered};
-use alloy_eips::eip8141::{ENTRY_POINT, Frame, FrameLimits, FrameMode, FrameStatus, NONCE_MANAGER};
+mod common;
+
+use alloy_consensus::{TxLegacy, transaction::Recovered};
+use alloy_eips::eip8141::{ENTRY_POINT, Frame, FrameMode, FrameStatus, NONCE_MANAGER};
 use alloy_primitives::{Address, Bytes, Log, TxKind, U256};
+use common::{APPROVE_BOTH, BODY, SENDER};
 use evm2::{
     BaseEvmConfigSelector, Evm, EvmTypesHost, Inspector, PrecompileError, PrecompileHalt, SpecId,
     bytecode::Bytecode,
     env::BlockEnvExt,
     ethereum::{TxEnvelope, ethereum_tx_registry},
-    evm::{AccountInfo, InMemoryDB},
+    evm::AccountInfo,
     interpreter::{
         GasTracker, Host, InstrStop, Interpreter, Message, MessageKind, MessageResult,
         MessageResultExt,
@@ -19,8 +22,6 @@ use evm2::{
 };
 use std::borrow::Cow;
 
-const SENDER: Address = Address::with_last_byte(0xa0);
-const BODY: Address = Address::with_last_byte(0xb0);
 const CUSTOM: Address = Address::with_last_byte(0xf0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,41 +187,16 @@ impl Inspector<CustomTypes> for Observe {
 }
 
 fn frame(mode: FrameMode, target: Address, selector: u8) -> Frame {
-    Frame {
-        mode,
-        target: target.into(),
-        flags: if mode == FrameMode::Verify { 3 } else { 0 },
-        limits: FrameLimits { execution: 100_000, state: 300_000 },
-        data: Bytes::copy_from_slice(&[selector]),
-        ..Default::default()
-    }
+    Frame { data: Bytes::copy_from_slice(&[selector]), ..common::frame(mode, target) }
 }
 
 fn tx(frames: Vec<Frame>) -> Recovered<TxEnvelope> {
-    Recovered::new_unchecked(
-        TxEnvelope::Eip8141(TxEip8141 {
-            chain_id: 1,
-            sender: SENDER,
-            nonce_keys: Some(vec![]),
-            frames,
-            ..Default::default()
-        }),
-        Address::ZERO,
-    )
+    common::recovered(common::payload(frames))
 }
 
 fn evm(body: &[u8], inspector: Observe) -> Evm<'static, CustomTypes> {
-    let mut db = InMemoryDB::default();
+    let mut db = common::database([(SENDER, APPROVE_BOTH), (BODY, body), (CUSTOM, &[])]);
     db.insert_account_info(&NONCE_MANAGER, AccountInfo::default().with_nonce(1));
-    for (address, code) in [(SENDER, &[0x60, 3, 0x5f, 0x5f, 0xaa][..]), (BODY, body), (CUSTOM, &[])]
-    {
-        db.insert_account_info(
-            &address,
-            AccountInfo::default()
-                .with_balance(U256::from(1_000_000_000))
-                .with_code(Bytecode::new_legacy(Bytes::copy_from_slice(code))),
-        );
-    }
     let mut evm = Evm::new_with_ext(
         SpecId::BOGOTA,
         BlockEnvExt::<()>::default().with_ext(Marker(42)),

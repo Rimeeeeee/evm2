@@ -1,26 +1,25 @@
 //! EIP-8250 empty-list legacy selection, zero keys, and single-use nonce exhaustion.
 
+mod common;
+
 use alloy_consensus::{TxEip8141, transaction::Recovered};
 use alloy_eips::eip8141::{
     Frame, FrameLimits, FrameMode, FrameStatus, NONCE_MANAGER, nonce_keys_hash, nonce_slot,
 };
 use alloy_primitives::{Address, Bytes, U256};
+use common::{APPROVE_BOTH, BODY, SENDER};
 use evm2::{
-    BaseEvmTypes, Evm, Inspector, Precompiles, SpecId,
+    BaseEvmTypes, Evm, Inspector,
     bytecode::Bytecode,
-    env::BlockEnvExt,
-    ethereum::{TxEnvelope, ethereum_tx_registry},
-    evm::{AccountInfo, Bal, BlockAccessIndex, InMemoryDB},
+    ethereum::TxEnvelope,
+    evm::{AccountInfo, Bal, BlockAccessIndex},
     interpreter::InstrStop,
     registry::HandlerError,
     version::GasId,
 };
 use std::sync::Arc;
 
-const SENDER: Address = Address::with_last_byte(0xa0);
-const BODY: Address = Address::with_last_byte(0xb0);
 const FAILURE: Address = Address::with_last_byte(0xc0);
-const APPROVE_BOTH: &[u8] = &[0x60, 3, 0x5f, 0x5f, 0xaa];
 const WRITE_BODY: &[u8] = &[0x60, 42, 0x5f, 0x55, 0x00];
 
 struct Observe;
@@ -29,26 +28,18 @@ impl Inspector<BaseEvmTypes> for Observe {}
 
 fn frame(mode: FrameMode, target: Address, flags: u8) -> Frame {
     Frame {
-        mode,
-        target: target.into(),
         flags,
         limits: FrameLimits { execution: 150_000, state: 300_000 },
-        ..Default::default()
+        ..common::frame(mode, target)
     }
 }
 
 fn payload(keys: Vec<U256>, sequence: u64, frames: Vec<Frame>) -> Recovered<TxEnvelope> {
-    Recovered::new_unchecked(
-        TxEnvelope::Eip8141(TxEip8141 {
-            chain_id: 1,
-            sender: SENDER,
-            nonce: sequence,
-            nonce_keys: Some(keys),
-            frames,
-            ..Default::default()
-        }),
-        Address::ZERO,
-    )
+    common::recovered(TxEip8141 {
+        nonce: sequence,
+        nonce_keys: Some(keys),
+        ..common::payload(frames)
+    })
 }
 
 fn approval(keys: Vec<U256>, sequence: u64) -> Recovered<TxEnvelope> {
@@ -61,29 +52,15 @@ fn evm(
     legacy_nonce: u64,
     inspected: bool,
 ) -> Evm<'static, BaseEvmTypes> {
-    let mut db = InMemoryDB::default();
+    let mut db = common::database([(BODY, body), (FAILURE, &[0x5f, 0x5f, 0xfd])]);
+    db.insert_account_info(&SENDER, common::account(sender).with_nonce(legacy_nonce));
     db.insert_account_info(
         &NONCE_MANAGER,
         AccountInfo::default()
             .with_nonce(1)
             .with_code(Bytecode::new_legacy(Bytes::from_static(&[0x60, 0, 0x60, 0, 0xfd]))),
     );
-    for (address, code) in [(SENDER, sender), (BODY, body), (FAILURE, &[0x5f, 0x5f, 0xfd][..])] {
-        db.insert_account_info(
-            &address,
-            AccountInfo::default()
-                .with_nonce(if address == SENDER { legacy_nonce } else { 0 })
-                .with_balance(U256::from(1_000_000_000))
-                .with_code(Bytecode::new_legacy(Bytes::copy_from_slice(code))),
-        );
-    }
-    let mut evm = Evm::new(
-        SpecId::BOGOTA,
-        BlockEnvExt::default(),
-        ethereum_tx_registry(SpecId::BOGOTA),
-        db,
-        Precompiles::base(SpecId::BOGOTA),
-    );
+    let mut evm = common::evm(db);
     if inspected {
         evm.set_inspector(Observe);
     }
@@ -270,15 +247,7 @@ fn single_use_first_use_budget_is_checked_before_writing_any_key() {
 
 // Nonempty input delegates APPROVE to BODY, then fails. Empty input approves directly.
 fn reverting_nested_approval(exit: &[u8]) -> Vec<u8> {
-    let mut code = vec![0x5f, 0x35, 0x15, 0x60, 0, 0x57];
-    code.extend_from_slice(&[0x5f, 0x5f, 0x5f, 0x5f, 0x73]);
-    code.extend_from_slice(BODY.as_slice());
-    code.extend_from_slice(&[0x5a, 0xf4, 0x50]);
-    code.extend_from_slice(exit);
-    code[4] = code.len().try_into().unwrap();
-    code.push(0x5b);
-    code.extend_from_slice(APPROVE_BOTH);
-    code
+    common::delegating_sender(BODY, exit)
 }
 
 #[test]

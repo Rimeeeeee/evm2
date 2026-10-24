@@ -142,9 +142,12 @@ pub struct CallTrace {
 }
 
 impl CallTrace {
-    /// Returns true if the status code is an error or revert, See [InstrStop::Revert].
+    /// Returns whether execution or the protocol frame failed.
     #[inline]
     pub const fn is_error(&self) -> bool {
+        if self.skipped || (self.frame_transaction_root && !self.success) {
+            return true;
+        }
         let Some(status) = self.status else {
             return false;
         };
@@ -175,6 +178,9 @@ impl CallTrace {
 
     /// Returns the error message if it is an erroneous result.
     pub(crate) fn as_error_msg(&self, kind: TraceStyle) -> Option<String> {
+        if self.frame_transaction_root && !self.success {
+            return Some("frame transaction failed".to_string());
+        }
         if self.skipped {
             return Some("frame skipped".to_string());
         }
@@ -343,7 +349,10 @@ impl CallTraceNode {
     /// Converts this node into a parity `TransactionTrace`
     pub fn parity_transaction_trace(&self, trace_address: Vec<usize>) -> TransactionTrace {
         let action = self.parity_action();
-        let result = if self.trace.is_error() && !self.trace.is_revert() {
+        let result = if self.trace.is_error()
+            && !self.trace.is_revert()
+            && !self.trace.frame_transaction_root
+        {
             // if the trace is a selfdestruct or an error that is not a revert, the result is None
             None
         } else {

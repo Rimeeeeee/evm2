@@ -46,7 +46,7 @@ pub struct TxResultExt<E = ()> {
     /// [`EvmFeatures::LOG_COLLECTION`](crate::EvmFeatures::LOG_COLLECTION) is disabled. Frame
     /// results always retain the canonical consensus events.
     pub logs: Vec<Log>,
-    /// Canonical ordered frame outcomes for a Bogota transaction.
+    /// Ordered frame outcomes.
     pub frame: Option<FrameTransactionResult>,
     /// EVM type-specific extension data.
     pub ext: E,

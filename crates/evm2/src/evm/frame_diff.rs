@@ -1,4 +1,4 @@
-//! Deterministic in-flight Bogota assertion state diffs.
+//! Assertion-frame state diffs.
 
 use super::State;
 use alloc::vec::Vec;

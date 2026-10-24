@@ -1,31 +1,24 @@
 //! Deterministic sequence coverage against a small independent rollback model.
 
+mod common;
+
 use alloy_consensus::{TxEip8141, transaction::Recovered};
-use alloy_eips::eip8141::{Frame, FrameLimits, FrameMode, FrameStatus, NONCE_MANAGER, nonce_slot};
+use alloy_eips::eip8141::{Frame, FrameMode, FrameStatus, NONCE_MANAGER, nonce_slot};
 use alloy_primitives::{Address, Bytes, U256};
+use common::{APPROVE_BOTH, BODY, SENDER};
 use evm2::{
-    BaseEvmTypes, Evm, Inspector, Precompiles, SpecId,
-    bytecode::Bytecode,
-    env::BlockEnvExt,
-    ethereum::{TxEnvelope, eip8141::FrameGas, ethereum_tx_registry},
-    evm::{AccountInfo, InMemoryDB, PendingState},
+    BaseEvmTypes, Evm, Inspector,
+    ethereum::{TxEnvelope, eip8141::FrameGas},
+    evm::{AccountInfo, PendingState},
     interpreter::{InstrStop, Interpreter, Message, MessageResult},
 };
 use std::sync::{Arc, Mutex};
 
-const SENDER: Address = Address::with_last_byte(0xa0);
-const BODY: Address = Address::with_last_byte(0xb0);
 const HALT: Address = Address::with_last_byte(0xb1);
 const ASSERTION: Address = Address::with_last_byte(0xc0);
 
 fn frame(mode: FrameMode, target: Address, flags: u8) -> Frame {
-    Frame {
-        mode,
-        target: target.into(),
-        flags,
-        limits: FrameLimits { execution: 100_000, state: 300_000 },
-        ..Default::default()
-    }
+    Frame { flags, ..common::frame(mode, target) }
 }
 
 fn evm(assertion_fails: bool) -> Evm<'static, BaseEvmTypes> {
@@ -35,28 +28,14 @@ fn evm(assertion_fails: bool) -> Evm<'static, BaseEvmTypes> {
         0x5f, 0x35, 0x5f, 0x55, 0x5f, 0x5f, 0xa0, 0x60, 0x20, 0x35, 0x15, 0x60, 0x11, 0x57, 0x5f,
         0x5f, 0xfd, 0x5b, 0x00,
     ];
-    let mut db = InMemoryDB::default();
-    db.insert_account_info(&NONCE_MANAGER, AccountInfo::default().with_nonce(1));
-    for (address, code) in [
-        (SENDER, &[0x60, 3, 0x5f, 0x5f, 0xaa][..]),
+    let mut db = common::database([
+        (SENDER, APPROVE_BOTH),
         (BODY, &body),
         (HALT, &[0xfe]),
         (ASSERTION, if assertion_fails { &[0x5f, 0x5f, 0xfd][..] } else { &[0x00] }),
-    ] {
-        db.insert_account_info(
-            &address,
-            AccountInfo::default()
-                .with_balance(U256::from(1_000_000_000))
-                .with_code(Bytecode::new_legacy(Bytes::copy_from_slice(code))),
-        );
-    }
-    Evm::new(
-        SpecId::BOGOTA,
-        BlockEnvExt::default(),
-        ethereum_tx_registry(SpecId::BOGOTA),
-        db,
-        Precompiles::base(SpecId::BOGOTA),
-    )
+    ]);
+    db.insert_account_info(&NONCE_MANAGER, AccountInfo::default().with_nonce(1));
+    common::evm(db)
 }
 
 fn stored(state: &PendingState, address: Address, key: U256) -> U256 {

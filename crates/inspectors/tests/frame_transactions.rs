@@ -250,16 +250,43 @@ fn native_atomic_failure_keeps_receipt_gas_and_skips_only_its_group() {
         assert_eq!(trace.rolled_back, outcome.rolled_back[index]);
     }
     assert!(result.status);
+    assert!(!nodes[0].trace.success);
+    assert!(nodes[0].trace.is_error());
     assert!(nodes[nodes[0].children[1]].logs.is_empty());
     assert!(nodes[nodes[0].children[3]].trace.skipped);
     assert_eq!(nodes[nodes[0].children[4]].logs.len(), 1);
-    let calls = inspector.geth_builder().geth_call_traces(
+    let calls = inspector.geth_builder().geth_call_traces_with_result_gas(
         CallConfig { with_log: Some(true), ..Default::default() },
-        result.tx_gas_used(),
+        &result,
     );
+    assert_eq!(calls.error.as_deref(), Some("frame transaction failed"));
+    assert_eq!(calls.gas_used, U256::from(result.tx_gas_used()));
+    assert_eq!(calls.execution_gas_used, Some(U256::from(result.execution_gas_spent())));
+    assert_eq!(calls.state_gas_used, Some(U256::from(result.state_gas_spent())));
     assert_eq!(calls.calls[3].gas_used, U256::ZERO);
     assert_eq!(calls.calls[4].logs.len(), 1);
     assert_eq!(calls.calls[4].logs[0].index, Some(0));
+    let final_frame_gas = &outcome.receipts[4].gas_used;
+    assert!(final_frame_gas.state > 0);
+    assert_eq!(calls.calls[4].gas, U256::from(100_000));
+    assert_eq!(calls.calls[4].gas_used, U256::from(final_frame_gas.execution));
+    assert_eq!(calls.calls[4].execution_gas_used, Some(U256::from(final_frame_gas.execution)));
+    assert_eq!(calls.calls[4].state_gas_used, Some(U256::from(final_frame_gas.state)));
+    let parity = inspector.into_parity_builder();
+    let traces = parity.clone().into_transaction_traces();
+    assert_eq!(
+        traces.iter().map(|trace| trace.trace_address.clone()).collect::<Vec<_>>(),
+        vec![vec![], vec![0], vec![1], vec![2], vec![3], vec![4]]
+    );
+    assert_eq!(traces[0].error.as_deref(), Some("frame transaction failed"));
+    assert_eq!(traces[0].result.as_ref().unwrap().gas_used(), result.tx_gas_used());
+    assert_eq!(traces[4].error.as_deref(), Some("frame skipped"));
+    assert!(traces[4].result.is_none());
+    assert_eq!(traces[5].action.as_call().unwrap().gas, 100_000);
+    assert_eq!(traces[5].result.as_ref().unwrap().gas_used(), final_frame_gas.execution);
+    let vm = parity.vm_trace();
+    assert!(vm.code.is_empty());
+    assert_eq!(vm.ops.iter().map(|op| op.pc).collect::<Vec<_>>(), vec![0, 1, 2, 4]);
 }
 
 #[test]
@@ -737,5 +764,91 @@ fn many_frame_vm_traces_keep_nested_calls_and_excluded_precompiles_in_each_subtr
         assert!(children[1].code.is_empty());
         assert!(children[1].ops.is_empty(), "excluded precompile in frame {index}");
         assert_eq!(children[2].ops.len(), 3, "last child in frame {index}");
+    }
+}
+
+#[test]
+fn pre_evm_frame_failures_keep_receipt_gas_and_later_frame_traces() {
+    let sender = Address::with_last_byte(0xa0);
+    let failed = Address::with_last_byte(0xb0);
+    let later = Address::with_last_byte(0xc0);
+    for (execution, value, geth_error, parity_error) in [
+        (1, U256::ZERO, "out of gas", "Out of gas"),
+        (
+            100_000,
+            U256::from(2_000_000_000u64),
+            "insufficient balance for transfer",
+            "Insufficient balance for transfer",
+        ),
+    ] {
+        let mut evm = evm(&[
+            (sender, &[0x60, 3, 0x5f, 0x5f, 0xaa]),
+            (failed, &[0x00]),
+            (later, &[0x60, 42, 0x5f, 0x53, 0x60, 1, 0x5f, 0xf3]),
+        ]);
+        evm.set_inspector(TracingInspector::new(TracingInspectorConfig::all()));
+        let mut failed_frame = frame(FrameMode::Sender, failed, 0);
+        failed_frame.limits.execution = execution;
+        failed_frame.value = value;
+        let result = evm
+            .transact(&transaction(vec![
+                frame(FrameMode::Verify, sender, 3),
+                failed_frame,
+                frame(FrameMode::Sender, later, 0),
+            ]))
+            .unwrap()
+            .discard();
+        let outcome = result.frame.as_ref().unwrap();
+        assert!(result.status);
+        assert_eq!(outcome.receipts[1].status, FrameStatus::Failure);
+        assert_eq!(outcome.receipts[2].status, FrameStatus::Success);
+        let inspector = evm.clear_inspector_as::<TracingInspector>().unwrap();
+        let nodes = inspector.traces().nodes();
+        assert!(!nodes[0].trace.success);
+        assert!(nodes[0].trace.is_error());
+        assert!(!nodes[nodes[0].children[1]].trace.entered_evm);
+        let steps = inspector.geth_builder().geth_traces(
+            result.tx_gas_used(),
+            Bytes::new(),
+            GethDefaultTracingOptions::default(),
+        );
+        assert!(steps.failed);
+        for only_top_call in [false, true] {
+            let calls = inspector.geth_builder().geth_call_traces(
+                CallConfig { only_top_call: Some(only_top_call), ..Default::default() },
+                result.tx_gas_used(),
+            );
+            assert_eq!(calls.from, sender);
+            assert_eq!(calls.to, Some(ENTRY_POINT));
+            assert_eq!(calls.error.as_deref(), Some("frame transaction failed"));
+            assert_eq!(calls.gas_used, U256::from(result.tx_gas_used()));
+            assert!(calls.output.is_none());
+            assert_eq!(calls.calls.len(), 3);
+            let call = &calls.calls[1];
+            assert_eq!(call.to, Some(failed));
+            assert_eq!(call.error.as_deref(), Some(geth_error));
+            assert_eq!(call.gas, U256::from(execution));
+            assert_eq!(call.gas_used, U256::from(outcome.receipts[1].gas_used.execution));
+            assert!(call.calls.is_empty());
+            assert!(call.output.is_none());
+            assert_eq!(calls.calls[2].output, Some(Bytes::from_static(&[42])));
+        }
+        let parity = inspector.into_parity_builder();
+        let traces = parity.clone().into_transaction_traces();
+        assert_eq!(traces.len(), 4);
+        assert_eq!(traces[0].error.as_deref(), Some("frame transaction failed"));
+        assert_eq!(traces[0].result.as_ref().unwrap().gas_used(), result.tx_gas_used());
+        assert_eq!(traces[2].trace_address, vec![1]);
+        assert_eq!(traces[2].error.as_deref(), Some(parity_error));
+        assert!(traces[2].result.is_none());
+        assert_eq!(traces[2].subtraces, 0);
+        assert_eq!(traces[3].trace_address, vec![2]);
+        let vm = parity.vm_trace();
+        assert!(vm.code.is_empty());
+        assert_eq!(vm.ops.iter().map(|op| op.pc).collect::<Vec<_>>(), vec![0, 2]);
+        assert_eq!(
+            vm.ops[1].sub.as_ref().unwrap().code.as_ref(),
+            &[0x60, 42, 0x5f, 0x53, 0x60, 1, 0x5f, 0xf3]
+        );
     }
 }

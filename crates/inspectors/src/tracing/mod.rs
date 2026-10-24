@@ -876,7 +876,8 @@ impl<T: EvmTypes> Inspector<T> for TracingInspector {
         let root = &mut self.traces.arena[0].trace;
         root.gas_used = result.tx_gas_used();
         root.state_gas_used = result.state_gas_spent;
-        root.success = result.status;
+        root.success =
+            outcome.receipts.iter().all(|receipt| receipt.status == FrameStatus::Success);
         root.status = Some(result.stop);
     }
 

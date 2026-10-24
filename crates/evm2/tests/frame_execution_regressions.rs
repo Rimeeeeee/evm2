@@ -1,24 +1,23 @@
 //! Native frame execution matrices for receipts, accounting and transaction-local assertions.
 
-use alloy_consensus::{TxEip8141, transaction::Recovered};
+mod common;
+
+use alloy_consensus::TxEip8141;
 use alloy_eips::eip8141::{
-    Frame, FrameLimits, FrameMode, FrameReceipt, FrameStatus, NONCE_MANAGER, nonce_calldata,
-    nonce_slot,
+    Frame, FrameMode, FrameReceipt, FrameStatus, NONCE_MANAGER, nonce_calldata, nonce_slot,
 };
 use alloy_primitives::{Address, B256, Bytes, Log, U256};
+use common::{APPROVE_BOTH, BODY, SENDER, frame};
 use evm2::{
     BaseEvmTypes, Evm, Precompiles, SpecId, Version,
-    bytecode::Bytecode,
     constants::EIP7708_TRANSFER_TOPIC,
     env::BlockEnvExt,
-    ethereum::{TxEnvelope, eip8141::FrameGas, ethereum_tx_registry},
-    evm::{AccountInfo, InMemoryDB, SYSTEM_ADDRESS},
+    ethereum::{eip8141::FrameGas, ethereum_tx_registry},
+    evm::{AccountInfo, SYSTEM_ADDRESS},
     version::GasId,
 };
 use std::collections::BTreeMap;
 
-const SENDER: Address = Address::with_last_byte(0xa0);
-const BODY: Address = Address::with_last_byte(0xb0);
 const OTHER: Address = Address::with_last_byte(0xc0);
 
 #[derive(Clone)]
@@ -58,31 +57,15 @@ struct Outcome {
     accounts: BTreeMap<Address, Account>,
 }
 
-fn frame(mode: FrameMode, target: Address) -> Frame {
-    Frame {
-        mode,
-        flags: if mode == FrameMode::Verify { 3 } else { 0 },
-        target: target.into(),
-        limits: FrameLimits { execution: 100_000, state: 300_000 },
-        ..Default::default()
-    }
-}
-
 fn base_case(name: &str, body: &[u8], other: &[u8], suffix: Vec<Frame>) -> Case {
     let mut frames = vec![frame(FrameMode::Verify, SENDER)];
     frames.extend(suffix);
     Case {
         name: name.into(),
-        tx: TxEip8141 {
-            chain_id: 1,
-            sender: SENDER,
-            nonce_keys: Some(vec![]),
-            frames,
-            ..Default::default()
-        },
+        tx: common::payload(frames),
         body: Bytes::copy_from_slice(body),
         other: Bytes::copy_from_slice(other),
-        sender_code: Bytes::from_static(&[0x60, 3, 0x5f, 0x5f, 0xaa]),
+        sender_code: Bytes::from_static(APPROVE_BOTH),
         storage: Vec::new(),
         basefee: 0,
         expected_valid: true,
@@ -119,16 +102,12 @@ fn prestate(case: &Case) -> BTreeMap<Address, Account> {
 }
 
 fn native(case: &Case) -> Result<Outcome, String> {
-    let mut db = InMemoryDB::default();
+    let mut db = common::database([
+        (SENDER, case.sender_code.as_ref()),
+        (BODY, case.body.as_ref()),
+        (OTHER, case.other.as_ref()),
+    ]);
     db.insert_account_info(&NONCE_MANAGER, AccountInfo::default().with_nonce(1));
-    for (address, code) in initial(case) {
-        db.insert_account_info(
-            &address,
-            AccountInfo::default()
-                .with_balance(U256::from(1_000_000_000))
-                .with_code(Bytecode::new_legacy(code)),
-        );
-    }
     for &(address, key, value) in &case.storage {
         db.insert_account_storage(&address, &key, &value);
     }
@@ -139,7 +118,7 @@ fn native(case: &Case) -> Result<Outcome, String> {
         db,
         Precompiles::base(SpecId::BOGOTA),
     );
-    let tx = Recovered::new_unchecked(TxEnvelope::Eip8141(case.tx.clone()), Address::ZERO);
+    let tx = common::recovered(case.tx.clone());
     let executed = evm.transact(&tx).map_err(|error| format!("{error:?}"))?;
     let mut accounts = prestate(case);
     for change in executed.account_changes() {

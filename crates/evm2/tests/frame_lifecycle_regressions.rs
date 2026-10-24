@@ -1,63 +1,38 @@
-//! Approval, keyed-nonce and cross-frame gas rollback regressions for pinned Bogota.
+//! Approval, keyed-nonce and cross-frame gas rollback regressions.
 
-use alloy_consensus::{TxEip8141, transaction::Recovered};
+mod common;
+
+use alloy_consensus::TxEip8141;
 use alloy_eips::eip8141::{
     Frame, FrameLimits, FrameMode, FrameSignature, FrameStatus, NONCE_MANAGER, SignatureMessage,
     SignatureScheme, nonce_slot,
 };
-use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_primitives::{Address, B256, U256};
+use common::{APPROVE_BOTH, BODY, SENDER, recovered};
 use evm2::{
-    BaseEvmTypes, Evm, EvmFeatures, ExecutionConfig, Precompiles, SpecId,
-    bytecode::Bytecode,
-    env::BlockEnvExt,
-    ethereum::{TxEnvelope, ethereum_tx_registry},
-    evm::{AccountInfo, InMemoryDB},
-    interpreter::InstrStop,
-    registry::HandlerError,
-    version::GasId,
+    BaseEvmTypes, Evm, EvmFeatures, ExecutionConfig, Precompiles, SpecId, bytecode::Bytecode,
+    ethereum::ethereum_tx_registry, evm::AccountInfo, interpreter::InstrStop,
+    registry::HandlerError, version::GasId,
 };
 
-const SENDER: Address = Address::with_last_byte(0xa0);
-const BODY: Address = Address::with_last_byte(0xb0);
 const FAILURE: Address = Address::with_last_byte(0xc0);
-const APPROVE_BOTH: &[u8] = &[0x60, 3, 0x5f, 0x5f, 0xaa];
 
 fn frame(mode: FrameMode, target: Address, flags: u8) -> Frame {
     Frame {
-        mode,
         flags,
-        target: target.into(),
         limits: FrameLimits { execution: 150_000, state: 300_000 },
-        ..Default::default()
+        ..common::frame(mode, target)
     }
 }
 
 fn payload(frames: Vec<Frame>, keys: Vec<U256>) -> TxEip8141 {
-    TxEip8141 { chain_id: 1, sender: SENDER, nonce_keys: Some(keys), frames, ..Default::default() }
-}
-
-const fn recovered(tx: TxEip8141) -> Recovered<TxEnvelope> {
-    Recovered::new_unchecked(TxEnvelope::Eip8141(tx), Address::ZERO)
+    TxEip8141 { nonce_keys: Some(keys), ..common::payload(frames) }
 }
 
 fn evm(sender: &[u8], body: &[u8]) -> Evm<'static, BaseEvmTypes> {
-    let mut db = InMemoryDB::default();
+    let mut db = common::database([(SENDER, sender), (BODY, body), (FAILURE, &[0x5f, 0x5f, 0xfd])]);
     db.insert_account_info(&NONCE_MANAGER, AccountInfo::default().with_nonce(1));
-    for (address, code) in [(SENDER, sender), (BODY, body), (FAILURE, &[0x5f, 0x5f, 0xfd][..])] {
-        db.insert_account_info(
-            &address,
-            AccountInfo::default()
-                .with_balance(U256::from(1_000_000_000))
-                .with_code(Bytecode::new_legacy(Bytes::copy_from_slice(code))),
-        );
-    }
-    Evm::new(
-        SpecId::BOGOTA,
-        BlockEnvExt::default(),
-        ethereum_tx_registry(SpecId::BOGOTA),
-        db,
-        Precompiles::base(SpecId::BOGOTA),
-    )
+    common::evm(db)
 }
 
 fn nonce(evm: &mut Evm<'_, BaseEvmTypes>, key: U256) -> U256 {
@@ -140,15 +115,7 @@ fn nonzero_arbitrary_message_and_unsigned_simulation_placeholders_remain_valid()
 // A nonempty input delegates approval to BODY, then exits with the requested stop. Empty input
 // approves directly, allowing a later frame to retry after an earlier parent failure.
 fn delegating_sender(parent_exit: &[u8]) -> Vec<u8> {
-    let mut code = vec![0x5f, 0x35, 0x15, 0x60, 0, 0x57];
-    code.extend_from_slice(&[0x5f, 0x5f, 0x5f, 0x5f, 0x73]);
-    code.extend_from_slice(BODY.as_slice());
-    code.extend_from_slice(&[0x5a, 0xf4, 0x50]);
-    code.extend_from_slice(parent_exit);
-    code[4] = code.len().try_into().unwrap();
-    code.push(0x5b);
-    code.extend_from_slice(APPROVE_BOTH);
-    code
+    common::delegating_sender(BODY, parent_exit)
 }
 
 #[test]

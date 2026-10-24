@@ -75,7 +75,6 @@ pub(crate) fn bench(c: &mut Criterion) {
     }
     cases.extend([signed(), atomic(false), atomic(true), nested_log(), first_use(), frame_limit()]);
     cases.extend([payment_trace(0), payment_trace(64), tracing_workload()]);
-    // Bogota's frame support must not change the ordinary transaction result.
     for slots in 0..=1 {
         let mut before = cases[2 + slots].evm();
         let mut after = cases[4 + slots].evm();
@@ -517,7 +516,6 @@ fn payment_trace(slots: u8) -> Case {
             0x5f, 0x60, 0x1a, 0xb6, 0x50, // TXTRACE payer address.
         ]);
     }
-    // Return the final payer read rather than discarding it.
     code.pop();
     code.extend_from_slice(&[0x5f, 0x52, 0x60, 32, 0x5f, 0xf3]);
     case.db.insert_account_info(

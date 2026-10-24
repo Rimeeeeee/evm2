@@ -1,6 +1,8 @@
 //! Bogota assertion selectors, transaction-local views, and ordinary recent-root execution.
 
-use alloy_consensus::{TxEip8141, TxLegacy, transaction::Recovered};
+mod common;
+
+use alloy_consensus::{TxLegacy, transaction::Recovered};
 use alloy_eips::{
     eip8141::{Frame, FrameLimits, FrameMode, FrameStatus, NONCE_MANAGER},
     eip8272::{
@@ -8,17 +10,16 @@ use alloy_eips::{
     },
 };
 use alloy_primitives::{Address, Bytes, KECCAK256_EMPTY, TxKind, U256, keccak256};
+use common::{APPROVE_BOTH, BODY, SENDER, payload, recovered};
 use evm2::{
-    BaseEvmTypes, Evm, Precompiles, SpecId,
+    BaseEvmTypes, Evm,
     bytecode::Bytecode,
     env::BlockEnvExt,
-    ethereum::{TxEnvelope, eip8141::FrameGas, ethereum_tx_registry},
-    evm::{AccountInfo, InMemoryDB},
+    ethereum::{TxEnvelope, eip8141::FrameGas},
+    evm::AccountInfo,
     interpreter::InstrStop,
 };
 
-const SENDER: Address = Address::with_last_byte(0xa0);
-const BODY: Address = Address::with_last_byte(0xb0);
 const OTHER: Address = Address::with_last_byte(0xb1);
 const ASSERTION: Address = Address::with_last_byte(0xc0);
 const RECEIVER: Address = Address::with_last_byte(0xd0);
@@ -27,53 +28,22 @@ const BALANCE: u64 = 1_000_000_000;
 
 fn frame(mode: FrameMode, target: Address) -> Frame {
     Frame {
-        mode,
-        target: target.into(),
-        flags: if mode == FrameMode::Verify { 3 } else { 0 },
         limits: FrameLimits { execution: 200_000, state: 400_000 },
-        ..Default::default()
+        ..common::frame(mode, target)
     }
-}
-
-fn payload(frames: Vec<Frame>) -> TxEip8141 {
-    TxEip8141 {
-        chain_id: 1,
-        sender: SENDER,
-        nonce_keys: Some(vec![]),
-        frames,
-        ..Default::default()
-    }
-}
-
-const fn recovered(tx: TxEip8141) -> Recovered<TxEnvelope> {
-    Recovered::new_unchecked(TxEnvelope::Eip8141(tx), Address::ZERO)
 }
 
 fn evm(body: &[u8], other: &[u8], assertion: &[u8]) -> Evm<'static, BaseEvmTypes> {
-    let mut db = InMemoryDB::default();
-    db.insert_account_info(&NONCE_MANAGER, AccountInfo::default().with_nonce(1));
-    for (address, code) in [
-        (SENDER, &[0x60, 3, 0x5f, 0x5f, 0xaa][..]),
+    let mut db = common::database([
+        (SENDER, APPROVE_BOTH),
         (BODY, body),
         (OTHER, other),
         (ASSERTION, assertion),
-    ] {
-        db.insert_account_info(
-            &address,
-            AccountInfo::default()
-                .with_balance(U256::from(BALANCE))
-                .with_code(Bytecode::new_legacy(Bytes::copy_from_slice(code))),
-        );
-    }
+    ]);
+    db.insert_account_info(&NONCE_MANAGER, AccountInfo::default().with_nonce(1));
     db.insert_account_info(&RECEIVER, AccountInfo::default().with_balance(U256::from(100)));
     db.insert_account_info(&WRITER, AccountInfo::default().with_balance(U256::from(BALANCE)));
-    Evm::new(
-        SpecId::BOGOTA,
-        BlockEnvExt::default(),
-        ethereum_tx_registry(SpecId::BOGOTA),
-        db,
-        Precompiles::base(SpecId::BOGOTA),
-    )
+    common::evm(db)
 }
 
 fn word(address: Address) -> U256 {

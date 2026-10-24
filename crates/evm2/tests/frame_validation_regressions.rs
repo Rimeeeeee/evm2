@@ -1,17 +1,19 @@
 //! Static frame validation and first-error ordering before untrusted database access.
 
-use alloy_consensus::{TxEip8141, transaction::Recovered};
+mod common;
+
+use alloy_consensus::TxEip8141;
 use alloy_eips::eip8141::{
     EXPIRY_DATA_LENGTH, EXPIRY_VERIFIER, Frame, FrameLimits, FrameMode, FrameSignature, SECP256K1N,
     SECP256R1N, SignatureMessage, SignatureScheme, validate_nonce_keys,
 };
 use alloy_primitives::{Address, B256, U256};
+use common::{BODY, FailingDatabase, SENDER, recovered};
 use evm2::{
     BaseEvmTypes, Evm, EvmFeatures, ExecutionConfig, Precompiles, SpecId, Version,
-    bytecode::Bytecode,
     env::BlockEnvExt,
-    ethereum::{TxEnvelope, eip8141::FrameGas, ethereum_tx_registry},
-    evm::{AccountInfo, Database, Db},
+    ethereum::{eip8141::FrameGas, ethereum_tx_registry},
+    evm::Db,
     registry::HandlerError,
 };
 use k256::ecdsa::SigningKey;
@@ -23,60 +25,12 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-const SENDER: Address = Address::with_last_byte(0xa0);
-const BODY: Address = Address::with_last_byte(0xb0);
-
 fn frame(mode: FrameMode, target: Address, flags: u8) -> Frame {
-    Frame {
-        mode,
-        target: target.into(),
-        flags,
-        limits: FrameLimits { execution: 100_000, state: 300_000 },
-        ..Default::default()
-    }
+    Frame { flags, ..common::frame(mode, target) }
 }
 
 fn payload() -> TxEip8141 {
-    TxEip8141 {
-        chain_id: 1,
-        sender: SENDER,
-        nonce_keys: Some(vec![]),
-        frames: vec![frame(FrameMode::Verify, SENDER, 3), frame(FrameMode::Sender, BODY, 0)],
-        ..Default::default()
-    }
-}
-
-const fn recovered(tx: TxEip8141) -> Recovered<TxEnvelope> {
-    Recovered::new_unchecked(TxEnvelope::Eip8141(tx), Address::ZERO)
-}
-
-struct RejectReads(Arc<AtomicUsize>);
-
-impl RejectReads {
-    fn fail<T>(&self) -> Result<T, std::io::Error> {
-        self.0.fetch_add(1, Ordering::Relaxed);
-        Err(std::io::Error::other("validation performed a database read"))
-    }
-}
-
-impl Database for RejectReads {
-    type Error = std::io::Error;
-
-    fn get_account(&mut self, _: &Address) -> Result<Option<AccountInfo>, Self::Error> {
-        self.fail()
-    }
-
-    fn get_code_by_hash(&mut self, _: &B256) -> Result<Bytecode, Self::Error> {
-        self.fail()
-    }
-
-    fn get_storage(&mut self, _: &Address, _: &U256) -> Result<U256, Self::Error> {
-        self.fail()
-    }
-
-    fn get_block_hash(&mut self, _: &U256) -> Result<B256, Self::Error> {
-        self.fail()
-    }
+    common::payload(vec![frame(FrameMode::Verify, SENDER, 3), frame(FrameMode::Sender, BODY, 0)])
 }
 
 fn evm(version: Version, block: BlockEnvExt) -> (Evm<'static, BaseEvmTypes>, Arc<AtomicUsize>) {
@@ -86,7 +40,7 @@ fn evm(version: Version, block: BlockEnvExt) -> (Evm<'static, BaseEvmTypes>, Arc
         SpecId::BOGOTA,
         block,
         ethereum_tx_registry(SpecId::BOGOTA),
-        Db::new(RejectReads(reads.clone())),
+        Db::new(FailingDatabase(reads.clone(), "validation performed a database read")),
         Precompiles::base(SpecId::BOGOTA),
     );
     (evm, reads)
