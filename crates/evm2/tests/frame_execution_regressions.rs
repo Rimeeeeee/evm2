@@ -1,23 +1,19 @@
-//! Differential checks against the pinned Bogota revm implementation.
+//! Native frame execution matrices for receipts, accounting and transaction-local assertions.
 
 use alloy_consensus::{TxEip8141, transaction::Recovered};
 use alloy_eips::eip8141::{
-    Frame, FrameLimits, FrameMode, FrameReceipt, NONCE_MANAGER, nonce_calldata, nonce_slot,
+    Frame, FrameLimits, FrameMode, FrameReceipt, FrameStatus, NONCE_MANAGER, nonce_calldata,
+    nonce_slot,
 };
 use alloy_primitives::{Address, B256, Bytes, Log, U256};
 use evm2::{
     BaseEvmTypes, Evm, Precompiles, SpecId, Version,
     bytecode::Bytecode,
+    constants::EIP7708_TRANSFER_TOPIC,
     env::BlockEnvExt,
     ethereum::{TxEnvelope, eip8141::FrameGas, ethereum_tx_registry},
-    evm::{AccountInfo, InMemoryDB},
-};
-use revm::{
-    Context, ExecuteEvm, MainBuilder, MainContext,
-    context::{TxEnv, result::ExecutionResult},
-    context_interface::transaction::FrameTransaction,
-    database::{CacheDB, EmptyDB},
-    primitives::hardfork::SpecId as RevmSpec,
+    evm::{AccountInfo, InMemoryDB, SYSTEM_ADDRESS},
+    version::GasId,
 };
 use std::collections::BTreeMap;
 
@@ -181,98 +177,6 @@ fn native(case: &Case) -> Result<Outcome, String> {
     })
 }
 
-fn oracle(case: &Case) -> Result<Outcome, String> {
-    let mut db = CacheDB::<EmptyDB>::default();
-    db.insert_account_info(NONCE_MANAGER, revm::state::AccountInfo::default().with_nonce(1));
-    for (address, code) in initial(case) {
-        db.insert_account_info(
-            address,
-            revm::state::AccountInfo::default()
-                .with_balance(U256::from(1_000_000_000))
-                .with_code(revm::bytecode::Bytecode::new_legacy(code)),
-        );
-    }
-    for &(address, key, value) in &case.storage {
-        db.insert_account_storage(address, key, value).unwrap();
-    }
-    let p = &case.tx;
-    let frame_transaction = FrameTransaction {
-        nonce_keys: p.nonce_keys.clone(),
-        nonce_calldata: p
-            .nonce_keys
-            .as_deref()
-            .map(|keys| nonce_calldata(keys, p.nonce))
-            .unwrap_or_default(),
-        frames: p.frames.clone(),
-        signatures: p.signatures.clone(),
-        signature_hash: p.signature_hash(),
-        max_fee: p.fees.max_fee,
-        max_priority_fee_per_gas: p.fees.max_priority_fee_per_gas,
-    };
-    let tx = TxEnv::builder()
-        .tx_type(Some(6))
-        .caller(p.sender)
-        .nonce(p.nonce)
-        .kind(revm::primitives::TxKind::Call(p.sender))
-        .gas_limit(frame_transaction.gas_limit(p.sender).unwrap())
-        .gas_priority_fee(Some(0))
-        .frame_transaction(frame_transaction)
-        .build()
-        .unwrap();
-    let mut evm = Context::mainnet()
-        .modify_cfg_chained(|cfg| {
-            cfg.set_spec_and_mainnet_gas_params(RevmSpec::BOGOTA);
-            cfg.enable_eip8250 = true;
-        })
-        .modify_block_chained(|block| block.basefee = case.basefee)
-        .with_db(db)
-        .build_mainnet();
-    let result = evm.transact(tx).map_err(|error| format!("{error:?}"))?;
-    let mut accounts = prestate(case);
-    for (address, account) in result.state {
-        if account.is_selfdestructed() || account.info.is_empty() {
-            accounts.remove(&address);
-            continue;
-        }
-        let entry = accounts.entry(address).or_default();
-        entry.balance = account.info.balance;
-        entry.nonce = account.info.nonce;
-        entry.code_hash = account.info.code_hash;
-        for (key, slot) in account.storage {
-            if slot.present_value.is_zero() {
-                entry.storage.remove(&key);
-            } else {
-                entry.storage.insert(key, slot.present_value);
-            }
-        }
-    }
-    let ExecutionResult::FrameTransaction {
-        success,
-        gas,
-        payer,
-        logs,
-        frame_receipts,
-        frame_outputs,
-    } = result.result
-    else {
-        panic!("oracle returned ordinary result");
-    };
-    Ok(Outcome {
-        success,
-        spent: gas.total_gas_spent(),
-        state_gas: gas.state_gas_spent_final(),
-        refunded: gas.inner_refunded(),
-        floor: gas.floor_gas(),
-        fee_gas: gas.frame_tx_gas_used(),
-        block_execution: gas.frame_block_regular_gas_used(),
-        payer,
-        receipts: frame_receipts,
-        outputs: frame_outputs,
-        logs,
-        accounts,
-    })
-}
-
 fn cases() -> Vec<Case> {
     let mut cases = vec![
         base_case("payment", &[], &[], vec![]),
@@ -385,34 +289,6 @@ fn cases() -> Vec<Case> {
     cases.extend(additional_cases());
     cases.extend(assertion_cases());
     cases
-}
-
-#[test]
-fn bogota_execution_matches_pinned_revm() {
-    let cases = cases();
-    let mut failures = 0;
-    for case in &cases {
-        let native = native(case);
-        let oracle = oracle(case);
-        match (&native, &oracle) {
-            (Ok(a), Ok(b))
-                if case.expected_valid
-                    && a == b
-                    && case.expected_success.is_none_or(|success| a.success == success) =>
-            {
-                println!("PASS {}", case.name);
-            }
-            (Err(_), Err(_)) if !case.expected_valid => {
-                println!("INVALID {}: evm2={native:?}; revm={oracle:?}", case.name);
-            }
-            _ => {
-                failures += 1;
-                eprintln!("MISMATCH {}\nevm2: {native:#?}\nrevm: {oracle:#?}", case.name);
-            }
-        }
-    }
-    println!("{} cases, {failures} mismatches against workspace revm", cases.len());
-    assert_eq!(failures, 0);
 }
 
 fn additional_cases() -> Vec<Case> {
@@ -606,4 +482,373 @@ fn assertion_cases() -> Vec<Case> {
     old_copy.expected_success = Some(false);
     cases.push(old_copy);
     cases
+}
+
+fn word(value: U256) -> Bytes {
+    Bytes::copy_from_slice(&value.to_be_bytes::<32>())
+}
+
+fn address_word(address: Address) -> U256 {
+    U256::from_be_slice(address.as_slice())
+}
+
+fn put_storage(
+    accounts: &mut BTreeMap<Address, Account>,
+    address: Address,
+    key: U256,
+    value: U256,
+) {
+    let storage = &mut accounts.get_mut(&address).unwrap().storage;
+    if value.is_zero() {
+        storage.remove(&key);
+    } else {
+        storage.insert(key, value);
+    }
+}
+
+fn assert_native_case(case: &Case, result: &Outcome) {
+    let version = Version::base(SpecId::BOGOTA);
+    let gp = &version.gas_params;
+    let slot_cost = u64::from(gp.get(GasId::SstoreSetState));
+    let create_cost = gp.create_state_gas() + gp.code_deposit_state_gas(1);
+    let mut statuses = vec![FrameStatus::Success; case.tx.frames.len()];
+    let mut executions = vec![107; case.tx.frames.len()];
+    let mut state = vec![0; case.tx.frames.len()];
+    let mut outputs = vec![Bytes::new(); case.tx.frames.len()];
+    let mut receipt_logs = vec![Vec::new(); case.tx.frames.len()];
+    let mut accounts = prestate(case);
+    let keys = case.tx.nonce_keys.as_deref().unwrap_or_default();
+    if keys.is_empty() {
+        accounts.get_mut(&SENDER).unwrap().nonce = 1;
+    } else {
+        for &key in keys {
+            let slot = nonce_slot(SENDER, key);
+            if accounts[&NONCE_MANAGER].storage.get(&slot).is_none_or(U256::is_zero) {
+                state[0] += slot_cost;
+            }
+            put_storage(
+                &mut accounts,
+                NONCE_MANAGER,
+                slot,
+                U256::from(case.tx.nonce.saturating_add(1)),
+            );
+        }
+    }
+    let name = case.name.as_str();
+    let mut success = true;
+    let mut raw_refund = 0;
+    let payer = if name.starts_with("external_payer_") { OTHER } else { SENDER };
+    if name.starts_with("external_payer_") {
+        executions[1] = 3_007;
+        executions[2] = 15_105;
+        state[2] = slot_cost;
+        if name.ends_with("true") {
+            success = false;
+            statuses[3] = FrameStatus::Failure;
+            executions[3] = case.tx.frames[3].limits.execution;
+            state[2] = 0;
+        } else {
+            put_storage(&mut accounts, BODY, U256::ZERO, U256::from(42));
+        }
+    } else if name.starts_with("storage_ownership_") {
+        // Only the first frame has a slot-creation reservoir. A later attempt to
+        // recreate a cleared slot fails its independent state-gas budget.
+        let first = !U256::from_be_slice(&case.tx.frames[1].data).is_zero();
+        let mut present = first;
+        executions[1] = if first { 15_107 } else { 5_107 };
+        for index in 2..case.tx.frames.len() {
+            let next = !U256::from_be_slice(&case.tx.frames[index].data).is_zero();
+            if next && !present {
+                statuses[index] = FrameStatus::Failure;
+                executions[index] = 100_000;
+            } else {
+                executions[index] = 207;
+                if present && !next {
+                    raw_refund += u64::from(gp.get(GasId::SstoreSetRefund));
+                }
+                present = next;
+            }
+        }
+        state[1] = if present { slot_cost } else { 0 };
+        put_storage(&mut accounts, BODY, U256::ZERO, U256::from(u8::from(present)));
+    } else if name.starts_with("nonzero_original_refund_") {
+        let mut present = U256::from(7);
+        for index in 1..case.tx.frames.len() {
+            let next = U256::from_be_slice(&case.tx.frames[index].data);
+            executions[index] = if index == 1 { 5_107 } else { 207 };
+            if present == U256::from(7) && next != present {
+                executions[index] += 10_000;
+            }
+            if next == U256::from(7) && next != present {
+                raw_refund += u64::from(gp.get(GasId::SstoreResetRefund));
+            }
+            present = next;
+        }
+        if present.is_zero() {
+            raw_refund += u64::from(gp.get(GasId::SstoreClearingSlotRefund));
+        }
+        put_storage(&mut accounts, BODY, U256::ZERO, present);
+    } else if name.starts_with("entry_execution_") {
+        let limit = case.tx.frames[1].limits.execution;
+        executions[1] = limit.min(3_000);
+        if limit < 3_000 {
+            statuses[1] = FrameStatus::Failure;
+        }
+    } else if name.starts_with("sstore_state_") {
+        let reservoir = case.tx.frames[1].limits.state;
+        if reservoir < slot_cost {
+            statuses[1] = FrameStatus::Failure;
+            executions[1] = 100_000;
+        } else {
+            executions[1] = 15_105;
+            state[1] = slot_cost;
+            put_storage(&mut accounts, BODY, U256::ZERO, U256::from(1));
+        }
+    } else if name == "atomic_storage_rollback_and_skip" {
+        executions[1..].copy_from_slice(&[15_105, 3_004, 0]);
+        statuses[2] = FrameStatus::Failure;
+        statuses[3] = FrameStatus::SkippedAtomicBatch;
+    } else if name == "atomic_nonzero_original_refund_rollback" {
+        executions[1..].copy_from_slice(&[15_104, 3_004]);
+        statuses[2] = FrameStatus::Failure;
+    } else if name == "created_account_and_code_stream" {
+        // CREATE access + one initcode word, the eight-gas initcode, memory,
+        // pushes and the EIP-8037 deployed-code hash word.
+        executions[1] = 15_039 + gp.keccak256_word_cost(1);
+        state[1] = create_cost;
+        let created = BODY.create(0);
+        outputs[1] = word(address_word(created));
+        accounts.get_mut(&BODY).unwrap().nonce = 1;
+        accounts.insert(
+            created,
+            Account { nonce: 1, code_hash: alloy_primitives::keccak256([0]), ..Default::default() },
+        );
+    } else if name == "created_then_selfdestructed_stream" {
+        // The zero beneficiary is already warm; the newly created zero-balance
+        // contract destroys itself without an ETH transfer or surviving account.
+        executions[1] = 20_170 + gp.keccak256_word_cost(2);
+        state[1] = gp.create_state_gas() + gp.code_deposit_state_gas(2);
+        accounts.get_mut(&BODY).unwrap().nonce = 1;
+    } else if name == "sstore" || name.starts_with("paid_budget_") {
+        executions[1] = 15_105;
+        if name.ends_with("assert_true") {
+            success = false;
+            statuses[2] = FrameStatus::Failure;
+            executions[2] = 3_004;
+        } else {
+            state[1] = slot_cost;
+            put_storage(&mut accounts, BODY, U256::ZERO, U256::from(42));
+        }
+    } else if name == "assertion_revert" {
+        success = false;
+        executions[1..].copy_from_slice(&[15_105, 3_004, 0]);
+        statuses[2] = FrameStatus::Failure;
+        statuses[3] = FrameStatus::SkippedAtomicBatch;
+    } else if name == "assertion_trace" {
+        executions[1..].copy_from_slice(&[15_105, 3_118]);
+        state[1] = slot_cost;
+        outputs[2] = word(U256::from(1));
+        put_storage(&mut accounts, BODY, U256::ZERO, U256::from(42));
+    } else if name.starts_with("txtrace_net_changes_")
+        || name.starts_with("txtrace_scalar_rejects_")
+        || name.starts_with("eventdatacopy_")
+        || name == "old_eventdatacopy_byte_is_undefined"
+    {
+        executions[1] = 29_292 + gp.keccak256_word_cost(1);
+        success = case.expected_success.unwrap();
+        if success {
+            let created = BODY.create(0);
+            state[1] = create_cost + slot_cost;
+            accounts.get_mut(&BODY).unwrap().nonce = 1;
+            accounts.insert(
+                created,
+                Account {
+                    nonce: 1,
+                    code_hash: alloy_primitives::keccak256([0]),
+                    ..Default::default()
+                },
+            );
+            put_storage(&mut accounts, BODY, U256::ZERO, U256::from(42));
+            let value = case.tx.frames[1].value;
+            if !value.is_zero() {
+                accounts.get_mut(&SENDER).unwrap().balance -= value;
+                accounts.get_mut(&BODY).unwrap().balance += value;
+                receipt_logs[1].push(Log::new_unchecked(
+                    SYSTEM_ADDRESS,
+                    vec![
+                        EIP7708_TRANSFER_TOPIC,
+                        B256::left_padding_from(SENDER.as_slice()),
+                        B256::left_padding_from(BODY.as_slice()),
+                    ],
+                    word(value),
+                ));
+            }
+            receipt_logs[1].push(Log::new_unchecked(
+                BODY,
+                [0x11, 0x22, 0x33, 0x44].map(|topic| B256::from(U256::from(topic))).to_vec(),
+                word(U256::from(0xab)),
+            ));
+            if name.starts_with("txtrace_net_changes_") {
+                let selector = case.other[3];
+                executions[2] = 3_119;
+                let mut nonce_addresses = vec![BODY, created];
+                if keys.is_empty() {
+                    nonce_addresses.push(SENDER);
+                }
+                nonce_addresses.sort_unstable();
+                let mut slots = vec![(BODY, U256::ZERO, U256::from(42))];
+                if let Some(&key) = keys.first() {
+                    slots.push((NONCE_MANAGER, nonce_slot(SENDER, key), U256::from(1)));
+                }
+                slots.sort_unstable();
+                let expected = match selector {
+                    0 => U256::from(2),
+                    1 => U256::from(slots.len()),
+                    2 => U256::from(1),
+                    3 => U256::from(nonce_addresses.len()),
+                    4 => address_word(SENDER),
+                    5 => U256::from(1_000_000_000),
+                    6 => U256::from(999_999_993),
+                    7 => address_word(slots[0].0),
+                    8 => U256::ZERO,
+                    9 => slots[0].2,
+                    0x0a => slots[0].1,
+                    0x0b => address_word(created),
+                    0x0c => U256::from_be_bytes(alloy_primitives::KECCAK256_EMPTY.0),
+                    0x0d => U256::from_be_bytes(alloy_primitives::keccak256([0]).0),
+                    0x0e => address_word(nonce_addresses[0]),
+                    0x0f => U256::ZERO,
+                    0x10 => U256::from(1),
+                    0x11 => U256::from(2),
+                    0x12 => address_word(BODY),
+                    0x13 => U256::from(4),
+                    0x14..=0x17 => {
+                        U256::from([0x11, 0x22, 0x33, 0x44][usize::from(selector - 0x14)])
+                    }
+                    0x18 => U256::from(32),
+                    0x19 => U256::ZERO,
+                    0x1a => address_word(SENDER),
+                    _ => unreachable!(),
+                };
+                outputs[2] = word(expected);
+            } else {
+                let memory = U256::from_be_slice(&case.other[67..99]);
+                let len = U256::from_be_slice(&case.other[1..33]).to::<usize>();
+                executions[2] = 3_026 + 3 * len.div_ceil(32) as u64;
+                let mut output = vec![0; 64];
+                if len != 0 {
+                    output[memory.to::<usize>() + 31] = 0xab;
+                }
+                outputs[2] = output.into();
+            }
+        } else {
+            statuses[2] = FrameStatus::Failure;
+            executions[2] = case.tx.frames[2].limits.execution;
+        }
+    } else if name.starts_with("txtrace_") {
+        let selector = case.other[2];
+        success = !matches!(selector, 4..=6 | 0x0b..=0x0d | 0x16 | 0x17 | 0x1b);
+        executions[1] = 16_508;
+        if success {
+            executions[2] = 3_118;
+            state[1] = slot_cost;
+            put_storage(&mut accounts, BODY, U256::ZERO, U256::from(42));
+            receipt_logs[1].push(Log::new_unchecked(
+                BODY,
+                vec![B256::from(U256::from(9)), B256::from(U256::from(7))],
+                word(U256::from(0xab)),
+            ));
+            outputs[2] = word(match selector {
+                0 | 2 | 8 | 0x0a | 0x0f | 0x19 => U256::ZERO,
+                1 | 3 | 0x10 | 0x11 => U256::from(1),
+                7 | 0x12 => address_word(BODY),
+                9 => U256::from(42),
+                0x0e | 0x1a => address_word(SENDER),
+                0x13 => U256::from(2),
+                0x14 => U256::from(9),
+                0x15 => U256::from(7),
+                0x18 => U256::from(32),
+                _ => unreachable!(),
+            });
+        } else {
+            statuses[2] = FrameStatus::Failure;
+            executions[2] = case.tx.frames[2].limits.execution;
+        }
+    }
+    assert_eq!(result.success, success, "{}", case.name);
+    assert_eq!(result.payer, payer, "{}", case.name);
+    assert_eq!(result.receipts.len(), case.tx.frames.len(), "{}", case.name);
+    for (index, receipt) in result.receipts.iter().enumerate() {
+        assert_eq!(receipt.status, statuses[index], "{} frame {index}", case.name);
+        assert_eq!(receipt.gas_used.execution, executions[index], "{} frame {index}", case.name);
+        assert_eq!(receipt.gas_used.state, state[index], "{} frame {index}", case.name);
+        assert_eq!(receipt.logs, receipt_logs[index], "{} frame {index}", case.name);
+    }
+    assert_eq!(result.outputs, outputs, "{}", case.name);
+    assert_eq!(
+        result.logs,
+        receipt_logs.into_iter().flatten().collect::<Vec<_>>(),
+        "{}",
+        case.name
+    );
+
+    // These matrices contain no signature entries. Derive the intrinsic and floor
+    // directly from their wire bytes, independently of FrameGas::calculate.
+    let nonce_data = nonce_calldata(keys, case.tx.nonce);
+    let bytes = nonce_data.iter().chain(case.tx.frames.iter().flat_map(|frame| frame.data.iter()));
+    let mut byte_count = 0;
+    let mut tokens = 0;
+    for byte in bytes {
+        byte_count += 1;
+        tokens += if *byte == 0 { 1 } else { 4 };
+    }
+    let base = 12_000
+        + 475 * case.tx.frames.len() as u64
+        + 6_000 * u64::from(!case.tx.frames.iter().all(|frame| frame.value.is_zero()))
+        + 12_100 * keys.len() as u64;
+    let intrinsic = base + 4 * tokens;
+    let floor = base + 64 * byte_count;
+    let expected_state = state.iter().sum::<u64>();
+    let expected_execution = intrinsic + executions.iter().sum::<u64>();
+    let expected_spent = expected_execution + expected_state;
+    let refund = raw_refund.min(expected_spent / 5);
+    let used = expected_execution.saturating_sub(refund).max(floor) + expected_state;
+    assert_eq!(result.state_gas, expected_state, "{}", case.name);
+    assert_eq!(result.spent, expected_spent, "{}", case.name);
+    assert_eq!(result.floor, floor, "{}", case.name);
+    assert_eq!(result.refunded, refund, "{}", case.name);
+    assert_eq!(result.fee_gas, used, "{}", case.name);
+    assert_eq!(result.block_execution, expected_execution.max(floor), "{}", case.name);
+
+    let base_fee = U256::from(used) * U256::from(case.basefee);
+    let tip = (U256::from(used) * case.tx.fees.max_priority_fee_per_gas)
+        .min(case.tx.fees.max_fee - base_fee);
+    accounts.get_mut(&payer).unwrap().balance -= base_fee + tip;
+    if !tip.is_zero() {
+        accounts
+            .entry(Address::ZERO)
+            .or_insert_with(|| Account {
+                code_hash: alloy_primitives::KECCAK256_EMPTY,
+                ..Default::default()
+            })
+            .balance += tip;
+    }
+    assert_eq!(result.accounts, accounts, "{}", case.name);
+}
+
+#[test]
+fn native_frame_execution_matches_explicit_protocol_expectations() {
+    let cases = cases();
+    assert_eq!(cases.len(), 189);
+    for case in &cases {
+        let result = native(case);
+        if case.expected_valid {
+            assert_native_case(
+                case,
+                &result.unwrap_or_else(|error| panic!("{}: {error}", case.name)),
+            );
+        } else {
+            assert!(result.is_err(), "{} accepted an invalid payload", case.name);
+        }
+    }
 }

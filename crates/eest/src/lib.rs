@@ -20,7 +20,6 @@ mod forks;
 mod harness;
 #[cfg(feature = "jit")]
 mod jit;
-mod reference;
 mod runner;
 mod state;
 mod trace;
@@ -53,10 +52,7 @@ pub use fixture_io::{
     write_blockchain as write_blockchain_fixture,
 };
 pub use runner::run as run_statetests;
-pub use tx::{
-    AccessListItem, TestAuthorization, TestFrame, TestFrameSignature, TxBuildError,
-    reference_block_transaction, reference_tx,
-};
+pub use tx::{AccessListItem, TestAuthorization, TestFrame, TestFrameSignature, TxBuildError};
 pub use types::{
     AccountInfo as StateTestAccountInfo, Env as StateTestEnv, SpecName as StateTestSpecName,
     Test as StateTestPost, TestSuite as StateTestSuite, TestUnit as StateTestUnit,
@@ -66,7 +62,7 @@ pub use types::{
 /// Runs all EEST harnesses.
 ///
 /// When `EVM2_ADDITIONAL_TESTS` is set, only that folder (or file) runs, as
-/// explicit suites with interpreter, inspected, paired reference, and enabled compiled backends.
+/// explicit suites with interpreter, inspected, and enabled compiled backends.
 /// Each suite detects fixture kinds and runs every selected file.
 pub fn run() -> std::process::ExitCode {
     if let Some(path) = fixtures::additional_tests_path() {

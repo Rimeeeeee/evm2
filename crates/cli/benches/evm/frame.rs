@@ -579,7 +579,7 @@ fn bench_tracing(group: &mut BenchmarkGroup<'_, WallTime>, case: &Case) {
     let children =
         body.ops.iter().filter_map(|operation| operation.sub.as_ref()).collect::<Vec<_>>();
     assert_eq!(children.len(), 128);
-    for pair in children.chunks_exact(2) {
+    for pair in children.as_chunks::<2>().0 {
         assert_eq!(pair[0].ops.len(), 3);
         assert!(pair[1].code.is_empty());
         assert!(pair[1].ops.is_empty());

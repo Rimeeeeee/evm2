@@ -83,14 +83,6 @@ bitflags::bitflags! {
         const TRUNCATED_PUSH = 1 << 73;
         const TX_CREATE = 1 << 74;
         const WIDE_PUSH = 1 << 75;
-        const FRAME_TRANSACTION = 1 << 76;
-        const FRAME_ATOMIC = 1 << 77;
-        const FRAME_ASSERTION = 1 << 78;
-        const FRAME_KEYED_NONCE = 1 << 79;
-        const FRAME_NESTED_APPROVAL = 1 << 80;
-        const FRAME_SPONSOR = 1 << 81;
-        const FRAME_INVALID = 1 << 82;
-        const FRAME_RECENT_ROOT = 1 << 83;
     }
 }
 

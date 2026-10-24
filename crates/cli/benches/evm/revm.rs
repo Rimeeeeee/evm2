@@ -29,9 +29,7 @@ impl PreparedBench {
         let suite = suites.get(bench.fixture_path);
         let (unit, test) = revm_case(suite.input(), &bench.name, spec);
         let tx = test.tx_env(&unit).expect("revm benchmark transaction must build");
-        let (mut cfg, block) = envs(&unit, revm_spec_id(spec));
-        cfg.enable_eip8250 = spec.enables(SpecId::BOGOTA);
-        cfg.set_max_blobs_per_tx(Version::base(spec).max_blobs_per_tx as u64);
+        let (cfg, block) = envs(&unit, revm_spec_id(spec));
         let db = Arc::new(database(&unit));
         Self { name: bench.name.clone(), cfg, block, db, tx }
     }
@@ -170,7 +168,6 @@ fn revm_spec_id(spec: SpecId) -> RevmSpecId {
         SpecId::PRAGUE => RevmSpecId::PRAGUE,
         SpecId::OSAKA => RevmSpecId::OSAKA,
         SpecId::AMSTERDAM => RevmSpecId::AMSTERDAM,
-        SpecId::BOGOTA => RevmSpecId::BOGOTA,
         _ => panic!("unsupported benchmark spec: {spec:?}"),
     }
 }

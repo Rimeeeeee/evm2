@@ -155,7 +155,7 @@ quote = "1.0"
 syn = "3.0"
 
 # testing
-revm = { git = "https://github.com/Rimeeeeee/revm", rev = "c71d5b783b900cbdf1b88a830d043a7bfaadfa74", default-features = false, features = ["std"] }
+revm = { version = "43.0.3", default-features = true, features = ["asm-keccak"] }
 criterion = { package = "codspeed-criterion-compat", version = "4", default-features = false, features = [
     "cargo_bench_support",
 ] }

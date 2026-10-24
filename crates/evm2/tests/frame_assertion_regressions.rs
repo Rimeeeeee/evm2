@@ -109,7 +109,7 @@ fn return_memory(code: &mut Vec<u8>, offset: u64, len: u64) {
 
 fn words(data: &[u8]) -> Vec<U256> {
     assert_eq!(data.len() % 32, 0);
-    data.chunks_exact(32).map(U256::from_be_slice).collect()
+    data.as_chunks::<32>().0.iter().copied().map(U256::from_be_bytes).collect()
 }
 
 #[test]
@@ -452,12 +452,7 @@ fn recent_root_write_read_and_ring_overwrite_execute_ordinary_contract_code() {
         );
         assert!(evm.transact(&recent_query(RECENT_ROOT_ADDRESS, tuple.clone())).is_err());
         evm.set_block(BlockEnvExt { slot_num: U256::from(slot + 1), ..*evm.block() });
-        assert!(
-            evm.transact(&recent_query(RECENT_ROOT_ADDRESS, tuple.clone()))
-                .unwrap()
-                .discard()
-                .status
-        );
+        assert!(evm.transact(&recent_query(RECENT_ROOT_ADDRESS, tuple)).unwrap().discard().status);
         if nonce == 1 {
             // Even with the new slot, an overwritten root does not satisfy the commitment.
             assert!(

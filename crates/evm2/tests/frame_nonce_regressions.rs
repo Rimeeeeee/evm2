@@ -438,7 +438,13 @@ fn nonce_introspection_returns_zero_first_key_for_the_empty_legacy_set() {
                 .discard();
             assert!(result.status, "keys={keys:?}, inspected={inspected}");
             let output = &result.frame.unwrap().outputs[1];
-            let actual = output.chunks_exact(32).map(U256::from_be_slice).collect::<Vec<_>>();
+            let actual = output
+                .as_chunks::<32>()
+                .0
+                .iter()
+                .copied()
+                .map(U256::from_be_bytes)
+                .collect::<Vec<_>>();
             assert_eq!(
                 actual,
                 [

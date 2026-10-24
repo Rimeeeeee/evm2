@@ -1,5 +1,4 @@
 use crate::fuzzer::case::EvmCase;
-use alloy_eips::eip8141::FrameReceipt;
 use alloy_primitives::{Address, B256, U256, keccak256, map::HashMap};
 use core::convert::Infallible;
 use evm2::evm::{AccountChangeRef, StateChangeSink, StorageChange, registry::HandlerError};
@@ -62,19 +61,6 @@ pub(crate) struct TxReceipt {
     pub(crate) logs: Vec<CanonicalLog>,
     pub(crate) state: CanonicalState,
     pub(crate) error: Option<FuzzError>,
-    pub(crate) frame: Option<FrameOutcome>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct FrameOutcome {
-    pub(crate) payer: Address,
-    pub(crate) receipts: Vec<FrameReceipt>,
-    pub(crate) outputs: Vec<Vec<u8>>,
-    pub(crate) spent: u64,
-    pub(crate) state_gas: u64,
-    pub(crate) refunded: u64,
-    pub(crate) floor: u64,
-    pub(crate) block_execution: u64,
 }
 
 impl TxReceipt {
@@ -86,7 +72,6 @@ impl TxReceipt {
             logs: Vec::new(),
             state: CanonicalState::default(),
             error: Some(error),
-            frame: None,
         }
     }
 }
@@ -136,7 +121,6 @@ pub(crate) enum FuzzError {
     InvalidNonce,
     NonceOverflow,
     UnsupportedTransactionType,
-    InvalidFrameTransaction,
     Transaction(InvalidTransaction),
     Evm2(HandlerError),
     Revm(EVMError<EvmDatabaseError<Infallible>>),
@@ -172,10 +156,6 @@ impl From<HandlerError> for FuzzError {
             HandlerError::InvalidNonce { .. } => Self::InvalidNonce,
             HandlerError::NonceOverflow => Self::NonceOverflow,
             HandlerError::UnsupportedTransactionType(_) => Self::UnsupportedTransactionType,
-            HandlerError::FrameFeeBudgetTooLow { .. } => {
-                Self::Transaction(InvalidTransaction::GasPriceLessThanBasefee)
-            }
-            HandlerError::InvalidFrameTransaction(_) => Self::InvalidFrameTransaction,
             HandlerError::MissingChainId => Self::Transaction(InvalidTransaction::MissingChainId),
             HandlerError::RejectCallerWithCode => {
                 Self::Transaction(InvalidTransaction::RejectCallerWithCode)
@@ -200,6 +180,8 @@ impl From<HandlerError> for FuzzError {
             | HandlerError::Fatal(_)
             | HandlerError::External(_)
             | HandlerError::WrongTransactionType { .. }
+            | HandlerError::FrameFeeBudgetTooLow { .. }
+            | HandlerError::InvalidFrameTransaction(_)
             | HandlerError::InvalidChainId { .. }
             | HandlerError::GasLimitMoreThanBlock { .. }
             | HandlerError::CreateInitCodeSizeLimit { .. }
@@ -223,11 +205,7 @@ impl From<EVMError<EvmDatabaseError<Infallible>>> for FuzzError {
                 | InvalidTransaction::Eip1559NotSupported
                 | InvalidTransaction::Eip4844NotSupported
                 | InvalidTransaction::Eip7702NotSupported
-                | InvalidTransaction::Eip8141NotSupported
                 | InvalidTransaction::Eip7873NotSupported => Self::UnsupportedTransactionType,
-                InvalidTransaction::Eip8141InvalidFields | InvalidTransaction::Str(_) => {
-                    Self::InvalidFrameTransaction
-                }
                 error => Self::Transaction(error),
             },
             EVMError::Database(EvmDatabaseError::Database(error)) => match error {},
@@ -390,10 +368,6 @@ mod tests {
             (HandlerError::UnsupportedTransactionType(4), InvalidTransaction::Eip7702NotSupported),
             (HandlerError::EmptyBlobs, InvalidTransaction::EmptyBlobs),
             (
-                HandlerError::FrameFeeBudgetTooLow { required: U256::from(10), got: U256::from(9) },
-                InvalidTransaction::GasPriceLessThanBasefee,
-            ),
-            (
                 HandlerError::TooManyBlobs { have: 10, max: 6 },
                 InvalidTransaction::TooManyBlobs { have: 10, max: 6 },
             ),
@@ -409,16 +383,6 @@ mod tests {
 
     #[test]
     fn unmatched_errors_keep_payloads() {
-        assert_ne!(
-            FuzzError::from(HandlerError::InvalidFrameTransaction(
-                "max fee below required base-fee budget"
-            )),
-            FuzzError::from(EVMError::Transaction(InvalidTransaction::GasPriceLessThanBasefee)),
-        );
-        assert_ne!(
-            FuzzError::from(HandlerError::InvalidFrameTransaction("fee budget overflow")),
-            FuzzError::from(EVMError::Transaction(InvalidTransaction::GasPriceLessThanBasefee)),
-        );
         assert_ne!(
             FuzzError::from(HandlerError::WrongTransactionType { expected: 1 }),
             FuzzError::from(HandlerError::WrongTransactionType { expected: 2 }),

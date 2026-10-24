@@ -251,32 +251,26 @@ fn collect_json_files_into(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-const fn replay_state_execution_mode(command: &Replay) -> StateTestExecutionMode {
-    if command.revm {
-        return StateTestExecutionMode::Revm;
-    }
+const fn replay_state_execution_mode(_command: &Replay) -> StateTestExecutionMode {
     #[cfg(feature = "jit")]
     {
-        if command.jit {
+        if _command.jit {
             return StateTestExecutionMode::Jit;
         }
-        if command.aot {
+        if _command.aot {
             return StateTestExecutionMode::Aot;
         }
     }
     StateTestExecutionMode::Interpreter
 }
 
-const fn replay_blockchain_execution_mode(command: &Replay) -> BlockchainTestExecutionMode {
-    if command.revm {
-        return BlockchainTestExecutionMode::Revm;
-    }
+const fn replay_blockchain_execution_mode(_command: &Replay) -> BlockchainTestExecutionMode {
     #[cfg(feature = "jit")]
     {
-        if command.jit {
+        if _command.jit {
             return BlockchainTestExecutionMode::Jit;
         }
-        if command.aot {
+        if _command.aot {
             return BlockchainTestExecutionMode::Aot;
         }
     }
@@ -529,21 +523,15 @@ mod collect_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "jit"))]
 mod tests {
     use super::*;
-    use crate::args::{Args, Command};
-    use clap::Parser;
-
-    #[cfg(feature = "jit")]
     use std::path::PathBuf;
 
-    #[cfg(feature = "jit")]
     fn replay(jit: bool, aot: bool) -> Replay {
         Replay {
             filter_test: None,
             filter_file: None,
-            revm: false,
             jit,
             aot,
             db_stats: false,
@@ -554,7 +542,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "jit")]
     #[test]
     fn replay_execution_mode_defaults_to_interpreter() {
         let command = replay(false, false);
@@ -566,7 +553,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "jit")]
     #[test]
     fn replay_execution_mode_selects_jit() {
         let command = replay(true, false);
@@ -575,20 +561,11 @@ mod tests {
         assert_eq!(replay_blockchain_execution_mode(&command), BlockchainTestExecutionMode::Jit);
     }
 
-    #[cfg(feature = "jit")]
     #[test]
     fn replay_execution_mode_selects_aot() {
         let command = replay(false, true);
 
         assert_eq!(replay_state_execution_mode(&command), StateTestExecutionMode::Aot);
         assert_eq!(replay_blockchain_execution_mode(&command), BlockchainTestExecutionMode::Aot);
-    }
-
-    #[test]
-    fn replay_execution_mode_selects_reference_comparison() {
-        let args = Args::try_parse_from(["evm2", "replay", "--revm", "fixture.json"]).unwrap();
-        let Command::Replay(command) = args.command else { panic!("expected replay command") };
-        assert_eq!(replay_state_execution_mode(&command), StateTestExecutionMode::Revm);
-        assert_eq!(replay_blockchain_execution_mode(&command), BlockchainTestExecutionMode::Revm);
     }
 }

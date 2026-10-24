@@ -53,10 +53,6 @@ pub(crate) struct Replay {
     /// name matches this glob.
     #[arg(long, value_name = "GLOB")]
     pub(crate) filter_file: Option<String>,
-    /// Compare every transaction's evm2 result and post-state with the Bogota revm reference.
-    #[arg(long)]
-    #[cfg_attr(feature = "jit", arg(conflicts_with_all = ["jit", "aot"]))]
-    pub(crate) revm: bool,
     /// Replay through the evm2 JIT runtime.
     #[cfg(feature = "jit")]
     #[arg(long, conflicts_with = "aot")]
@@ -107,6 +103,8 @@ fn parse_block_range(value: &str) -> Result<RangeInclusive<u64>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "jit")]
     use clap::Parser;
 
     #[test]
@@ -150,23 +148,5 @@ mod tests {
         let err =
             Args::try_parse_from(["evm2", "replay", "--jit", "--aot", "fixture.json"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
-    }
-
-    #[test]
-    fn replay_accepts_reference_comparison() {
-        let args = Args::try_parse_from(["evm2", "replay", "--revm", "fixture.json"]).unwrap();
-        let Command::Replay(replay) = args.command else { panic!("expected replay command") };
-        assert!(replay.revm);
-        assert_eq!(replay.path, PathBuf::from("fixture.json"));
-    }
-
-    #[cfg(feature = "jit")]
-    #[test]
-    fn replay_rejects_reference_comparison_with_compiled_modes() {
-        for mode in ["--jit", "--aot"] {
-            let err = Args::try_parse_from(["evm2", "replay", "--revm", mode, "fixture.json"])
-                .unwrap_err();
-            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
-        }
     }
 }

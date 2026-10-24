@@ -398,11 +398,11 @@ mod tests {
             &block.transactions.as_ref().unwrap()[0],
             &block.rlp_decoded.as_ref().unwrap().transactions[0],
         ] {
-            let reference = crate::reference_block_transaction(transaction).unwrap();
-            assert_eq!(reference.caller, Address::repeat_byte(0x11));
-            let frame = reference.frame_transaction.unwrap();
+            let recovered = crate::blockchaintest::execute::build_tx(transaction).unwrap();
+            assert_eq!(recovered.signer(), Address::repeat_byte(0x11));
+            let frame = recovered.inner().as_eip8141().unwrap();
             assert_eq!(frame.nonce_keys, None);
-            assert_eq!(frame.max_fee, U256::ZERO);
+            assert_eq!(frame.fees.max_fee, U256::ZERO);
             assert_eq!(frame.frames, vec![alloy_eips::eip8141::Frame::default()]);
         }
         let mut wrong_schema = encoded.clone();

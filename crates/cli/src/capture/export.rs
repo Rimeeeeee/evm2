@@ -293,7 +293,10 @@ fn export_authorization_list(authorizations: &[SignedAuthorization]) -> Vec<Test
 mod tests {
     use super::*;
     use alloy_consensus::TxEip8141;
-    use alloy_eips::eip8141::{Frame, FrameSignature};
+    use alloy_eips::{
+        Decodable2718,
+        eip8141::{Frame, FrameSignature},
+    };
     use alloy_primitives::Sealable;
 
     #[test]
@@ -320,13 +323,12 @@ mod tests {
         assert_eq!(exported.txbytes.as_ref().unwrap().as_ref(), envelope.encoded_2718().as_slice());
         let encoded = serde_json::to_vec(&exported).unwrap();
         let replay = serde_json::from_slice::<Transaction>(&encoded).unwrap();
-        let reference = evm2_eest::reference_block_transaction(&replay).unwrap();
-        assert_eq!(reference.caller, sender);
-        assert_eq!(reference.nonce, payload.nonce);
-        let frame = reference.frame_transaction.unwrap();
-        assert_eq!(frame.max_fee, U256::MAX);
-        assert_eq!(frame.nonce_keys, payload.nonce_keys);
-        assert_eq!(frame.frames, payload.frames);
-        assert_eq!(frame.signatures, payload.signatures);
+        let decoded =
+            EthereumTxEnvelope::<TxEip4844>::decode_2718(&mut replay.txbytes.unwrap().as_ref())
+                .unwrap();
+        let EthereumTxEnvelope::Eip8141(frame) = decoded else {
+            panic!("expected frame transaction")
+        };
+        assert_eq!(frame.inner(), &payload);
     }
 }

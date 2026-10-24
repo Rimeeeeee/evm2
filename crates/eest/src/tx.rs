@@ -1,13 +1,13 @@
 use alloy_consensus::{
-    EthereumTxEnvelope, Transaction, TxEip4844, TxEip8141, TypedTransaction,
+    EthereumTxEnvelope, TxEip4844, TxEip8141, TypedTransaction,
     transaction::{Recovered, SignerRecoverable},
 };
 use alloy_eips::{
-    Decodable2718, Typed2718,
+    Decodable2718,
     eip7702::SignedAuthorization,
     eip8141::{
         Frame, FrameAddress, FrameLimits, FrameMode, FrameSignature, SignatureMessage,
-        SignatureScheme, TransactionFees, nonce_calldata,
+        SignatureScheme, TransactionFees,
     },
 };
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256};
@@ -17,10 +17,6 @@ use alloy_rpc_types_eth::{
 };
 use evm2::ethereum::{RecoveredTxEnvelope, TxEnvelope};
 use k256::ecdsa::SigningKey;
-use revm::{
-    context::TxEnv,
-    context_interface::{either::Either, transaction::FrameTransaction},
-};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Access list entry shared by EEST fixture formats.
@@ -365,64 +361,6 @@ fn recovered_envelope(tx: TypedTransaction, caller: Address) -> RecoveredTxEnvel
     }
 }
 
-/// Converts a native recovered envelope without narrowing canonical frame fees or replacing its
-/// sender.
-pub fn reference_tx(recovered: &RecoveredTxEnvelope) -> Result<TxEnv, String> {
-    let tx = recovered.inner();
-    let mut env = TxEnv {
-        tx_type: tx.ty(),
-        caller: recovered.signer(),
-        gas_limit: tx.gas_limit(),
-        gas_price: tx.max_fee_per_gas(),
-        kind: tx.kind(),
-        value: tx.value(),
-        data: tx.input().clone(),
-        nonce: tx.nonce(),
-        chain_id: tx.chain_id(),
-        gas_priority_fee: tx.max_priority_fee_per_gas(),
-        access_list: tx.access_list().cloned().unwrap_or_default(),
-        blob_hashes: tx.blob_versioned_hashes().unwrap_or_default().to_vec(),
-        max_fee_per_blob_gas: tx.max_fee_per_blob_gas().unwrap_or_default(),
-        authorization_list: tx
-            .authorization_list()
-            .unwrap_or_default()
-            .iter()
-            .cloned()
-            .map(Either::Left)
-            .collect(),
-        ..Default::default()
-    };
-    if let Some(tx) = tx.as_eip8141() {
-        let frame = FrameTransaction {
-            nonce_keys: tx.nonce_keys.clone(),
-            nonce_calldata: tx
-                .nonce_keys
-                .as_deref()
-                .map(|keys| nonce_calldata(keys, tx.nonce))
-                .unwrap_or_default(),
-            frames: tx.frames.clone(),
-            signatures: tx.signatures.clone(),
-            signature_hash: tx.signature_hash(),
-            max_fee: tx.fees.max_fee,
-            max_priority_fee_per_gas: tx.fees.max_priority_fee_per_gas,
-        };
-        env.caller = tx.sender;
-        env.kind = TxKind::Call(tx.sender);
-        env.gas_limit = frame.gas_limit(tx.sender).unwrap_or(u64::MAX);
-        env.frame_transaction = Some(Box::new(frame));
-    }
-    Ok(env)
-}
-
-/// Converts a blockchain fixture transaction, preserving authoritative canonical wire bytes.
-pub fn reference_block_transaction(
-    tx: &crate::blockchaintest::Transaction,
-) -> Result<TxEnv, String> {
-    let recovered =
-        crate::blockchaintest::execute::build_tx(tx).map_err(|error| error.to_string())?;
-    reference_tx(&recovered)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,9 +402,6 @@ mod tests {
         assert_eq!(frame.chain_id, 1);
         assert_eq!(frame.nonce_keys, None);
         assert_eq!(frame.frames, vec![Frame::default()]);
-        let reference = crate::reference_tx(&recovered).unwrap();
-        assert_eq!(reference.caller, frame.sender);
-        assert_eq!(reference.frame_transaction.unwrap().frames, frame.frames);
 
         for length in 0..raw.len() {
             assert!(build_recovered_tx_bytes(&raw[..length]).is_err(), "prefix {length}");
@@ -509,16 +444,6 @@ mod tests {
             };
             let recovered = build_recovered_tx_bytes(&tx.encoded_2718()).unwrap();
             assert_eq!(recovered.inner().as_eip8141().unwrap(), &tx);
-            let reference = crate::reference_tx(&recovered).unwrap();
-            assert_eq!(reference.nonce, u64::MAX);
-            let frame = reference.frame_transaction.unwrap();
-            assert_eq!(frame.max_fee, U256::MAX);
-            assert_eq!(frame.max_priority_fee_per_gas, U256::MAX - U256::ONE);
-            assert_eq!(frame.nonce_keys, tx.nonce_keys);
-            let mut nonce_calldata = vec![0xe2, 0x01, 0xa0];
-            nonce_calldata.extend([0xff; 32]);
-            assert_eq!(frame.nonce_calldata, nonce_calldata);
-            assert_eq!(frame.signature_hash, tx.signature_hash());
 
             let signature_hash = tx.signature_hash();
             tx.signatures[0].signature = vec![0x85; length].into();
@@ -577,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn frame_json_uses_the_full_width_total_budget_in_native_and_reference_builders() {
+    fn frame_json_uses_the_full_width_total_budget() {
         let transaction = crate::blockchaintest::Transaction {
             transaction_type: Some(U256::from(6)),
             sender: Some(Address::repeat_byte(0x11)),
@@ -593,10 +518,6 @@ mod tests {
         let decoded = serde_json::from_value(json).unwrap();
         let native = crate::blockchaintest::execute::build_tx(&decoded).unwrap();
         let fees = &native.inner().as_eip8141().unwrap().fees;
-        assert_eq!(fees.max_fee, U256::MAX);
-        assert_eq!(fees.max_priority_fee_per_gas, U256::MAX - U256::ONE);
-        let reference = crate::reference_block_transaction(&decoded).unwrap();
-        let fees = reference.frame_transaction.unwrap();
         assert_eq!(fees.max_fee, U256::MAX);
         assert_eq!(fees.max_priority_fee_per_gas, U256::MAX - U256::ONE);
     }
@@ -629,40 +550,5 @@ mod tests {
         let mut trailing = expected.to_vec();
         trailing.push(0x80);
         assert!(ReceiptEnvelope::decode_2718_exact(&trailing).is_err());
-    }
-
-    #[test]
-    fn reference_conversion_preserves_invalid_shapes_for_handler_validation() {
-        let payload = TxEip8141 {
-            sender: Address::repeat_byte(0x11),
-            nonce: u64::MAX,
-            nonce_keys: Some(vec![]),
-            frames: vec![Frame {
-                flags: 0xff,
-                limits: FrameLimits { execution: u64::MAX, state: u64::MAX },
-                ..Default::default()
-            }],
-            signatures: vec![FrameSignature {
-                scheme: SignatureScheme::Secp256k1,
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let recovered = Recovered::new_unchecked(
-            TxEnvelope::Eip8141(payload.clone()),
-            Address::repeat_byte(0x99),
-        );
-        let reference = reference_tx(&recovered).unwrap();
-        assert_eq!(reference.caller, payload.sender);
-        assert_eq!(reference.kind, TxKind::Call(payload.sender));
-        assert_eq!(reference.nonce, u64::MAX);
-        assert_eq!(reference.gas_limit, u64::MAX);
-        let frame = reference.frame_transaction.unwrap();
-        assert_eq!(frame.nonce_keys, Some(vec![]));
-        let mut nonce_calldata = vec![0xc0, 0x88];
-        nonce_calldata.extend([0xff; 8]);
-        assert_eq!(frame.nonce_calldata, nonce_calldata);
-        assert_eq!(frame.frames, payload.frames);
-        assert_eq!(frame.signatures, payload.signatures);
     }
 }
