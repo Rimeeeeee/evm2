@@ -875,6 +875,24 @@ evm_versions! {
         ],
     }
 
+    BOGOTA {
+        features: [
+            EIP8141,
+            EIP8250,
+            EIP7906,
+        ],
+        ops: [
+            APPROVE: ZERO,
+            TXPARAM: BASE,
+            FRAMEDATALOAD: VERYLOW,
+            FRAMEDATACOPY: VERYLOW,
+            FRAMEPARAM: BASE,
+            SIGPARAM: BASE,
+            SIGDATACOPY: VERYLOW,
+            TXTRACE: WARM_STORAGE_READ_COST,
+            EVENTDATACOPY: VERYLOW,
+        ],
+    }
 }
 
 macro_rules! op_instr {
@@ -1036,5 +1054,14 @@ macro_rules! op_instr {
     (@path $ty:ident, REVERT) => { instr::revert<$ty> };
     (@path $ty:ident, INVALID) => { instr::invalid<$ty> };
     (@path $ty:ident, SELFDESTRUCT) => { instr::selfdestruct<$ty> };
+    (@path $ty:ident, APPROVE) => { instr::approve<$ty> };
+    (@path $ty:ident, TXPARAM) => { instr::txparam<$ty> };
+    (@path $ty:ident, FRAMEDATALOAD) => { instr::framedataload<$ty> };
+    (@path $ty:ident, FRAMEDATACOPY) => { instr::framedatacopy<$ty> };
+    (@path $ty:ident, FRAMEPARAM) => { instr::frameparam<$ty> };
+    (@path $ty:ident, SIGPARAM) => { instr::sigparam<$ty> };
+    (@path $ty:ident, SIGDATACOPY) => { instr::sigdatacopy<$ty> };
+    (@path $ty:ident, TXTRACE) => { instr::txtrace<$ty> };
+    (@path $ty:ident, EVENTDATACOPY) => { instr::eventdatacopy<$ty> };
 }
 use op_instr;

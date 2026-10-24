@@ -464,6 +464,7 @@ pub unsafe extern "C" fn __revmc_builtin_sstore(
         let state_gas = ecx.gas_params().sstore_state_gas(&state_load);
         ecx.gas.spend_state(state_gas)?;
         let refill = ecx.gas_params().sstore_state_gas_refill(&state_load);
+        let refill = ecx.host().frame_sstore_gas(*target, index, state_gas, refill);
         ecx.gas.refill_reservoir(refill);
     }
 
@@ -956,6 +957,9 @@ pub unsafe extern "C" fn __revmc_builtin_selfdestruct(
 }
 
 }
+
+mod frame;
+pub use frame::*;
 
 #[cfg(test)]
 mod tests {

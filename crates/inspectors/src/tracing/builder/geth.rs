@@ -1,4 +1,5 @@
 //! Geth trace builder
+
 use crate::tracing::{
     final_refunded,
     tx_state::TxState,
@@ -84,6 +85,24 @@ impl<'a> GethTraceBuilder<'a> {
         storage: &mut HashMap<Address, BTreeMap<B256, B256>>,
         struct_logs: &mut Vec<StructLog>,
     ) {
+        if main_trace_node.trace.frame_transaction_root {
+            for child in &main_trace_node.children {
+                self.fill_geth_trace_at_depth(&self.nodes[*child], opts, storage, struct_logs, 0);
+            }
+            return;
+        }
+        self.fill_geth_trace_at_depth(main_trace_node, opts, storage, struct_logs, 1);
+    }
+
+    /// Flattens a real call subtree without counting the synthetic frame root as EVM depth.
+    fn fill_geth_trace_at_depth(
+        &self,
+        main_trace_node: &CallTraceNode,
+        opts: &GethDefaultTracingOptions,
+        storage: &mut HashMap<Address, BTreeMap<B256, B256>>,
+        struct_logs: &mut Vec<StructLog>,
+        depth_offset: u64,
+    ) {
         // Suspend only the parent iterator when entering a child. Scratch space scales with
         // call depth rather than step count, and a trace without subcalls needs no allocation.
         let mut steps = main_trace_node.steps_with_children();
@@ -103,7 +122,8 @@ impl<'a> GethTraceBuilder<'a> {
             // We increment the depth by one because steps that are part of call at depth N should
             // have depth N + 1. For example, steps inside of a top-level call should
             // have depth 1.
-            let mut log = step.convert_to_geth_struct_log(opts, trace_node.trace.depth as u64 + 1);
+            let mut log =
+                step.convert_to_geth_struct_log(opts, trace_node.trace.depth as u64 + depth_offset);
 
             // Only touch the storage cache when updating it or emitting a storage snapshot.
             if opts.is_storage_enabled()
@@ -244,6 +264,21 @@ impl<'a> GethTraceBuilder<'a> {
         }
 
         if opts.only_top_call.unwrap_or_default() {
+            if main_trace_node.trace.frame_transaction_root {
+                root_call_frame.calls = main_trace_node
+                    .children
+                    .iter()
+                    .map(|child| {
+                        let node = &self.nodes[*child];
+                        let mut call =
+                            node.geth_empty_call_frame(include_logs && !node.trace.is_error());
+                        for log in &mut call.logs {
+                            log.position = Some(0);
+                        }
+                        call
+                    })
+                    .collect();
+            }
             // No subcall frames are collected, so logs have no position relative to them.
             for log in &mut root_call_frame.logs {
                 log.position = Some(0);
@@ -262,7 +297,9 @@ impl<'a> GethTraceBuilder<'a> {
         // so we can populate the call frame tree by walking up the call tree
         let mut call_frames = Vec::with_capacity(self.nodes.len());
         call_frames.push(PendingCallFrame {
-            logs_visible: include_logs && !main_trace_node.trace.is_error(),
+            logs_visible: include_logs
+                && (main_trace_node.trace.frame_transaction_root
+                    || !main_trace_node.trace.is_error()),
             frame: root_call_frame,
         });
 
@@ -593,7 +630,7 @@ impl<'a> GethTraceBuilder<'a> {
             }
 
             let include_logs = include_logs
-                && !trace.is_error()
+                && (trace.frame_transaction_root || !trace.is_error())
                 && node.parent.is_none_or(|parent| frames[parent].logs_visible);
             let call_frame = if idx == 0 {
                 top_call.take().unwrap()

@@ -171,7 +171,10 @@ pub use db::{
 };
 
 mod tx;
-pub use tx::{ExecutedTx, TxResult, TxResultExt, TxResultWithState};
+pub use tx::{ExecutedTx, FrameTransactionResult, TxResult, TxResultExt, TxResultWithState};
+
+pub(crate) mod frame;
+mod frame_diff;
 
 mod state;
 #[cfg(feature = "account-ext")]
@@ -235,6 +238,7 @@ pub struct Evm<'a, T: EvmTypesHost> {
     #[derive_where(skip)]
     async_stack: r#async::FiberStack,
     evm_send: bool,
+    pub(crate) frame_tx: Option<frame::FrameTransactionRuntime>,
 }
 
 impl<'a, T: EvmTypes> Evm<'a, T> {
@@ -353,6 +357,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
             #[cfg(feature = "async")]
             async_stack: r#async::FiberStack::default(),
             evm_send: false,
+            frame_tx: None,
         }
     }
 
@@ -410,7 +415,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     const fn enter_execution(&mut self) -> ExecutionGuard<'_, 'a, T> {
         let was_running = self.running;
         self.running = true;
-        ExecutionGuard { evm: self, was_running }
+        ExecutionGuard { evm: self, was_running, discard_on_drop: false }
     }
 
     /// Returns the transaction handler registry.
@@ -815,7 +820,9 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     /// Precompiles and handlers that emit logs should check this before building them.
     #[inline]
     pub const fn logs_observed(&self) -> bool {
-        self.feature(EvmFeatures::LOG_COLLECTION) || self.inspector.is_some()
+        self.feature(EvmFeatures::LOG_COLLECTION)
+            || self.inspector.is_some()
+            || self.frame_tx.is_some()
     }
 
     /// Notifies the inspector and records an emitted log if [`EvmFeatures::LOG_COLLECTION`] is
@@ -823,7 +830,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     #[inline]
     pub fn log(&mut self, log: Log) {
         self.inspect_log(&log);
-        if self.feature(EvmFeatures::LOG_COLLECTION) {
+        if self.feature(EvmFeatures::LOG_COLLECTION) || self.frame_tx.is_some() {
             self.state.log(log);
         }
     }
@@ -833,11 +840,12 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         &mut self,
         mut result: TxResult<T>,
     ) -> HandlerResult<ExecutedTx<'_, 'a, T>> {
-        if let Err(error) = self.state.finalize_transaction(self.execution_config.version()) {
-            self.state.clear_transaction_state();
-            return Err(error.into());
-        }
-        result.logs = self.state.take_logs();
+        let mut guard = self.enter_execution();
+        guard.discard_on_drop = true;
+        guard.evm.state.finalize_transaction(guard.evm.execution_config.version())?;
+        result.logs = guard.evm.state.take_logs();
+        guard.discard_on_drop = false;
+        drop(guard);
         Ok(ExecutedTx::from_result(self, result, true))
     }
 
@@ -935,12 +943,32 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
 struct ExecutionGuard<'guard, 'evm, T: EvmTypesHost> {
     evm: &'guard mut Evm<'evm, T>,
     was_running: bool,
+    discard_on_drop: bool,
 }
 
 impl<'guard, 'evm, T: EvmTypesHost> Drop for ExecutionGuard<'guard, 'evm, T> {
     #[inline]
     fn drop(&mut self) {
         self.evm.running = self.was_running;
+        if !self.was_running {
+            self.evm.current_frame = None;
+            if self.discard_on_drop || self.evm.frame_tx.is_some() {
+                self.evm.frame_tx = None;
+                self.evm.state.clear_transaction_state();
+            }
+        }
+    }
+}
+
+/// Restores the enclosing interpreter before the active interpreter can be dropped on unwind.
+struct CurrentFrameGuard<'guard, 'evm, T: EvmTypesHost> {
+    evm: &'guard mut Evm<'evm, T>,
+    previous: Option<NonNull<Interpreter<'static, 'static, T>>>,
+}
+
+impl<T: EvmTypesHost> Drop for CurrentFrameGuard<'_, '_, T> {
+    fn drop(&mut self) {
+        self.evm.current_frame = self.previous;
     }
 }
 
@@ -980,13 +1008,16 @@ impl<'a, T: EvmTypes<Tx: Typed2718>> Evm<'a, T> {
     /// or execution configuration while the transaction is being executed.
     pub fn transact(&mut self, tx: &Recovered<T::Tx>) -> HandlerResult<ExecutedTx<'_, 'a, T>> {
         let handler = self.registry.try_get_by_type(tx.ty())?;
-        let guard = self.enter_execution();
+        let mut guard = self.enter_execution();
+        guard.discard_on_drop = true;
         let result = handler.execute(tx, guard.evm);
+        guard.discard_on_drop = false;
         drop(guard);
         match result {
             Ok(result) => self.finish_executed_tx(result),
             Err(err) => {
                 self.state.clear_transaction_state();
+                self.frame_tx = None;
                 Err(err)
             }
         }
@@ -1009,11 +1040,13 @@ impl<'a, T: EvmTypes<Tx: Typed2718>> Evm<'a, T> {
     /// responsibility.
     ///
     /// Uses the active validation rules; callers must configure any pool-specific relaxations.
+    /// For frame transactions this checks preparation only. Executable payment/approval
+    /// validation requires the Ethereum type family's `validate_frame_prefix()`.
     pub fn validate_tx(&mut self, tx: &Recovered<T::Tx>) -> HandlerResult<()> {
-        let result =
-            self.registry.try_get_by_type(tx.ty()).and_then(|handler| handler.validate(tx, self));
-        self.state.clear_transaction_state();
-        result
+        let handler = self.registry.try_get_by_type(tx.ty())?;
+        let mut guard = self.enter_execution();
+        guard.discard_on_drop = true;
+        handler.validate(tx, guard.evm)
     }
 
     /// Dispatches the transaction to the handler registered for its EIP-2718 type byte on an async
@@ -1054,7 +1087,14 @@ impl<'a, T: EvmTypes<Tx: Typed2718>> Evm<'a, T> {
     + Send
     + 'fut
     where
-        T::Tx: Sync,
+        T::SpecId: Send,
+        T::Tx: Send + Sync,
+        T::EvmExt: Send,
+        T::MessageExt: Send,
+        T::MessageResultExt: Send,
+        T::TxEnvExt: Send,
+        T::TxResultExt: Send,
+        T::BlockEnvExt: Send,
     {
         self.assert_erased_send();
         let stack = self.async_stack();
@@ -1094,10 +1134,14 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         &mut self,
         tx_env: &TxEnv<T>,
         message: &mut Message<T>,
+        rollback_checkpoint: &mut StateCheckpoint,
     ) -> Result<MessageResult<T>, ExecutionError> {
+        if let Some(result) = self.execute_default_frame(message)? {
+            return Ok(result);
+        }
         let mut result = match message.kind {
             MessageKind::Create | MessageKind::Create2 => {
-                self.execute_create_message(tx_env, message)
+                self.execute_create_message(tx_env, message, rollback_checkpoint)
             }
             MessageKind::Call
             | MessageKind::CallCode
@@ -1120,10 +1164,11 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         &mut self,
         tx_env: &'frame TxEnv<T>,
         message: &'frame mut Message<T>,
+        rollback_checkpoint: &mut StateCheckpoint,
     ) -> Result<MessageResult<T>, ExecutionError> {
         let guard = self.enter_execution();
         let Some(inspector) = guard.evm.inspector.as_deref_mut() else {
-            return guard.evm.execute_message_impl(tx_env, message);
+            return guard.evm.execute_message_impl(tx_env, message, rollback_checkpoint);
         };
         // SAFETY: The inspector is stored in `self`; the execution guard prevents inspector
         // replacement while the hooks are running.
@@ -1163,7 +1208,9 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         let mut result = if let Some(error) = frame.take_error() {
             Err(error)
         } else {
-            inspected.map(Ok).unwrap_or_else(|| guard.evm.execute_message_impl(tx_env, message))
+            inspected.map(Ok).unwrap_or_else(|| {
+                guard.evm.execute_message_impl(tx_env, message, rollback_checkpoint)
+            })
         };
 
         if let Ok(result) = &mut result {
@@ -1172,6 +1219,9 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
             } else {
                 inspector.call_end(frame, message, result);
             }
+            // Hooks can replace a successful call with a revert or halt, or supply a result
+            // without dispatch. Settle the final outcome before its gas reaches the caller.
+            result.gas.settle_gas(result.stop);
         }
 
         if let Some(error) = frame.take_error() {
@@ -1190,6 +1240,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         &mut self,
         tx_env: &TxEnv<T>,
         message: &mut Message<T>,
+        rollback_checkpoint: &mut StateCheckpoint,
     ) -> Result<MessageResult<T>, ExecutionError> {
         if message.depth > CALL_DEPTH_LIMIT {
             return Ok(Self::error_message_result(
@@ -1207,6 +1258,10 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
             };
         }
         let checkpoint = self.state.checkpoint();
+        // Failed creation preserves the creator's nonce bump, including when `create_end`
+        // changes a successful deployment into a failure. Reuse this same boundary for the
+        // final post-inspector rollback instead of reverting the earlier preparation phase.
+        *rollback_checkpoint = checkpoint.clone();
         if let Err(error) = self.create_message_account(message) {
             self.state.rollback(checkpoint, self.features);
             return match error {
@@ -1395,6 +1450,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     ) -> Result<MessageResult<T>, ExecutionError> {
         let mut gas =
             GasTracker::new_with_execution_gas_and_reservoir(message.gas_limit, message.reservoir);
+        gas.set_isolated_state(self.frame_tx.is_some());
         let execution = self.execute_precompile(message, &mut gas);
         let (stop, output) = match execution {
             Ok(_) | Err(PrecompileError::Revert(_)) if gas.remaining() > message.gas_limit => {
@@ -1480,21 +1536,22 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
             // interpreter run.
             unsafe { trustme::decouple_lt_mut(inspector) }
         });
-        let prev_frame = guard
+        let previous = guard
             .evm
             .current_frame
             .replace(NonNull::from(&mut *interp_ref).cast::<Interpreter<'static, 'static, T>>());
-        let interpreter_runner = guard.evm.interpreter_runner.clone();
+        let frame_guard = CurrentFrameGuard { evm: guard.evm, previous };
+        let interpreter_runner = frame_guard.evm.interpreter_runner.clone();
         let stop = if let Some(inspector) = inspector {
-            interp_ref.run_inspect(guard.evm, inspector)
+            interp_ref.run_inspect(frame_guard.evm, inspector)
         } else if let Some(runner) = interpreter_runner
-            && let Some(stop) = runner.run(interp_ref, guard.evm)
+            && let Some(stop) = runner.run(interp_ref, frame_guard.evm)
         {
             interp_ref.finish_run(stop)
         } else {
-            interp_ref.run(guard.evm)
+            interp_ref.run(frame_guard.evm)
         };
-        guard.evm.current_frame = prev_frame;
+        drop(frame_guard);
         guard.evm.interpreter_pool.push(interp);
         stop
     }
@@ -1653,16 +1710,76 @@ impl<'a, T: EvmTypes> Host<T> for Evm<'a, T> {
         tx_env: &TxEnv<T>,
         message: &mut Message<T>,
     ) -> Result<MessageResult<T>, ExecutionError> {
-        let checkpoint = self.state.checkpoint();
+        let mut checkpoint = self.state.checkpoint();
+        if let Some(rt) = &mut self.frame_tx {
+            rt.enter_scope();
+        }
         let result = if self.inspector.is_some() {
-            self.execute_message_inspected(tx_env, message)
+            self.execute_message_inspected(tx_env, message, &mut checkpoint)
         } else {
-            self.execute_message_impl(tx_env, message)
+            self.execute_message_impl(tx_env, message, &mut checkpoint)
         };
-        if result.is_err() {
+        let success = result.as_ref().is_ok_and(|r| r.stop.is_success());
+        if let Some(rt) = &mut self.frame_tx {
+            rt.exit_scope(success);
+        }
+        if !success {
             self.state.rollback(checkpoint, self.features);
         }
         result
+    }
+
+    fn frame_transaction_active(&self) -> bool {
+        self.frame_tx.is_some()
+    }
+
+    fn frame_tx_param(&self, param: Word, state_left: u64) -> Option<Word> {
+        self.frame_tx.as_ref()?.tx_param(param, state_left)
+    }
+
+    fn frame_data(&self, index: Word) -> Option<Bytes> {
+        self.frame_tx.as_ref()?.data(index)
+    }
+
+    fn frame_param(&self, index: Word, param: Word) -> Option<Word> {
+        self.frame_tx.as_ref()?.param(index, param)
+    }
+
+    fn frame_signature_param(&self, index: Word, param: Word) -> Option<Word> {
+        self.frame_tx.as_ref()?.signature_param(index, param)
+    }
+
+    fn frame_signature_bytes(&self, index: Word) -> Option<Bytes> {
+        self.frame_tx.as_ref()?.signature_bytes(index)
+    }
+
+    fn is_assert_frame(&self) -> bool {
+        self.frame_tx.as_ref().is_some_and(|rt| rt.is_assert())
+    }
+
+    fn approve_frame(
+        &mut self,
+        address: Address,
+        scope: Word,
+        state_left: u64,
+    ) -> Result<u64, HostError> {
+        self.apply_frame_approval(address, scope, state_left)
+    }
+
+    fn frame_sstore_gas(&mut self, address: Address, key: Word, charge: u64, refill: u64) -> u64 {
+        if let Some(rt) = &mut self.frame_tx {
+            rt.sstore_gas(address, key, charge, refill)
+        } else {
+            refill
+        }
+    }
+
+    fn txtrace(&mut self, param: Word, index: Word) -> Option<Word> {
+        self.frame_tx.as_mut()?.trace_value(&self.state, param, index)
+    }
+
+    fn event_data(&self, index: Word) -> Option<Bytes> {
+        self.frame_tx.as_ref()?.event_data(&self.state, index)
     }
 
     fn selfdestruct(
@@ -1856,9 +1973,12 @@ mod tests {
         test_utils::{legacy_bytecode, push_address},
     };
     use alloc::{borrow::Cow, string::ToString, sync::Arc, vec, vec::Vec};
-    use alloy_consensus::{TxLegacy, transaction::Recovered};
+    use alloy_consensus::{TxEip8141, TxLegacy, transaction::Recovered};
     use alloy_eip7928::{BlockAccessList, StorageChange};
-    use alloy_primitives::{Address, Bytes, KECCAK256_EMPTY, Log, LogData, TxKind, U256};
+    use alloy_eips::eip8141::{Frame, FrameLimits, FrameMode, NONCE_MANAGER};
+    use alloy_primitives::{
+        Address, Bytes, KECCAK256_EMPTY, Log, LogData, TxKind, U256, keccak256,
+    };
     use core::{
         error::Error,
         fmt,
@@ -2205,7 +2325,6 @@ mod tests {
 
     #[test]
     fn owned_database_error_survives_nested_precompile_calls() {
-        use crate::{DatabaseError, evm::bal::BalError};
         let precompiles = precompiles_with([
             test_precompile(TEST_PRECOMPILE, |evm, _, _| {
                 let mut child = precompile_message(INNER_TEST_PRECOMPILE);
@@ -4242,5 +4361,195 @@ mod tests {
         );
 
         let _ = evm.transact(&test_tx(0));
+    }
+
+    struct CreateRollbackInspector {
+        before: Option<InstrStop>,
+        after: Option<InstrStop>,
+    }
+
+    impl Inspector<BaseEvmTypes> for CreateRollbackInspector {
+        fn create(
+            &mut self,
+            _interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+            message: &mut Message,
+        ) -> Option<MessageResult> {
+            self.before.map(|stop| MessageResultExt {
+                stop,
+                gas: GasTracker::new_with_execution_gas_and_reservoir(
+                    message.gas_limit,
+                    message.reservoir,
+                ),
+                ..Default::default()
+            })
+        }
+
+        fn create_end(
+            &mut self,
+            _interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+            _message: &Message,
+            result: &mut MessageResult,
+        ) {
+            if let Some(stop) = self.after {
+                result.stop = stop;
+            }
+        }
+    }
+
+    #[test]
+    fn failed_nested_creates_preserve_creator_nonce_and_revert_deployment_effects() {
+        let sender = Address::with_last_byte(0xa0);
+        let creator = Address::with_last_byte(0xb0);
+        for frame_tx in [false, true] {
+            for create2 in [false, true] {
+                for (init_stop, before, after) in [
+                    (op::REVERT, None, None),
+                    (op::INVALID, None, None),
+                    (op::RETURN, None, Some(InstrStop::Revert)),
+                    (op::RETURN, None, Some(InstrStop::OutOfGas)),
+                    (op::RETURN, Some(InstrStop::Revert), None),
+                    (op::RETURN, Some(InstrStop::InvalidFEOpcode), None),
+                ] {
+                    for inspected in [false, true] {
+                        if !inspected && (before.is_some() || after.is_some()) {
+                            continue;
+                        }
+                        let label = alloc::format!(
+                            "frame={frame_tx}, create2={create2}, init={init_stop}, before={before:?}, after={after:?}, inspected={inspected}"
+                        );
+                        let initcode = [
+                            op::PUSH1,
+                            1,
+                            op::PUSH0,
+                            op::SSTORE,
+                            op::PUSH0,
+                            op::PUSH0,
+                            op::LOG0,
+                            op::PUSH0,
+                            op::PUSH0,
+                            init_stop,
+                        ];
+                        let created = if create2 {
+                            creator.create2(U256::ONE.to_be_bytes::<32>(), keccak256(initcode))
+                        } else {
+                            creator.create(1)
+                        };
+                        let mut code = vec![op::PUSH32];
+                        code.extend_from_slice(&initcode);
+                        code.resize(33, 0);
+                        code.extend_from_slice(&[op::PUSH0, op::MSTORE]);
+                        if create2 {
+                            code.extend_from_slice(&[op::PUSH1, 1]);
+                        }
+                        code.extend_from_slice(&[
+                            op::PUSH1,
+                            initcode.len() as u8,
+                            op::PUSH0,
+                            op::PUSH1,
+                            1,
+                            if create2 { op::CREATE2 } else { op::CREATE },
+                            op::POP,
+                            op::STOP,
+                        ]);
+                        let mut database = InMemoryDB::default();
+                        database.insert_account_info(
+                            &sender,
+                            AccountInfo::default()
+                                .with_balance(U256::from(1_000_000_000))
+                                .with_code(Bytecode::new_legacy(if frame_tx {
+                                    Bytes::from_static(&[
+                                        op::PUSH1,
+                                        3,
+                                        op::PUSH0,
+                                        op::PUSH0,
+                                        op::APPROVE,
+                                    ])
+                                } else {
+                                    Bytes::new()
+                                })),
+                        );
+                        database.insert_account_info(
+                            &creator,
+                            AccountInfo::default()
+                                .with_nonce(1)
+                                .with_balance(U256::from(1_000_000))
+                                .with_code(Bytecode::new_legacy(code.into())),
+                        );
+                        database.insert_account_info(
+                            &NONCE_MANAGER,
+                            AccountInfo::default().with_nonce(1),
+                        );
+                        let spec = if frame_tx { SpecId::BOGOTA } else { SpecId::AMSTERDAM };
+                        let mut evm = Evm::<BaseEvmTypes>::new(
+                            spec,
+                            BlockEnvExt::default(),
+                            ethereum_tx_registry(spec),
+                            database,
+                            Precompiles::base(spec),
+                        );
+                        if inspected {
+                            evm.set_inspector(CreateRollbackInspector { before, after });
+                        }
+                        let envelope = if frame_tx {
+                            TxEnvelope::Eip8141(TxEip8141 {
+                                chain_id: 1,
+                                sender,
+                                nonce_keys: Some(vec![]),
+                                frames: [
+                                    (FrameMode::Verify, sender, 3),
+                                    (FrameMode::Sender, creator, 0),
+                                ]
+                                .into_iter()
+                                .map(|(mode, target, flags)| Frame {
+                                    mode,
+                                    target: target.into(),
+                                    flags,
+                                    limits: FrameLimits { execution: 500_000, state: 1_000_000 },
+                                    ..Default::default()
+                                })
+                                .collect(),
+                                ..Default::default()
+                            })
+                        } else {
+                            TxEnvelope::Legacy(TxLegacy {
+                                gas_limit: 1_000_000,
+                                to: TxKind::Call(creator),
+                                ..Default::default()
+                            })
+                        };
+                        let result = evm
+                            .transact(&Recovered::new_unchecked(envelope, sender))
+                            .unwrap_or_else(|error| panic!("{label}: {error:?}"))
+                            .commit();
+                        assert!(result.status, "{label}");
+                        assert!(result.logs.is_empty(), "{label}");
+                        assert_eq!(
+                            evm.state.account(&creator).unwrap().nonce(),
+                            if before.is_some() { 1 } else { 2 },
+                            "{label}"
+                        );
+                        assert_eq!(
+                            evm.state.account(&creator).unwrap().balance(),
+                            U256::from(1_000_000),
+                            "{label}"
+                        );
+                        assert!(
+                            evm.state.account_info_untracked(&created).unwrap().is_none(),
+                            "{label}"
+                        );
+                        assert_eq!(
+                            evm.state
+                                .storage(&created)
+                                .unwrap()
+                                .into_slot(U256::ZERO)
+                                .unwrap()
+                                .current(),
+                            U256::ZERO,
+                            "{label}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

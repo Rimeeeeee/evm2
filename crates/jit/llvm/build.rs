@@ -1,46 +1,42 @@
 #![allow(missing_docs)]
 
+mod build_support;
+
 fn main() {
     println!("cargo:rerun-if-changed=cpp/lib.cpp");
+    println!("cargo:rerun-if-changed=build_support.rs");
+    println!("cargo:rerun-if-env-changed=LLVM_SYS_231_PREFIX");
+    println!("cargo:rerun-if-env-changed=LLVM_CONFIG_PATH");
+    println!("cargo:rerun-if-env-changed=PATH");
 
-    let cxxflags = ["llvm-config", "llvm-config-23"]
-        .into_iter()
-        .find_map(detect_cxxflags)
-        .expect("no llvm-config found");
+    let candidates = build_support::config_candidates(
+        std::env::var_os("LLVM_SYS_231_PREFIX"),
+        std::env::var_os("LLVM_CONFIG_PATH"),
+    );
+    let config = build_support::detect_config(&candidates, query)
+        .unwrap_or_else(|error| panic!("cannot select LLVM 23.1 C++ headers:\n{error}"));
+    println!("cargo:warning=LLVM C++ shim uses {} ({})", config.path.display(), config.version);
 
     cc::Build::new()
         .cpp(true)
-        .flags(cxxflags.split_whitespace())
+        .flags(config.cxxflags.split_whitespace())
         .flag("-w")
         .file("cpp/lib.cpp")
         .compile("evm2_jit_llvm_cpp");
 }
 
-/// Returns the `--cxxflags` reported by `llvm_config`, or `None` if it cannot be used.
-///
-/// [`Command::output`] only reports whether the process could be spawned, so a `llvm-config` that
-/// exists but exits with a non-zero status still yields `Ok`. Checking the status keeps such a
-/// broken binary from shadowing a working one later in the candidate list.
-fn detect_cxxflags(llvm_config: &str) -> Option<String> {
+fn query(llvm_config: &std::path::Path, argument: &str) -> Result<String, String> {
     let output = std::process::Command::new(llvm_config)
-        .arg("--cxxflags")
+        .arg(argument)
         .output()
-        .inspect_err(|error| eprintln!("failed to run {llvm_config}: {error}"))
-        .ok()?;
-
-    let status = output.status;
-    if !status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stderr = stderr.trim();
-        if stderr.is_empty() {
-            eprintln!("{llvm_config} --cxxflags failed with {status}");
-        } else {
-            eprintln!("{llvm_config} --cxxflags failed with {status}: {stderr}");
-        }
-        return None;
+        .map_err(|error| format!("failed to run {argument}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{argument} failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
-
     String::from_utf8(output.stdout)
-        .inspect_err(|error| eprintln!("{llvm_config} --cxxflags is not valid UTF-8: {error}"))
-        .ok()
+        .map_err(|error| format!("{argument} is not valid UTF-8: {error}"))
 }

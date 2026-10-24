@@ -14,7 +14,7 @@ use evm2::{
 use evm2_jit_backend::{Attribute, BackendTypes, FunctionAttributeLocation, Pointer, TypeMethods};
 use evm2_jit_builtins::{Builtin, Builtins, CallKind, CreateKind};
 use oxc_index::IndexVec;
-use std::mem;
+use std::{fmt::Write, mem};
 
 mod peephole;
 
@@ -1090,6 +1090,46 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
                 goto_return!(no_branch);
             }
 
+            op::APPROVE => {
+                let sp = self.sp_after_inputs();
+                self.sync_diverging_stack_effect();
+                self.call_fallible_builtin(Builtin::Approve, &[self.ecx, sp]);
+                self.bcx.unreachable();
+                goto_return!(no_branch);
+            }
+            op::TXPARAM => {
+                let sp = self.sp_after_inputs();
+                self.call_fallible_builtin(Builtin::TxParam, &[self.ecx, sp]);
+            }
+            op::FRAMEDATALOAD => {
+                let sp = self.sp_after_inputs();
+                self.call_fallible_builtin(Builtin::FrameDataLoad, &[self.ecx, sp]);
+            }
+            op::FRAMEDATACOPY => {
+                let sp = self.sp_after_inputs();
+                self.call_fallible_builtin(Builtin::FrameDataCopy, &[self.ecx, sp]);
+            }
+            op::FRAMEPARAM => {
+                let sp = self.sp_after_inputs();
+                self.call_fallible_builtin(Builtin::FrameParam, &[self.ecx, sp]);
+            }
+            op::SIGPARAM => {
+                let sp = self.sp_after_inputs();
+                self.call_fallible_builtin(Builtin::SigParam, &[self.ecx, sp]);
+            }
+            op::SIGDATACOPY => {
+                let sp = self.sp_after_inputs();
+                self.call_fallible_builtin(Builtin::SigDataCopy, &[self.ecx, sp]);
+            }
+            op::TXTRACE => {
+                let sp = self.sp_after_inputs();
+                self.call_fallible_builtin(Builtin::TxTrace, &[self.ecx, sp]);
+            }
+            op::EVENTDATACOPY => {
+                let sp = self.sp_after_inputs();
+                self.call_fallible_builtin(Builtin::EventDataCopy, &[self.ecx, sp]);
+            }
+
             _ => unreachable!("unimplemented instruction: {data:?}"),
         }
 
@@ -1166,7 +1206,6 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
                 if d.is_dead_code() {
                     continue;
                 }
-                use std::fmt::Write;
                 let _ = write!(
                     section_dump,
                     "\n  ic{i} pc={} {:?} io={:?} flags={:?} gas={:?} stack={:?}{}{}",

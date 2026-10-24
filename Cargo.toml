@@ -61,18 +61,18 @@ evm2-jit-context = { path = "crates/jit/context", version = "0.1.0", default-fea
 evm2-jit-llvm = { path = "crates/jit/llvm", version = "0.1.0", default-features = false }
 evm2-jit-runtime = { path = "crates/jit/runtime", version = "0.1.0", default-features = false }
 
-alloy-consensus = { version = "2.0.4", default-features = false }
+alloy-consensus = { version = "=2.4.1", default-features = false }
 alloy-chains = { version = "0.2.34", default-features = false }
 alloy-eip2930 = { version = "0.2.4", default-features = false }
 alloy-eip7928 = { version = "0.4.11", default-features = false }
-alloy-eips = { version = "2.0.4", default-features = false }
+alloy-eips = { version = "=2.4.1", default-features = false }
 alloy-hardforks = { version = "0.4", default-features = false }
 alloy-primitives = { version = "1.5.7", default-features = false }
-alloy-provider = { version = "2.0.4", default-features = false }
+alloy-provider = { version = "=2.4.1", default-features = false }
 alloy-rlp = { version = "0.3", default-features = false }
-alloy-rpc-client = { version = "2.0.4", default-features = false }
-alloy-rpc-types-eth = { version = "2.0.4", default-features = false }
-alloy-rpc-types-trace = { version = "2.0.4", default-features = false }
+alloy-rpc-client = { version = "=2.4.1", default-features = false }
+alloy-rpc-types-eth = { version = "=2.4.1", default-features = false }
+alloy-rpc-types-trace = { version = "=2.4.1", default-features = false }
 alloy-sol-types = { version = "1.5.7", default-features = false }
 alloy-trie = { version = "0.9.6", default-features = false }
 
@@ -111,7 +111,6 @@ quanta = "0.13"
 postcard = { version = "1.1.3", default-features = false }
 rand = "0.10"
 rayon = "1.10"
-revm = { version = "43", default-features = true, features = ["asm-keccak"] }
 rmp-serde = "1.3"
 rstest = "0.27.0"
 ruint = { version = "1.18", default-features = false }
@@ -156,6 +155,7 @@ quote = "1.0"
 syn = "3.0"
 
 # testing
+revm = { version = "43.0.3", default-features = true, features = ["asm-keccak"] }
 criterion = { package = "codspeed-criterion-compat", version = "4", default-features = false, features = [
     "cargo_bench_support",
 ] }
@@ -180,6 +180,26 @@ lto = "thin"
 codegen-units = 1
 
 [patch.crates-io]
+# Frame transaction dependencies from bogota-devnet-2.
+alloy-consensus = { git = "https://github.com/Rimeeeeee/alloy", rev = "476361e7f6efab3fcae27f4b8efa992da0f06ab3" }
+alloy-consensus-any = { git = "https://github.com/Rimeeeeee/alloy", rev = "476361e7f6efab3fcae27f4b8efa992da0f06ab3" }
+alloy-contract = { git = "https://github.com/Rimeeeeee/alloy", rev = "476361e7f6efab3fcae27f4b8efa992da0f06ab3" }
+alloy-eips = { git = "https://github.com/Rimeeeeee/alloy", rev = "476361e7f6efab3fcae27f4b8efa992da0f06ab3" }
+alloy-genesis = { git = "https://github.com/Rimeeeeee/alloy", rev = "476361e7f6efab3fcae27f4b8efa992da0f06ab3" }
+alloy-json-rpc = { git = "https://github.com/Rimeeeeee/alloy", rev = "476361e7f6efab3fcae27f4b8efa992da0f06ab3" }
+alloy-network = { git = "https://github.com/Rimeeeeee/alloy", rev = "476361e7f6efab3fcae27f4b8efa992da0f06ab3" }
+alloy-network-primitives = { git = "https://github.com/Rimeeeeee/alloy", rev = "476361e7f6efab3fcae27f4b8efa992da0f06ab3" }
+alloy-provider = { git = "https://github.com/Rimeeeeee/alloy", rev = "476361e7f6efab3fcae27f4b8efa992da0f06ab3" }
+alloy-pubsub = { git = "https://github.com/Rimeeeeee/alloy", rev = "476361e7f6efab3fcae27f4b8efa992da0f06ab3" }
+alloy-rpc-client = { git = "https://github.com/Rimeeeeee/alloy", rev = "476361e7f6efab3fcae27f4b8efa992da0f06ab3" }
+alloy-rpc-types-eth = { git = "https://github.com/Rimeeeeee/alloy", rev = "476361e7f6efab3fcae27f4b8efa992da0f06ab3" }
+alloy-rpc-types-trace = { git = "https://github.com/Rimeeeeee/alloy", rev = "476361e7f6efab3fcae27f4b8efa992da0f06ab3" }
+alloy-serde = { git = "https://github.com/Rimeeeeee/alloy", rev = "476361e7f6efab3fcae27f4b8efa992da0f06ab3" }
+alloy-signer = { git = "https://github.com/Rimeeeeee/alloy", rev = "476361e7f6efab3fcae27f4b8efa992da0f06ab3" }
+alloy-transport = { git = "https://github.com/Rimeeeeee/alloy", rev = "476361e7f6efab3fcae27f4b8efa992da0f06ab3" }
+alloy-transport-http = { git = "https://github.com/Rimeeeeee/alloy", rev = "476361e7f6efab3fcae27f4b8efa992da0f06ab3" }
+alloy-tx-macros = { git = "https://github.com/Rimeeeeee/alloy", rev = "476361e7f6efab3fcae27f4b8efa992da0f06ab3" }
+
 # faster compile times: https://github.com/arkworks-rs/algebra/issues/1104
 ark-ec = { git = "https://github.com/DaniPopes/algebra", rev = "a71d9795e2e527cd0c80e6831bd957134de30d22" }
 ark-bls12-381 = { git = "https://github.com/DaniPopes/algebra", rev = "a71d9795e2e527cd0c80e6831bd957134de30d22" }

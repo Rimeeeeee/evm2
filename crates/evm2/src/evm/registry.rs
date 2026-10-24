@@ -136,6 +136,17 @@ pub enum HandlerError {
     /// Priority fee is greater than max fee.
     #[error("priority fee greater than max fee")]
     PriorityFeeGreaterThanMaxFee,
+    /// Invalid frame transaction.
+    #[error("invalid frame transaction: {0}")]
+    InvalidFrameTransaction(&'static str),
+    /// Frame transaction fee budget does not cover execution and blob base fees.
+    #[error("frame fee budget too low: required {required}, got {got}")]
+    FrameFeeBudgetTooLow {
+        /// Required base-fee budget for all reserved gas and blobs.
+        required: U256,
+        /// Signed maximum total fee.
+        got: U256,
+    },
 }
 
 impl From<DatabaseError> for HandlerError {

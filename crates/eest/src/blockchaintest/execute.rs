@@ -594,7 +594,10 @@ fn execute_block(
                         .with_bloom();
                         let tx_type = TxType::try_from(tx.inner().ty())
                             .expect("executor only builds supported Ethereum transaction types");
-                        receipts.push(ReceiptEnvelope::from_typed(tx_type, receipt));
+                        receipts.push(
+                            ReceiptEnvelope::from_typed(tx_type, receipt)
+                                .expect("ordinary fixture transactions have ordinary receipts"),
+                        );
                     }
                 }
                 Err(err) if should_fail => {

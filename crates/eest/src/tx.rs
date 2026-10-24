@@ -204,6 +204,7 @@ fn recovered_envelope(tx: TypedTransaction, caller: Address) -> RecoveredTxEnvel
         TypedTransaction::Eip1559(tx) => Recovered::new_unchecked(TxEnvelope::Eip1559(tx), caller),
         TypedTransaction::Eip4844(tx) => Recovered::new_unchecked(TxEnvelope::Eip4844(tx), caller),
         TypedTransaction::Eip7702(tx) => Recovered::new_unchecked(tx.into(), caller),
+        TypedTransaction::Eip8141(tx) => Recovered::new_unchecked(TxEnvelope::Eip8141(tx), caller),
     }
 }
 

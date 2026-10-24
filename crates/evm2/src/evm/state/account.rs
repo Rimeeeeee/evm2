@@ -374,6 +374,11 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
         self.tracked.present.as_ref()
     }
 
+    /// Returns the account at the start of this transaction, before any frame writes.
+    pub const fn original(&self) -> Option<&AccountInfo> {
+        self.tracked.original.as_ref()
+    }
+
     /// Returns whether the account currently exists in the overlay.
     #[inline]
     pub const fn exists(&self) -> bool {
@@ -692,8 +697,11 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::evm::{CacheDB, state::State};
-    use alloy_primitives::Address;
+    use crate::{
+        LoadError, SpecId, Version,
+        evm::{CacheDB, state::State},
+    };
+    use alloy_primitives::{Address, Bytes};
 
     #[test]
     fn transfer_to_self_requires_balance() {
@@ -708,8 +716,6 @@ mod tests {
 
     #[test]
     fn journaled_account_mutations_journal_and_roll_back() {
-        use crate::{SpecId, Version, bytecode::Bytecode};
-
         let address = Address::from([0x88; 20]);
         let mut state = State::new(CacheDB::default());
 
@@ -744,8 +750,6 @@ mod tests {
 
     #[test]
     fn account_info_set_code_is_published_on_commit() {
-        use alloy_primitives::Bytes;
-
         let address = Address::from([0x8c; 20]);
         let code = Bytecode::new_raw(Bytes::from_static(&[0x60, 0x01]));
         let mut state = State::new(CacheDB::default());
@@ -759,9 +763,6 @@ mod tests {
 
     #[test]
     fn journaled_existing_account_field_changes_roll_back_granularly() {
-        use crate::{SpecId, Version, bytecode::Bytecode};
-        use alloy_primitives::Bytes;
-
         let address = Address::from([0x8b; 20]);
         let original_code = Bytecode::new_raw(Bytes::from_static(&[0x60, 0x01]));
         let original_code_hash = original_code.hash_slow();
@@ -819,8 +820,6 @@ mod tests {
 
     #[test]
     fn journaled_account_skip_cold_load_signals_skip() {
-        use crate::LoadError;
-
         let address = Address::from([0x8a; 20]);
         let mut database = CacheDB::default();
         database.insert_account_info(&address, AccountInfo::default().with_balance(Word::from(5)));

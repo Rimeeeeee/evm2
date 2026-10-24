@@ -240,6 +240,22 @@ evm_features! {
     ///
     /// Default: on since Amsterdam
     EIP2780,
+    /// Frame transactions and introspection.
+    ///
+    /// Default: on since Bogota
+    EIP8141,
+    /// Keyed transaction nonces.
+    ///
+    /// Default: on since Bogota
+    EIP8250,
+    /// Transaction assertion instructions.
+    ///
+    /// Default: on since Bogota
+    EIP7906,
+    /// Explicit simulation-only allowance for unsigned frame requests.
+    ///
+    /// Default: off
+    FRAME_SIGNATURE_PLACEHOLDERS,
 }
 
 #[cfg(test)]

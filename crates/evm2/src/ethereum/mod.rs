@@ -8,6 +8,7 @@ pub mod eip2930;
 pub mod eip4844;
 /// EIP-7702 transaction handler.
 pub mod eip7702;
+pub mod eip8141;
 mod lazy_eip7702;
 /// Legacy transaction handler.
 pub mod legacy;
@@ -31,7 +32,7 @@ use crate::{
     version::GasId,
 };
 use alloy_consensus::{
-    EthereumTxEnvelope, TxEip1559, TxEip2930, TxEip4844, TxEip7702, TxLegacy,
+    EthereumTxEnvelope, TxEip1559, TxEip2930, TxEip4844, TxEip7702, TxEip8141, TxLegacy,
     transaction::{Recovered, Transaction, TxEip4844Variant},
 };
 use alloy_eips::{eip2718::Typed2718, eip2930::AccessList};
@@ -50,6 +51,8 @@ pub enum TxEnvelope {
     Eip4844(TxEip4844Variant),
     /// EIP-7702 set-code transaction.
     Eip7702(LazyTxEip7702),
+    /// Frame transaction with an explicit sender.
+    Eip8141(TxEip8141),
 }
 
 /// Recovered Ethereum transaction envelope.
@@ -73,6 +76,7 @@ impl From<EthereumTxEnvelope<TxEip4844>> for TxEnvelope {
             EthereumTxEnvelope::Eip2930(tx) => Self::Eip2930(tx.strip_signature()),
             EthereumTxEnvelope::Eip1559(tx) => Self::Eip1559(tx.strip_signature()),
             EthereumTxEnvelope::Eip4844(tx) => Self::Eip4844(tx.strip_signature().into()),
+            EthereumTxEnvelope::Eip8141(tx) => Self::Eip8141(tx.into_inner()),
             EthereumTxEnvelope::Eip7702(tx) => {
                 Self::Eip7702(LazyTxEip7702::from_recovered_authorizations(tx.strip_signature()))
             }
@@ -85,7 +89,11 @@ impl TxEnvelope {
     pub const fn as_legacy(&self) -> Option<&TxLegacy> {
         match self {
             Self::Legacy(tx) => Some(tx),
-            Self::Eip2930(_) | Self::Eip1559(_) | Self::Eip4844(_) | Self::Eip7702(_) => None,
+            Self::Eip2930(_)
+            | Self::Eip1559(_)
+            | Self::Eip4844(_)
+            | Self::Eip7702(_)
+            | Self::Eip8141(_) => None,
         }
     }
 
@@ -93,7 +101,11 @@ impl TxEnvelope {
     pub const fn as_eip2930(&self) -> Option<&TxEip2930> {
         match self {
             Self::Eip2930(tx) => Some(tx),
-            Self::Legacy(_) | Self::Eip1559(_) | Self::Eip4844(_) | Self::Eip7702(_) => None,
+            Self::Legacy(_)
+            | Self::Eip1559(_)
+            | Self::Eip4844(_)
+            | Self::Eip7702(_)
+            | Self::Eip8141(_) => None,
         }
     }
 
@@ -101,7 +113,11 @@ impl TxEnvelope {
     pub const fn as_eip1559(&self) -> Option<&TxEip1559> {
         match self {
             Self::Eip1559(tx) => Some(tx),
-            Self::Legacy(_) | Self::Eip2930(_) | Self::Eip4844(_) | Self::Eip7702(_) => None,
+            Self::Legacy(_)
+            | Self::Eip2930(_)
+            | Self::Eip4844(_)
+            | Self::Eip7702(_)
+            | Self::Eip8141(_) => None,
         }
     }
 
@@ -109,7 +125,11 @@ impl TxEnvelope {
     pub const fn as_eip4844(&self) -> Option<&TxEip4844Variant> {
         match self {
             Self::Eip4844(tx) => Some(tx),
-            Self::Legacy(_) | Self::Eip2930(_) | Self::Eip1559(_) | Self::Eip7702(_) => None,
+            Self::Legacy(_)
+            | Self::Eip2930(_)
+            | Self::Eip1559(_)
+            | Self::Eip7702(_)
+            | Self::Eip8141(_) => None,
         }
     }
 
@@ -117,7 +137,19 @@ impl TxEnvelope {
     pub const fn as_eip7702(&self) -> Option<&LazyTxEip7702> {
         match self {
             Self::Eip7702(tx) => Some(tx),
-            Self::Legacy(_) | Self::Eip2930(_) | Self::Eip1559(_) | Self::Eip4844(_) => None,
+            Self::Legacy(_)
+            | Self::Eip2930(_)
+            | Self::Eip1559(_)
+            | Self::Eip4844(_)
+            | Self::Eip8141(_) => None,
+        }
+    }
+
+    /// Returns the frame payload, if present.
+    pub const fn as_eip8141(&self) -> Option<&TxEip8141> {
+        match self {
+            Self::Eip8141(tx) => Some(tx),
+            _ => None,
         }
     }
 }
@@ -142,6 +174,7 @@ macro_rules! delegate {
             Self::Eip1559(tx) => tx.$method($($arg),*),
             Self::Eip4844(tx) => tx.$method($($arg),*),
             Self::Eip7702(tx) => tx.$method($($arg),*),
+            Self::Eip8141(tx) => tx.$method($($arg),*),
         }
     };
 }
@@ -220,6 +253,22 @@ impl Transaction for TxEnvelope {
     fn authorization_list(&self) -> Option<&[alloy_eips::eip7702::SignedAuthorization]> {
         delegate!(self, authorization_list)
     }
+
+    fn max_fee_per_gas_u256(&self) -> U256 {
+        delegate!(self, max_fee_per_gas_u256)
+    }
+
+    fn max_priority_fee_per_gas_u256(&self) -> Option<U256> {
+        delegate!(self, max_priority_fee_per_gas_u256)
+    }
+
+    fn max_fee_per_blob_gas_u256(&self) -> Option<U256> {
+        delegate!(self, max_fee_per_blob_gas_u256)
+    }
+
+    fn effective_gas_price_u256(&self, base_fee: Option<u64>) -> U256 {
+        delegate!(self, effective_gas_price_u256, base_fee)
+    }
 }
 
 /// Returns the Ethereum transaction registry for `spec_id`.
@@ -276,6 +325,13 @@ pub fn ethereum_tx_registry<T: EvmTypes<Tx = TxEnvelope>>(
         );
     }
 
+    if spec_id.enables(SpecId::BOGOTA) {
+        registry.register(
+            6,
+            TxEnvelope::as_eip8141,
+            handler(eip8141::prepare::<T>, eip8141::execute_prepared::<T>),
+        );
+    }
     registry
 }
 
@@ -933,13 +989,19 @@ fn eip2780_base_to_value_gas(
     gas
 }
 
+impl From<TxEip8141> for TxEnvelope {
+    fn from(tx: TxEip8141) -> Self {
+        Self::Eip8141(tx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         BaseEvmTypes, ExecutionConfig, Precompiles,
         env::{BlockEnvExt, TxEnvExt},
-        evm::InMemoryDB,
+        evm::{InMemoryDB, handler::TxHandlerHooks},
         interpreter::{Host, InstrStop, op},
         registry::TxRegistry,
     };
@@ -951,8 +1013,6 @@ mod tests {
     fn adjusted_floor_gas_controls_validation_and_settlement(
         #[values(31_049, 31_050)] gas_limit: u64,
     ) {
-        use crate::evm::handler::TxHandlerHooks;
-
         struct CalldataSurcharge;
 
         impl TxHandlerHooks<BaseEvmTypes> for CalldataSurcharge {

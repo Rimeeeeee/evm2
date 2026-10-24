@@ -199,42 +199,80 @@ impl MuxInspector {
 }
 
 impl<T: EvmTypes> Inspector<T> for MuxInspector {
+    fn frame_transaction_start(&mut self, tx: &alloy_consensus::TxEip8141, host: &mut T::Host<'_>) {
+        if let Some(inspector) = &mut self.tracing {
+            <TracingInspector as Inspector<T>>::frame_transaction_start(inspector, tx, host);
+        }
+    }
+
+    fn frame_start(
+        &mut self,
+        index: usize,
+        frame: &alloy_eips::eip8141::Frame,
+        host: &mut T::Host<'_>,
+    ) {
+        if let Some(inspector) = &mut self.tracing {
+            <TracingInspector as Inspector<T>>::frame_start(inspector, index, frame, host);
+        }
+    }
+
+    fn frame_end(
+        &mut self,
+        index: usize,
+        receipt: &alloy_eips::eip8141::FrameReceipt,
+        output: &alloy_primitives::Bytes,
+        stop: evm2::interpreter::InstrStop,
+        host: &mut T::Host<'_>,
+    ) {
+        if let Some(inspector) = &mut self.tracing {
+            <TracingInspector as Inspector<T>>::frame_end(
+                inspector, index, receipt, output, stop, host,
+            );
+        }
+    }
+
+    fn frame_transaction_end(&mut self, result: &evm2::TxResult<T>, host: &mut T::Host<'_>) {
+        if let Some(inspector) = &mut self.tracing {
+            <TracingInspector as Inspector<T>>::frame_transaction_end(inspector, result, host);
+        }
+    }
+
     #[inline]
     fn initialize_interp(&mut self, interp: &mut Interpreter<'_, '_, T>) {
-        if let Some(ref mut inspector) = self.four_byte {
+        if let Some(inspector) = &mut self.four_byte {
             inspector.initialize_interp(interp);
         }
-        if let Some(ref mut inspector) = self.tracing {
+        if let Some(inspector) = &mut self.tracing {
             inspector.initialize_interp(interp);
         }
     }
 
     #[inline]
     fn step(&mut self, interp: &mut Interpreter<'_, '_, T>) {
-        if let Some(ref mut inspector) = self.four_byte {
+        if let Some(inspector) = &mut self.four_byte {
             inspector.step(interp);
         }
-        if let Some(ref mut inspector) = self.tracing {
+        if let Some(inspector) = &mut self.tracing {
             inspector.step(interp);
         }
     }
 
     #[inline]
     fn step_end(&mut self, interp: &mut Interpreter<'_, '_, T>) {
-        if let Some(ref mut inspector) = self.four_byte {
+        if let Some(inspector) = &mut self.four_byte {
             inspector.step_end(interp);
         }
-        if let Some(ref mut inspector) = self.tracing {
+        if let Some(inspector) = &mut self.tracing {
             inspector.step_end(interp);
         }
     }
 
     #[inline]
     fn log(&mut self, log: &Log, host: &mut T::Host<'_>) {
-        if let Some(ref mut inspector) = self.four_byte {
+        if let Some(inspector) = &mut self.four_byte {
             <FourByteInspector as Inspector<T>>::log(inspector, log, host);
         }
-        if let Some(ref mut inspector) = self.tracing {
+        if let Some(inspector) = &mut self.tracing {
             <TracingInspector as Inspector<T>>::log(inspector, log, host);
         }
     }
@@ -245,10 +283,10 @@ impl<T: EvmTypes> Inspector<T> for MuxInspector {
         interp: &mut Interpreter<'_, '_, T>,
         message: &mut Message<T>,
     ) -> Option<MessageResult<T>> {
-        if let Some(ref mut inspector) = self.four_byte {
+        if let Some(inspector) = &mut self.four_byte {
             let _ = inspector.call(interp, message);
         }
-        if let Some(ref mut inspector) = self.tracing {
+        if let Some(inspector) = &mut self.tracing {
             return inspector.call(interp, message);
         }
         None
@@ -261,10 +299,10 @@ impl<T: EvmTypes> Inspector<T> for MuxInspector {
         message: &Message<T>,
         result: &mut MessageResult<T>,
     ) {
-        if let Some(ref mut inspector) = self.four_byte {
+        if let Some(inspector) = &mut self.four_byte {
             inspector.call_end(interp, message, result);
         }
-        if let Some(ref mut inspector) = self.tracing {
+        if let Some(inspector) = &mut self.tracing {
             inspector.call_end(interp, message, result);
         }
     }
@@ -275,10 +313,10 @@ impl<T: EvmTypes> Inspector<T> for MuxInspector {
         interp: &mut Interpreter<'_, '_, T>,
         message: &mut Message<T>,
     ) -> Option<MessageResult<T>> {
-        if let Some(ref mut inspector) = self.four_byte {
+        if let Some(inspector) = &mut self.four_byte {
             let _ = inspector.create(interp, message);
         }
-        if let Some(ref mut inspector) = self.tracing {
+        if let Some(inspector) = &mut self.tracing {
             return inspector.create(interp, message);
         }
         None
@@ -291,10 +329,10 @@ impl<T: EvmTypes> Inspector<T> for MuxInspector {
         message: &Message<T>,
         result: &mut MessageResult<T>,
     ) {
-        if let Some(ref mut inspector) = self.four_byte {
+        if let Some(inspector) = &mut self.four_byte {
             inspector.create_end(interp, message, result);
         }
-        if let Some(ref mut inspector) = self.tracing {
+        if let Some(inspector) = &mut self.tracing {
             inspector.create_end(interp, message, result);
         }
     }
@@ -307,12 +345,12 @@ impl<T: EvmTypes> Inspector<T> for MuxInspector {
         value: &U256,
         host: &mut T::Host<'_>,
     ) {
-        if let Some(ref mut inspector) = self.four_byte {
+        if let Some(inspector) = &mut self.four_byte {
             <FourByteInspector as Inspector<T>>::selfdestruct(
                 inspector, contract, target, value, host,
             );
         }
-        if let Some(ref mut inspector) = self.tracing {
+        if let Some(inspector) = &mut self.tracing {
             <TracingInspector as Inspector<T>>::selfdestruct(
                 inspector, contract, target, value, host,
             );
