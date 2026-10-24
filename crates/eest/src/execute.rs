@@ -1,3 +1,5 @@
+#[cfg(feature = "jit")]
+use crate::compiled::{self, FileSummary};
 use crate::{
     dump,
     error::{TestError, TestErrorKind},
@@ -9,10 +11,7 @@ use crate::{
         insert_account_with_storage, parse_bytecode, storage_for_root, system_contract_has_code,
     },
     trace::{self, Eip3155Tracer},
-    tx::{
-        TxFields, build_recovered_tx, build_recovered_tx_bytes, recover_address, rpc_access_list,
-        signed_authorizations,
-    },
+    tx::{TxFields, build_recovered_tx, recover_address, rpc_access_list, signed_authorizations},
     types::{AccountInfo, Env, Test, TestSuite, TestUnit, TransactionParts, TxPartIndices},
 };
 use alloy_eips::{eip4844, eip7691};
@@ -34,12 +33,9 @@ use evm2::{
     registry::HandlerError,
 };
 use serde_json::json;
-use std::{collections::BTreeMap, path::Path};
-
-#[cfg(feature = "jit")]
-use crate::compiled::{self, FileSummary};
 #[cfg(feature = "jit")]
 use std::path::PathBuf;
+use std::{collections::BTreeMap, path::Path};
 
 pub use crate::execution::ExecutionMode;
 
@@ -168,7 +164,7 @@ pub fn execute_str_with_filter(
     Ok(summary)
 }
 
-pub(crate) fn execute_str_with_resources(
+fn execute_str_with_resources(
     path: &Path,
     input: &str,
     config: ExecuteConfig,
@@ -177,7 +173,7 @@ pub(crate) fn execute_str_with_resources(
     db_stats_counts: &mut DbStatsCounts,
 ) -> Result<ExecuteSummary, TestError> {
     let suite: TestSuite =
-        fixture_io::parse_json(input).map_err(|err| TestError::unknown(path, err.into()))?;
+        serde_json::from_str(input).map_err(|err| TestError::unknown(path, err.into()))?;
     let mut summary = ExecuteSummary::default();
     for (name, unit) in suite.0 {
         if !test_filter.matches(&name) {
@@ -208,14 +204,7 @@ fn execute_unit(
         }
         let block = parse_block(&unit.env, spec);
         for post in posts {
-            let built = if let Some(bytes) =
-                post.txbytes.as_ref().filter(|bytes| bytes.first() == Some(&6))
-            {
-                build_recovered_tx_bytes(bytes).map_err(Into::into)
-            } else {
-                build_tx(&unit.transaction, &post.indexes, unit.env.current_chain_id)
-            };
-            let tx = match built {
+            let tx = match build_tx(&unit.transaction, &post.indexes, unit.env.current_chain_id) {
                 Ok(tx) => tx,
                 Err(_) if post.expect_exception.is_some() => {
                     continue;
@@ -621,15 +610,11 @@ fn build_tx(
         chain_id: raw.chain_id.or(chain_id),
         gas_price: raw.gas_price,
         max_fee_per_gas: raw.max_fee_per_gas,
-        max_fee: raw.max_fee,
         max_priority_fee_per_gas: raw.max_priority_fee_per_gas,
         access_list: access_list(raw, indexes.data)?,
         authorization_list: signed_authorizations(raw.authorization_list.as_deref())?,
         blob_versioned_hashes: raw.blob_versioned_hashes.clone(),
         max_fee_per_blob_gas: raw.max_fee_per_blob_gas,
-        frames: raw.frames.clone(),
-        signatures: raw.signatures.clone(),
-        nonce_keys: raw.nonce_keys.clone(),
     })?)
 }
 
@@ -651,7 +636,6 @@ mod tests {
     use super::*;
     use alloy_primitives::LogData;
     use evm2::interpreter::op;
-    use serde_json::json;
 
     #[cfg(feature = "jit")]
     const BYTECODE_RET42: &[u8] =
@@ -784,29 +768,6 @@ mod tests {
             panic!("expected EIP-2930 transaction");
         };
         assert_eq!(inner.access_list[0].address, second_address);
-    }
-
-    #[test]
-    fn build_frame_tx_reads_the_full_width_total_fee_budget_from_state_json() {
-        let raw = serde_json::from_value::<TransactionParts>(json!({
-            "type": "0x6",
-            "chainId": "0x1",
-            "sender": Address::repeat_byte(0x11),
-            "nonce": "0x0",
-            "data": ["0x"],
-            "gasLimit": ["0x0"],
-            "value": ["0x0"],
-            "frames": [],
-            "maxFee": U256::MAX,
-            "maxPriorityFeePerGas": U256::MAX - U256::ONE,
-            "maxFeePerGas": "0x1",
-            "maxFeePerBlobGas": "0x1",
-        }))
-        .unwrap();
-        let tx = build_tx(&raw, &TxPartIndices { data: 0, gas: 0, value: 0 }, None).unwrap();
-        let fees = &tx.inner().as_eip8141().unwrap().fees;
-        assert_eq!(fees.max_fee, U256::MAX);
-        assert_eq!(fees.max_priority_fee_per_gas, U256::MAX - U256::ONE);
     }
 
     #[cfg(feature = "jit")]

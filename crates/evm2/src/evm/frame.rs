@@ -7,7 +7,6 @@ use crate::{
     Evm, EvmFeatures, EvmTypes, EvmTypesHost, HostError,
     ethereum::{
         TxEnvelope,
-        eip7906::TxTraceParam,
         eip8141::{self, FrameValidationResult},
     },
     interpreter::{GasTracker, InstrStop, Message, MessageResult, MessageResultExt},
@@ -15,7 +14,10 @@ use crate::{
 };
 use alloc::{sync::Arc, vec::Vec};
 use alloy_consensus::{TxEip8141, transaction::Recovered};
-use alloy_eips::eip8141::{FrameMode, FrameStatus, NONCE_MANAGER, SignatureScheme, nonce_slot};
+use alloy_eips::{
+    eip7906::TxTraceParam,
+    eip8141::{FrameMode, FrameStatus, NONCE_MANAGER, SignatureScheme, nonce_slot},
+};
 use alloy_primitives::{Address, B256, Bytes, KECCAK256_EMPTY, U256, map::HashMap};
 
 #[cfg(feature = "async")]

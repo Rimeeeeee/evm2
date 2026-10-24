@@ -10,23 +10,12 @@ use alloy_primitives::{Address, B256, Bytes, U256};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Binary fixture identity; schema changes require regeneration.
-const BINARY_FORMAT: [u8; 5] = *b"EV2F\x02";
-
 pub(crate) fn to_vec(suite: &BlockchainTest) -> Result<Vec<u8>, postcard::Error> {
-    postcard::to_allocvec(&(BINARY_FORMAT, BlockchainTestRef::new(suite)))
+    postcard::to_allocvec(&BlockchainTestRef::new(suite))
 }
 
 pub(crate) fn from_bytes(bytes: &[u8]) -> Result<BlockchainTest, postcard::Error> {
-    if !bytes.starts_with(&BINARY_FORMAT) {
-        return Err(postcard::Error::DeserializeBadEncoding);
-    }
-    let (suite, remaining) =
-        postcard::take_from_bytes::<BlockchainTestWire>(&bytes[BINARY_FORMAT.len()..])?;
-    if !remaining.is_empty() {
-        return Err(postcard::Error::DeserializeBadEncoding);
-    }
-    Ok(suite.into())
+    postcard::from_bytes::<BlockchainTestWire>(bytes).map(Into::into)
 }
 
 #[derive(Serialize)]
@@ -120,10 +109,6 @@ impl<'a> DecodedBlockRef<'a> {
 
 #[derive(Deserialize, Serialize)]
 struct TransactionWire {
-    frames: Option<Vec<crate::tx::TestFrame>>,
-    signatures: Vec<crate::tx::TestFrameSignature>,
-    nonce_keys: Option<Vec<U256>>,
-    txbytes: Option<Bytes>,
     transaction_type: Option<U256>,
     sender: Option<Address>,
     data: Bytes,
@@ -138,7 +123,6 @@ struct TransactionWire {
     chain_id: Option<U256>,
     access_list: Option<Vec<AccessListItem>>,
     max_fee_per_gas: Option<U256>,
-    max_fee: Option<U256>,
     max_priority_fee_per_gas: Option<U256>,
     blob_versioned_hashes: Vec<B256>,
     max_fee_per_blob_gas: Option<U256>,
@@ -149,10 +133,6 @@ struct TransactionWire {
 impl TransactionWire {
     fn new(tx: &Transaction) -> Self {
         Self {
-            txbytes: tx.txbytes.clone(),
-            frames: tx.frames.clone(),
-            signatures: tx.signatures.clone(),
-            nonce_keys: tx.nonce_keys.clone(),
             transaction_type: tx.transaction_type,
             sender: tx.sender,
             data: tx.data.clone(),
@@ -167,7 +147,6 @@ impl TransactionWire {
             chain_id: tx.chain_id,
             access_list: tx.access_list.clone(),
             max_fee_per_gas: tx.max_fee_per_gas,
-            max_fee: tx.max_fee,
             max_priority_fee_per_gas: tx.max_priority_fee_per_gas,
             blob_versioned_hashes: tx.blob_versioned_hashes.clone(),
             max_fee_per_blob_gas: tx.max_fee_per_blob_gas,
@@ -183,10 +162,6 @@ impl TransactionWire {
 impl From<TransactionWire> for Transaction {
     fn from(value: TransactionWire) -> Self {
         Self {
-            txbytes: value.txbytes,
-            frames: value.frames,
-            signatures: value.signatures,
-            nonce_keys: value.nonce_keys,
             transaction_type: value.transaction_type,
             sender: value.sender,
             data: value.data,
@@ -201,7 +176,6 @@ impl From<TransactionWire> for Transaction {
             chain_id: value.chain_id,
             access_list: value.access_list,
             max_fee_per_gas: value.max_fee_per_gas,
-            max_fee: value.max_fee,
             max_priority_fee_per_gas: value.max_priority_fee_per_gas,
             blob_versioned_hashes: value.blob_versioned_hashes,
             max_fee_per_blob_gas: value.max_fee_per_blob_gas,
@@ -329,98 +303,5 @@ impl From<DecodedBlockWire> for DecodedBlock {
             withdrawals: value.withdrawals,
             block_access_list: value.block_access_list,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tx::{TestFrame, TestFrameSignature};
-    use alloy_primitives::hex;
-
-    #[test]
-    fn binary_frame_fixture_preserves_full_width_metadata_and_authoritative_wire_bytes() {
-        let raw = hex!(
-            "06e60180941111111111111111111111111111111111111111c9c8808080c280808080c0c28080c0"
-        );
-        let transaction = Transaction {
-            txbytes: Some(raw.to_vec().into()),
-            transaction_type: Some(U256::from(6)),
-            sender: Some(Address::repeat_byte(0x22)),
-            nonce_keys: Some(vec![U256::ONE, U256::MAX]),
-            max_fee_per_gas: Some(U256::MAX),
-            max_fee: Some(U256::MAX - U256::from(3)),
-            max_priority_fee_per_gas: Some(U256::MAX - U256::ONE),
-            max_fee_per_blob_gas: Some(U256::MAX - U256::from(2)),
-            frames: Some(vec![TestFrame {
-                mode: U256::MAX,
-                flags: U256::MAX,
-                target: Some(Bytes::from_static(&[1, 2, 3])),
-                gas_limit: U256::MAX,
-                state_gas_limit: U256::MAX,
-                value: U256::MAX,
-                data: vec![0x81; 256].into(),
-            }]),
-            signatures: vec![TestFrameSignature {
-                scheme: U256::MAX,
-                signer: Bytes::from_static(&[4, 5, 6]),
-                msg: B256::repeat_byte(0x33).as_slice().to_vec().into(),
-                signature: vec![0x82; 256].into(),
-            }],
-            ..Default::default()
-        };
-        let suite = BlockchainTest(BTreeMap::from([(
-            "frame-wire-authority".into(),
-            BlockchainTestCase {
-                genesis_block_header: BlockHeader::default(),
-                genesis_rlp: Some(Bytes::from_static(&[0xc0])),
-                blocks: vec![Block {
-                    transactions: Some(vec![transaction.clone()]),
-                    rlp_decoded: Some(DecodedBlock {
-                        transactions: vec![transaction],
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }],
-                post_state: None,
-                pre: State::default(),
-                block_hashes: vec![],
-                lastblockhash: B256::ZERO,
-                network: ForkSpec::Bogota,
-                seal_engine: SealEngine::NoProof,
-            },
-        )]));
-        let encoded = to_vec(&suite).unwrap();
-        let decoded = from_bytes(&encoded).unwrap();
-        assert_eq!(serde_json::to_value(&decoded).unwrap(), serde_json::to_value(&suite).unwrap());
-        let block = &decoded.0["frame-wire-authority"].blocks[0];
-        for transaction in [
-            &block.transactions.as_ref().unwrap()[0],
-            &block.rlp_decoded.as_ref().unwrap().transactions[0],
-        ] {
-            let recovered = crate::blockchaintest::execute::build_tx(transaction).unwrap();
-            assert_eq!(recovered.signer(), Address::repeat_byte(0x11));
-            let frame = recovered.inner().as_eip8141().unwrap();
-            assert_eq!(frame.nonce_keys, None);
-            assert_eq!(frame.fees.max_fee, U256::ZERO);
-            assert_eq!(frame.frames, vec![alloy_eips::eip8141::Frame::default()]);
-        }
-        let mut wrong_schema = encoded.clone();
-        wrong_schema[4] = 0;
-        assert!(from_bytes(&wrong_schema).is_err());
-        let mut trailing = encoded;
-        trailing.push(0);
-        assert!(from_bytes(&trailing).is_err());
-    }
-
-    #[test]
-    fn binary_format_is_checked_before_decoding_the_fixture_payload() {
-        for input in [&[][..], b"EV2F", b"EV2F\0\xff", b"EV2F\x01\xff", b"\xff\xff\xff\xff\xff"] {
-            assert!(matches!(from_bytes(input), Err(postcard::Error::DeserializeBadEncoding)));
-        }
-        assert!(matches!(
-            from_bytes(&BINARY_FORMAT),
-            Err(postcard::Error::DeserializeUnexpectedEnd)
-        ));
     }
 }

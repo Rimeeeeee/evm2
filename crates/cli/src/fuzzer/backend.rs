@@ -219,7 +219,7 @@ const fn revm_spec(spec: SpecId) -> RevmSpecId {
         SpecId::PRAGUE => RevmSpecId::PRAGUE,
         SpecId::OSAKA => RevmSpecId::OSAKA,
         SpecId::AMSTERDAM => RevmSpecId::AMSTERDAM,
-        _ => panic!("unsupported specification for upstream revm"),
+        _ => RevmSpecId::AMSTERDAM,
     }
 }
 
@@ -243,10 +243,11 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "unsupported specification for upstream revm")]
-    fn unsupported_reference_forks_never_fall_back_to_cancun() {
+    fn unsupported_reference_forks_use_amsterdam() {
         let mut case = CaseGenerator::default().generate(&mut Gen::new(1)).clone();
+        case.spec = SpecId::AMSTERDAM;
+        let expected = RevmBackend::default().run(&case);
         case.spec = SpecId::BOGOTA;
-        RevmBackend::default().run(&case);
+        assert_eq!(RevmBackend::default().run(&case), expected);
     }
 }

@@ -18,7 +18,7 @@ use evm2::{
     bytecode::Bytecode,
     env::BlockEnvExt,
     ethereum::{TxEnvelope, eip8141::FrameGas, ethereum_tx_registry},
-    evm::{AccountInfo, Bal, BlockAccessIndex, Database, Db, InMemoryDB},
+    evm::{AccountInfo, Bal, BalError, BlockAccessIndex, Database, Db, InMemoryDB},
     interpreter::{GasTracker, InstrStop},
     registry::HandlerError,
     version::GasId,
@@ -427,6 +427,30 @@ fn bal_positioned_frames_preserve_prefix_writes_after_assertion_failure() {
         rebuilt.commit(index, detached.pending_state);
     }
     assert_eq!(rebuilt, *bal);
+
+    let slot = nonce_slot(SENDER, U256::from(7));
+    let mut incomplete = (*bal).clone();
+    assert!(
+        incomplete
+            .accounts
+            .get_mut(&NONCE_MANAGER)
+            .unwrap()
+            .storage
+            .storage
+            .remove(&slot)
+            .is_some()
+    );
+    let mut positioned = evm(&body, &assertion);
+    positioned.state_mut().set_bal(Arc::new(incomplete));
+    positioned.state_mut().set_bal_index(BlockAccessIndex::new(1));
+    let error = positioned.transact(&transactions[0]).map(evm2::ExecutedTx::discard).unwrap_err();
+    let HandlerError::Database(error) = error else { panic!("expected BAL input error") };
+    assert!(!error.is_fatal());
+    assert_eq!(
+        error.downcast_ref::<BalError>(),
+        Some(&BalError::SlotNotFound { address: NONCE_MANAGER, slot })
+    );
+
     assert_eq!(
         serial
             .state_mut()

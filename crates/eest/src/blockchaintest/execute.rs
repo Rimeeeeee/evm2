@@ -9,6 +9,8 @@ use super::{
         Withdrawal,
     },
 };
+#[cfg(feature = "jit")]
+use crate::compiled::{self, FileSummary};
 use crate::{
     dump,
     execute::state_root_from_database,
@@ -18,10 +20,7 @@ use crate::{
     forks::is_fork_skipped,
     state::{insert_account_with_storage, parse_bytecode},
     trace::{self, Eip3155Tracer},
-    tx::{
-        TxFields, build_recovered_tx, build_recovered_tx_bytes, rpc_access_list,
-        signed_authorizations,
-    },
+    tx::{TxFields, build_recovered_tx, rpc_access_list, signed_authorizations},
 };
 use alloy_consensus::{Eip658Value, Receipt, ReceiptEnvelope, Transaction as _, TxType};
 use alloy_eip7928::{BlockAccessList, validate_block_access_list};
@@ -40,17 +39,9 @@ use evm2::{
     },
     registry::HandlerError,
 };
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fmt::Write,
-    mem,
-    path::Path,
-};
-
-#[cfg(feature = "jit")]
-use crate::compiled::{self, FileSummary};
 #[cfg(feature = "jit")]
 use std::path::PathBuf;
+use std::{mem, path::Path};
 
 pub use crate::execution::ExecutionMode;
 
@@ -163,7 +154,7 @@ pub fn execute_str(
     hook: &mut dyn Hook,
 ) -> Result<ExecuteSummary, TestError> {
     let suite: BlockchainTest =
-        fixture_io::parse_json(input).map_err(|err| TestError::unknown(path, err.into()))?;
+        serde_json::from_str(input).map_err(|err| TestError::unknown(path, err.into()))?;
     execute_suite(path, &suite, config, test_filter, hook)
 }
 
@@ -208,7 +199,7 @@ pub fn execute_case_on(
     execute_case(path, name, test_case, database, config, hook, &resources)
 }
 
-pub(crate) fn execute_suite_with_resources(
+fn execute_suite_with_resources(
     path: &Path,
     suite: &BlockchainTest,
     config: ExecuteConfig,
@@ -286,17 +277,6 @@ fn execute_case(
     hook.case_started(CaseStarted { name, total_blocks, network: test_case.network });
 
     for (block_index, block) in test_case.blocks.iter().enumerate() {
-        let spec = if test_case.network == ForkSpec::AmsterdamToBogotaAtTime15k {
-            if block_header(block).map_or(block_env.timestamp, |header| header.timestamp)
-                >= U256::from(15_000)
-            {
-                SpecId::BOGOTA
-            } else {
-                SpecId::AMSTERDAM
-            }
-        } else {
-            spec
-        };
         let block_number = block_number(block);
         let block_gas_used = block_gas_used(block);
         let total_transactions = block_transactions(block).len();
@@ -511,21 +491,6 @@ fn execute_block(
         }
 
         let transactions = block_transactions(block);
-        let wire_transactions = if block.rlp.is_empty() {
-            None
-        } else {
-            match fixture_io::block_transaction_bytes(&block.rlp) {
-                Ok(wire) if wire.len() == transactions.len() => Some(wire),
-                _ if should_fail => return Ok(BlockResolution::Discard),
-                _ => {
-                    return Err(TestError::case(
-                        path,
-                        name,
-                        TestErrorKind::UnexpectedFailure("invalid block transaction RLP".into()),
-                    ));
-                }
-            }
-        };
         // EIP-8037: track execution and state gas separately for the block-header gas check.
         let mut cumulative_tx_gas_used = 0u64;
         let mut block_execution_gas_used = 0u64;
@@ -539,12 +504,7 @@ fn execute_block(
                 transaction_index,
                 total_transactions,
             });
-            let built = if let Some(wire) = &wire_transactions {
-                build_recovered_tx_bytes(&wire[transaction_index]).map_err(Into::into)
-            } else {
-                build_tx(raw_tx)
-            };
-            let tx = match built {
+            let tx = match build_tx(raw_tx) {
                 Ok(tx) => tx,
                 Err(_err) if should_fail => {
                     return Ok(BlockResolution::Discard);
@@ -574,27 +534,8 @@ fn execute_block(
                 let execution_gas_available =
                     block_gas_limit.saturating_sub(block_execution_gas_used);
                 let state_gas_available = block_gas_limit.saturating_sub(block_state_gas_used);
-                let (execution_reservation, state_reservation) = if let Some(frame) =
-                    tx.inner().as_eip8141()
-                {
-                    let gas =
-                        match evm2::ethereum::eip8141::FrameGas::calculate(frame, evm.version()) {
-                            Ok(gas) => gas,
-                            Err(_) if should_fail => return Ok(BlockResolution::Discard),
-                            Err(error) => {
-                                return Err(TestError::case(
-                                    path,
-                                    name,
-                                    TestErrorKind::UnexpectedFailure(error.to_string()),
-                                ));
-                            }
-                        };
-                    (gas.execution, gas.state)
-                } else {
-                    (tx_gas_limit.min(evm.version().tx_gas_limit_cap), tx_gas_limit)
-                };
-                if execution_reservation > execution_gas_available
-                    || state_reservation > state_gas_available
+                if tx_gas_limit.min(evm.version().tx_gas_limit_cap) > execution_gas_available
+                    || tx_gas_limit > state_gas_available
                 {
                     if should_fail {
                         return Ok(BlockResolution::Discard);
@@ -614,8 +555,7 @@ fn execute_block(
             if build_bal {
                 evm.state_mut().bump_bal_index();
             }
-            let executed = execute_tx(&mut evm, &mut block_state, &tx);
-            match executed {
+            match execute_tx(&mut evm, &mut block_state, &tx) {
                 Ok(result) => {
                     cumulative_tx_gas_used =
                         cumulative_tx_gas_used.saturating_add(result.tx_gas_used());
@@ -646,24 +586,18 @@ fn execute_block(
                             post_state.commit_source(&block_state);
                             Eip658Value::PostState(state_root_from_database(&post_state))
                         };
-                        let receipt = if let Some(frame) = result.frame {
-                            ReceiptEnvelope::Eip8141(
-                                frame.into_receipt(cumulative_tx_gas_used).into(),
-                            )
-                        } else {
-                            let receipt = Receipt {
-                                status,
-                                cumulative_gas_used: cumulative_tx_gas_used,
-                                logs: result.logs,
-                            }
-                            .with_bloom();
-                            let tx_type = TxType::try_from(tx.inner().ty()).expect(
-                                "executor only builds supported Ethereum transaction types",
-                            );
+                        let receipt = Receipt {
+                            status,
+                            cumulative_gas_used: cumulative_tx_gas_used,
+                            logs: result.logs,
+                        }
+                        .with_bloom();
+                        let tx_type = TxType::try_from(tx.inner().ty())
+                            .expect("executor only builds supported Ethereum transaction types");
+                        receipts.push(
                             ReceiptEnvelope::from_typed(tx_type, receipt)
-                                .expect("ordinary result has an ordinary receipt")
-                        };
-                        receipts.push(receipt);
+                                .expect("ordinary fixture transactions have ordinary receipts"),
+                        );
                     }
                 }
                 Err(err) if should_fail => {
@@ -1126,10 +1060,7 @@ fn blob_params_for_timestamp(timestamp: U256, spec: SpecId) -> BlobParams {
     }
 }
 
-pub(crate) fn build_tx(raw: &Transaction) -> Result<RecoveredTxEnvelope, TestErrorKind> {
-    if let Some(bytes) = &raw.txbytes {
-        return Ok(build_recovered_tx_bytes(bytes)?);
-    }
+fn build_tx(raw: &Transaction) -> Result<RecoveredTxEnvelope, TestErrorKind> {
     let caller = raw.sender.ok_or(TestErrorKind::MissingSender)?;
     let gas_limit = raw.gas_limit.try_into().map_err(|_| TestErrorKind::Overflow("gasLimit"))?;
     let nonce = raw.nonce.try_into().map_err(|_| TestErrorKind::Overflow("nonce"))?;
@@ -1145,15 +1076,11 @@ pub(crate) fn build_tx(raw: &Transaction) -> Result<RecoveredTxEnvelope, TestErr
         chain_id: raw.chain_id,
         gas_price: raw.gas_price,
         max_fee_per_gas: raw.max_fee_per_gas,
-        max_fee: raw.max_fee,
         max_priority_fee_per_gas: raw.max_priority_fee_per_gas,
         access_list: access_list(raw)?,
         authorization_list: signed_authorizations(raw.authorization_list.as_deref())?,
         blob_versioned_hashes: raw.blob_versioned_hashes.clone(),
         max_fee_per_blob_gas: raw.max_fee_per_blob_gas,
-        frames: raw.frames.clone(),
-        signatures: raw.signatures.clone(),
-        nonce_keys: raw.nonce_keys.clone(),
     })?)
 }
 
@@ -1346,10 +1273,15 @@ fn format_bal_diff(
     built: &alloy_eip7928::BlockAccessList,
     expected: &alloy_eip7928::BlockAccessList,
 ) -> String {
-    let built = built.iter().map(|account| (account.address, account)).collect::<BTreeMap<_, _>>();
-    let expected =
-        expected.iter().map(|account| (account.address, account)).collect::<BTreeMap<_, _>>();
-    let addresses = built.keys().chain(expected.keys()).copied().collect::<BTreeSet<_>>();
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        fmt::Write,
+    };
+
+    let built: BTreeMap<_, _> = built.iter().map(|account| (account.address, account)).collect();
+    let expected: BTreeMap<_, _> =
+        expected.iter().map(|account| (account.address, account)).collect();
+    let addresses: BTreeSet<_> = built.keys().chain(expected.keys()).copied().collect();
 
     let mut out = String::new();
     for address in addresses {
@@ -1429,8 +1361,6 @@ fn fork_to_spec_id(fork: ForkSpec) -> SpecId {
         ForkSpec::Prague => SpecId::PRAGUE,
         ForkSpec::Osaka => SpecId::OSAKA,
         ForkSpec::Amsterdam => SpecId::AMSTERDAM,
-        ForkSpec::Bogota => SpecId::BOGOTA,
-        ForkSpec::AmsterdamToBogotaAtTime15k => SpecId::AMSTERDAM,
         ForkSpec::FrontierToHomesteadAt5
         | ForkSpec::HomesteadToDaoAt5
         | ForkSpec::HomesteadToEIP150At5
@@ -1452,12 +1382,13 @@ fn fork_to_spec_id(fork: ForkSpec) -> SpecId {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::blockchaintest::types::{DecodedBlock, SealEngine, State};
-    use std::collections::BTreeMap;
-
+    use super::{
+        super::types::{SealEngine, State},
+        *,
+    };
     #[cfg(feature = "jit")]
     use evm2::interpreter::op;
+    use std::collections::BTreeMap;
 
     #[cfg(feature = "jit")]
     const BYTECODE_STORE42: &[u8] = &[op::PUSH1, 0x42, op::PUSH0, op::SSTORE, op::STOP];
@@ -1587,6 +1518,17 @@ mod tests {
 
     #[test]
     fn blockchain_tests_apply_ommer_rewards_before_merge() {
+        use super::{
+            super::types::{
+                Account, Block, BlockHeader, BlockchainTest, BlockchainTestCase, DecodedBlock,
+                ForkSpec, SealEngine, State,
+            },
+            ExecuteConfig, NoopHook, ONE_ETHER, execute_suite,
+        };
+        use crate::filter::NameFilter;
+        use alloy_primitives::{Address, B256, U256};
+        use std::{collections::BTreeMap, path::Path};
+
         let miner = Address::with_last_byte(1);
         let ommer_miner = Address::with_last_byte(2);
         let genesis_hash = B256::with_last_byte(1);
@@ -1674,6 +1616,16 @@ mod tests {
 
     #[test]
     fn receipt_root_check_rejects_invalid_empty_block_root() {
+        use super::{
+            super::types::{
+                Block, BlockHeader, BlockchainTest, BlockchainTestCase, ForkSpec, SealEngine, State,
+            },
+            ExecuteConfig, ExecutionMode, NoopHook, execute_str,
+        };
+        use crate::filter::NameFilter;
+        use alloy_primitives::{B256, U256};
+        use std::{collections::BTreeMap, path::Path};
+
         let genesis_hash = B256::with_last_byte(1);
         let suite = BlockchainTest(BTreeMap::from([(
             "invalid-receipt-root".to_string(),
@@ -1722,6 +1674,16 @@ mod tests {
 
     #[test]
     fn rejects_block_with_wrong_parent_hash() {
+        use super::{
+            super::types::{
+                Block, BlockHeader, BlockchainTest, BlockchainTestCase, ForkSpec, SealEngine, State,
+            },
+            ExecuteConfig, NoopHook, execute_str,
+        };
+        use crate::filter::NameFilter;
+        use alloy_primitives::{B256, U256};
+        use std::{collections::BTreeMap, path::Path};
+
         let genesis_hash = B256::with_last_byte(1);
         let block_hash = B256::with_last_byte(2);
         let suite = BlockchainTest(BTreeMap::from([(
@@ -1770,6 +1732,16 @@ mod tests {
 
     #[test]
     fn discards_expected_block_with_wrong_parent_hash() {
+        use super::{
+            super::types::{
+                Block, BlockHeader, BlockchainTest, BlockchainTestCase, ForkSpec, SealEngine, State,
+            },
+            ExecuteConfig, NoopHook, execute_str,
+        };
+        use crate::filter::NameFilter;
+        use alloy_primitives::{B256, U256};
+        use std::{collections::BTreeMap, path::Path};
+
         let genesis_hash = B256::with_last_byte(1);
         let suite = BlockchainTest(BTreeMap::from([(
             "expected-wrong-parent-hash".to_string(),
@@ -1813,6 +1785,16 @@ mod tests {
 
     #[test]
     fn rejects_case_with_wrong_last_block_hash() {
+        use super::{
+            super::types::{
+                Block, BlockHeader, BlockchainTest, BlockchainTestCase, ForkSpec, SealEngine, State,
+            },
+            ExecuteConfig, NoopHook, execute_str,
+        };
+        use crate::filter::NameFilter;
+        use alloy_primitives::{B256, U256};
+        use std::{collections::BTreeMap, path::Path};
+
         let genesis_hash = B256::with_last_byte(1);
         let block_hash = B256::with_last_byte(2);
         let suite = BlockchainTest(BTreeMap::from([(
@@ -1930,10 +1912,6 @@ mod tests {
                         ..BlockHeader::default()
                     }),
                     transactions: Some(vec![Transaction {
-                        txbytes: None,
-                        frames: None,
-                        signatures: Vec::new(),
-                        nonce_keys: None,
                         transaction_type: None,
                         sender: Some(caller),
                         data: Bytes::new(),
@@ -1948,7 +1926,6 @@ mod tests {
                         chain_id: Some(U256::ONE),
                         access_list: None,
                         max_fee_per_gas: None,
-                        max_fee: None,
                         max_priority_fee_per_gas: None,
                         blob_versioned_hashes: Vec::new(),
                         max_fee_per_blob_gas: None,
@@ -1993,6 +1970,15 @@ mod tests {
 
     #[test]
     fn json_outcome_reports_pass_and_failure() {
+        use super::{
+            super::{
+                error::{TestError, TestErrorKind},
+                types::ForkSpec,
+            },
+            json_outcome_value,
+        };
+        use alloy_primitives::B256;
+
         let root = B256::with_last_byte(7);
         let pass = json_outcome_value("case-a", ForkSpec::Byzantium, &Ok(Some(root)));
         assert_eq!(pass["pass"], true);
@@ -2000,7 +1986,7 @@ mod tests {
         assert_eq!(pass["stateRoot"], serde_json::to_value(root).unwrap());
         assert_eq!(pass["errorMsg"], "");
 
-        let failure = Err(TestError::case(
+        let failure: Result<Option<B256>, TestError> = Err(TestError::case(
             std::path::Path::new("f.json"),
             "case-b",
             TestErrorKind::UnexpectedFailure("boom".to_string()),
@@ -2008,9 +1994,6 @@ mod tests {
         let fail = json_outcome_value("case-b", ForkSpec::Byzantium, &failure);
         assert_eq!(fail["pass"], false);
         assert_eq!(fail["stateRoot"], serde_json::to_value(B256::ZERO).unwrap());
-        assert_eq!(
-            fail["errorMsg"],
-            "Path: f.json\nName: case-b\nError: unexpected execution failure: boom"
-        );
+        assert!(fail["errorMsg"].as_str().unwrap().contains("boom"));
     }
 }

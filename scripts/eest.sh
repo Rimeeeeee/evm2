@@ -5,14 +5,10 @@
 #   scripts/eest.sh <path> [extra cargo-nextest args...]
 #
 # <path> may be absolute or relative to the current directory. Every JSON
-# fixture found under it runs in the explicit additional suites, with state vs
-# blockchain kind detected per file. Available modes are additional,
-# additional::inspected, and (with --features jit) additional::jit/additional::aot.
-# Each selected mode shares one runtime across the full folder, without normal
-# ignore lists or compiled smoke subsets. Extra cargo-nextest arguments can select
-# a backend, for example:
-#   scripts/eest.sh ./test-fixtures/bogota -E 'test(=additional)'
-#   scripts/eest.sh ./test-fixtures/bogota --features jit -E 'test(=additional::jit)'
+# fixture found under it runs as one auto-detecting suite (state vs blockchain
+# kind is detected per file), so no test-name filter is needed. Extra arguments
+# are forwarded to `cargo nextest run`, for example:
+#   scripts/eest.sh ./test-fixtures/devnet/state_tests -E 'test(precompile)'
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then

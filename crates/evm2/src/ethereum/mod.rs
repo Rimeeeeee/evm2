@@ -8,7 +8,6 @@ pub mod eip2930;
 pub mod eip4844;
 /// EIP-7702 transaction handler.
 pub mod eip7702;
-pub mod eip7906;
 pub mod eip8141;
 mod lazy_eip7702;
 /// Legacy transaction handler.

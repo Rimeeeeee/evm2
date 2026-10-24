@@ -3,15 +3,14 @@ use super::{
     execute::{ExecuteConfig, ExecutionMode, execute_test_suite},
 };
 use crate::harness::{TestSuite, run_json_harnesses};
+#[cfg(feature = "jit")]
+use crate::{
+    blockchaintest::execute::execute_test_suites, execution::CompiledMode, harness::compiled_roots,
+};
 use libtest_mimic::Failed;
 use std::{
     path::{Path, PathBuf},
     process::ExitCode,
-};
-
-#[cfg(feature = "jit")]
-use crate::{
-    blockchaintest::execute::execute_test_suites, execution::CompiledMode, harness::compiled_roots,
 };
 
 /// Runs the cargo-nextest blockchain test harness.
@@ -30,7 +29,6 @@ pub(crate) fn suites() -> Vec<TestSuite> {
             should_ignore,
             run_file: run_file_jit,
             run_files: Some(run_files_jit),
-            exhaustive: false,
         });
         suites.push(TestSuite {
             name: "blockchain_tests::aot",
@@ -39,7 +37,6 @@ pub(crate) fn suites() -> Vec<TestSuite> {
             should_ignore,
             run_file: run_file_aot,
             run_files: Some(run_files_aot),
-            exhaustive: false,
         });
         suites
     }
@@ -58,7 +55,6 @@ pub(crate) fn suite() -> TestSuite {
         should_ignore,
         run_file,
         run_files: None,
-        exhaustive: false,
     }
 }
 

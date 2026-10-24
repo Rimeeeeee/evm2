@@ -6,7 +6,7 @@ use alloy_consensus::{
     EthereumTxEnvelope, Header, TxEip4844,
     transaction::{Transaction as _, to_eip155_value},
 };
-use alloy_eips::{Encodable2718, Typed2718, eip2930::AccessList, eip7702::SignedAuthorization};
+use alloy_eips::{Typed2718, eip2930::AccessList, eip7702::SignedAuthorization};
 use alloy_primitives::{Address, B256, Bytes, FixedBytes, U256};
 use evm2::SpecId;
 use evm2_eest::{
@@ -96,7 +96,6 @@ fn network(capture: &CapturedCase) -> Result<ForkSpec, CaptureError> {
         SpecId::PRAGUE => Ok(ForkSpec::Prague),
         SpecId::OSAKA => Ok(ForkSpec::Osaka),
         SpecId::AMSTERDAM => Ok(ForkSpec::Amsterdam),
-        SpecId::BOGOTA => Ok(ForkSpec::Bogota),
         _ => Err(CaptureError::UnsupportedSpec(first.spec_id)),
     }
 }
@@ -157,7 +156,7 @@ fn export_block(input: &CapturedBlock) -> Result<Block, CaptureError> {
                 .iter()
                 .zip(input.transactions.iter())
                 .map(|(tx, input_tx)| export_transaction(tx, input_tx.signer))
-                .collect(),
+                .collect::<Result<_, _>>()?,
         ),
         uncle_headers: Some(block.body.ommers.iter().map(export_header).collect()),
         withdrawals: Some(
@@ -213,28 +212,13 @@ fn export_header(header: &Header) -> BlockHeader {
     }
 }
 
-fn export_transaction(tx: &EthereumTxEnvelope<TxEip4844>, signer: Address) -> Transaction {
-    if let Some(frame) = tx.as_eip8141() {
-        return Transaction {
-            txbytes: Some(tx.encoded_2718().into()),
-            transaction_type: Some(U256::from(6)),
-            sender: Some(frame.sender),
-            nonce: U256::from(frame.nonce),
-            chain_id: Some(U256::from(frame.chain_id)),
-            max_fee: Some(frame.fees.max_fee),
-            max_priority_fee_per_gas: Some(frame.fees.max_priority_fee_per_gas),
-            blob_versioned_hashes: frame.blob_versioned_hashes.clone(),
-            hash: Some(*tx.tx_hash()),
-            ..Default::default()
-        };
-    }
-    let signature = tx.signature().expect("frame envelopes were handled above");
+fn export_transaction(
+    tx: &EthereumTxEnvelope<TxEip4844>,
+    signer: Address,
+) -> Result<Transaction, CaptureError> {
     let tx_type = tx.ty();
-    Transaction {
-        txbytes: None,
-        frames: None,
-        signatures: Vec::new(),
-        nonce_keys: None,
+    let signature = tx.signature().ok_or(CaptureError::UnsupportedTransactionType(tx_type))?;
+    Ok(Transaction {
         transaction_type: Some(U256::from(tx_type)),
         sender: Some(signer),
         data: tx.input().clone(),
@@ -249,13 +233,12 @@ fn export_transaction(tx: &EthereumTxEnvelope<TxEip4844>, signer: Address) -> Tr
         chain_id: tx.chain_id().map(U256::from),
         access_list: tx.access_list().map(export_access_list),
         max_fee_per_gas: tx.tx_type().is_dynamic_fee().then(|| U256::from(tx.max_fee_per_gas())),
-        max_fee: None,
         max_priority_fee_per_gas: tx.max_priority_fee_per_gas().map(U256::from),
         blob_versioned_hashes: tx.blob_versioned_hashes().unwrap_or_default().to_vec(),
         max_fee_per_blob_gas: tx.max_fee_per_blob_gas().map(U256::from),
         authorization_list: tx.authorization_list().map(export_authorization_list),
         hash: Some(*tx.tx_hash()),
-    }
+    })
 }
 
 fn signature_v(tx_type: u8, y_parity: bool, chain_id: Option<u64>) -> u128 {
@@ -287,48 +270,4 @@ fn export_authorization_list(authorizations: &[SignedAuthorization]) -> Vec<Test
             }),
         })
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use alloy_consensus::TxEip8141;
-    use alloy_eips::{
-        Decodable2718,
-        eip8141::{Frame, FrameSignature},
-    };
-    use alloy_primitives::Sealable;
-
-    #[test]
-    fn frame_export_replays_canonical_wire_with_explicit_sender_and_full_width_fees() {
-        let sender = Address::with_last_byte(0x42);
-        let mut payload = TxEip8141 {
-            sender,
-            nonce: 7,
-            nonce_keys: Some(vec![U256::ONE, U256::MAX]),
-            frames: vec![Frame::default()],
-            signatures: vec![FrameSignature {
-                signature: Bytes::from_static(&[1, 2, 3]),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        payload.fees.max_fee = U256::MAX;
-        let envelope = EthereumTxEnvelope::<TxEip4844>::Eip8141(payload.clone().seal_slow());
-        let exported = export_transaction(&envelope, Address::ZERO);
-        assert_eq!(exported.sender, Some(sender));
-        assert_eq!(exported.max_fee, Some(U256::MAX));
-        assert_eq!(exported.max_fee_per_gas, None);
-        assert_eq!(exported.max_fee_per_blob_gas, None);
-        assert_eq!(exported.txbytes.as_ref().unwrap().as_ref(), envelope.encoded_2718().as_slice());
-        let encoded = serde_json::to_vec(&exported).unwrap();
-        let replay = serde_json::from_slice::<Transaction>(&encoded).unwrap();
-        let decoded =
-            EthereumTxEnvelope::<TxEip4844>::decode_2718(&mut replay.txbytes.unwrap().as_ref())
-                .unwrap();
-        let EthereumTxEnvelope::Eip8141(frame) = decoded else {
-            panic!("expected frame transaction")
-        };
-        assert_eq!(frame.inner(), &payload);
-    }
 }

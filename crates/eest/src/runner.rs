@@ -3,11 +3,10 @@ use crate::{
     execute::{ExecuteConfig, ExecutionMode, execute_test_suite},
     harness::{TestSuite, descend_all, run_json_harnesses},
 };
-use libtest_mimic::Failed;
-use std::{path::PathBuf, process::ExitCode};
-
 #[cfg(feature = "jit")]
 use crate::{execute::execute_test_suites, execution::CompiledMode, harness::compiled_roots};
+use libtest_mimic::Failed;
+use std::{path::PathBuf, process::ExitCode};
 
 /// Runs the cargo-nextest state test harness.
 pub fn run() -> ExitCode {
@@ -25,7 +24,6 @@ pub(crate) fn suites() -> Vec<TestSuite> {
             should_ignore,
             run_file: run_file_jit,
             run_files: Some(run_files_jit),
-            exhaustive: false,
         });
         suites.push(TestSuite {
             name: "statetests::aot",
@@ -34,7 +32,6 @@ pub(crate) fn suites() -> Vec<TestSuite> {
             should_ignore,
             run_file: run_file_aot,
             run_files: Some(run_files_aot),
-            exhaustive: false,
         });
         suites
     }
@@ -53,7 +50,6 @@ fn suite() -> TestSuite {
         should_ignore,
         run_file,
         run_files: None,
-        exhaustive: false,
     }
 }
 

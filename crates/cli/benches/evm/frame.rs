@@ -52,7 +52,7 @@ enum Check {
 
 pub(crate) fn bench(c: &mut Criterion) {
     let shard = env::var("EVM2_BENCH_SHARD").ok();
-    if shard.as_deref() == Some("jit-mainnet") {
+    if shard.as_deref() == Some("jit-mainnet") || env::var_os("EVM2_BENCH_REVM").is_some() {
         return;
     }
     let mut cases = Vec::new();

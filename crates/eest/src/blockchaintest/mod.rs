@@ -2,7 +2,7 @@
 
 pub(crate) mod env;
 mod error;
-pub(crate) mod execute;
+mod execute;
 mod hook;
 mod runner;
 mod types;
@@ -17,7 +17,7 @@ pub use hook::{
     TransactionFinished, TransactionStarted,
 };
 pub use runner::run;
-pub(crate) use runner::suites;
+pub(crate) use runner::{IGNORED_TESTS, suites};
 pub use types::{
     Account, Block, BlockHash, BlockHeader, BlockchainTest, BlockchainTestCase, DecodedBlock,
     ForkSpec, SealEngine, State, Transaction, Withdrawal,

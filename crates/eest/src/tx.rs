@@ -1,15 +1,5 @@
-use alloy_consensus::{
-    EthereumTxEnvelope, TxEip4844, TxEip8141, TypedTransaction,
-    transaction::{Recovered, SignerRecoverable},
-};
-use alloy_eips::{
-    Decodable2718,
-    eip7702::SignedAuthorization,
-    eip8141::{
-        Frame, FrameAddress, FrameLimits, FrameMode, FrameSignature, SignatureMessage,
-        SignatureScheme, TransactionFees,
-    },
-};
+use alloy_consensus::{TypedTransaction, transaction::Recovered};
+use alloy_eips::eip7702::SignedAuthorization;
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256};
 use alloy_rpc_types_eth::{
     AccessList as RpcAccessList, AccessListItem as RpcAccessListItem, TransactionInput,
@@ -34,40 +24,6 @@ pub struct AccessListItem {
 pub struct TestAuthorization {
     /// Raw authorization JSON.
     pub value: serde_json::Value,
-}
-
-/// A frame in the pinned execution-specs fixture schema. Limits remain full-width until conversion.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TestFrame {
-    /// Frame execution mode.
-    pub mode: U256,
-    /// Approval scope and atomic link flags.
-    pub flags: U256,
-    /// Empty or explicit target bytes.
-    pub target: Option<Bytes>,
-    /// Execution budget.
-    pub gas_limit: U256,
-    /// State budget.
-    pub state_gas_limit: U256,
-    /// Transfer value.
-    pub value: U256,
-    /// Frame input.
-    pub data: Bytes,
-}
-
-/// Raw signature metadata in the pinned execution-specs fixture schema.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TestFrameSignature {
-    /// Signature scheme, retained full-width until validation.
-    pub scheme: U256,
-    /// Empty or explicit signer bytes.
-    pub signer: Bytes,
-    /// Empty or explicit signed digest bytes.
-    pub msg: Bytes,
-    /// Protocol signature or arbitrary witness.
-    pub signature: Bytes,
 }
 
 impl Serialize for TestAuthorization {
@@ -101,7 +57,7 @@ fn normalize_authorization_value(value: &mut serde_json::Value) {
 
 /// Error while building a consensus transaction from fixture fields.
 #[derive(Debug, thiserror::Error)]
-pub enum TxBuildError {
+pub(crate) enum TxBuildError {
     /// Numeric value overflowed the target type.
     #[error("value overflows {0}")]
     Overflow(&'static str),
@@ -135,8 +91,6 @@ pub(crate) struct TxFields {
     pub(crate) gas_price: Option<U256>,
     /// EIP-1559 max fee.
     pub(crate) max_fee_per_gas: Option<U256>,
-    /// EIP-8141 total signed fee budget.
-    pub(crate) max_fee: Option<U256>,
     /// EIP-1559 priority fee.
     pub(crate) max_priority_fee_per_gas: Option<U256>,
     /// EIP-2930 access list.
@@ -147,26 +101,10 @@ pub(crate) struct TxFields {
     pub(crate) blob_versioned_hashes: Vec<B256>,
     /// EIP-4844 max fee per blob gas.
     pub(crate) max_fee_per_blob_gas: Option<U256>,
-    /// Ordered native frame payload, if type 6.
-    pub(crate) frames: Option<Vec<TestFrame>>,
-    /// Signature entries for a frame transaction.
-    pub(crate) signatures: Vec<TestFrameSignature>,
-    /// Optional keyed nonce schema.
-    pub(crate) nonce_keys: Option<Vec<U256>>,
 }
 
 /// Builds an evm2 recovered transaction envelope from common fixture fields.
 pub(crate) fn build_recovered_tx(fields: TxFields) -> Result<RecoveredTxEnvelope, TxBuildError> {
-    let caller = fields.caller;
-    let tx = if fields.tx_type == Some(6) || fields.frames.is_some() {
-        TypedTransaction::Eip8141(build_frame_tx(fields)?)
-    } else {
-        build_request_tx(fields)?
-    };
-    Ok(recovered_envelope(tx, caller))
-}
-
-fn build_request_tx(fields: TxFields) -> Result<TypedTransaction, TxBuildError> {
     let mut request = TransactionRequest::default()
         .from(fields.caller)
         .gas_limit(fields.gas_limit)
@@ -222,97 +160,9 @@ fn build_request_tx(fields: TxFields) -> Result<TypedTransaction, TxBuildError> 
         request.blob_versioned_hashes = Some(fields.blob_versioned_hashes);
     }
 
-    request.build_consensus_tx().map_err(|err| TxBuildError::BuildTransaction(err.error))
-}
-
-fn build_frame_tx(fields: TxFields) -> Result<TxEip8141, TxBuildError> {
-    let frames = fields
-        .frames
-        .ok_or_else(|| TxBuildError::BuildTransaction("type 6 requires frames".into()))?
-        .into_iter()
-        .map(Frame::try_from)
-        .collect::<Result<_, TxBuildError>>()?;
-    let signatures =
-        fields.signatures.into_iter().map(FrameSignature::try_from).collect::<Result<_, _>>()?;
-    Ok(TxEip8141 {
-        chain_id: fields
-            .chain_id
-            .unwrap_or(U256::ONE)
-            .try_into()
-            .map_err(|_| TxBuildError::Overflow("chainId"))?,
-        nonce: fields.nonce,
-        nonce_keys: fields.nonce_keys,
-        sender: fields.caller,
-        frames,
-        signatures,
-        fees: TransactionFees {
-            max_fee: fields.max_fee.unwrap_or_default(),
-            max_priority_fee_per_gas: fields.max_priority_fee_per_gas.unwrap_or_default(),
-        },
-        blob_versioned_hashes: fields.blob_versioned_hashes,
-    })
-}
-
-impl TryFrom<TestFrame> for Frame {
-    type Error = TxBuildError;
-
-    fn try_from(frame: TestFrame) -> Result<Self, Self::Error> {
-        Ok(Self {
-            mode: u8::try_from(frame.mode)
-                .ok()
-                .and_then(FrameMode::try_from_u8)
-                .ok_or_else(|| TxBuildError::BuildTransaction("invalid frame mode".into()))?,
-            target: FrameAddress::try_from(
-                frame.target.as_ref().map_or(&[][..], |target| target.as_ref()),
-            )
-            .map_err(|error| TxBuildError::BuildTransaction(error.to_string()))?,
-            flags: frame.flags.try_into().map_err(|_| TxBuildError::Overflow("frame flags"))?,
-            limits: FrameLimits {
-                execution: frame
-                    .gas_limit
-                    .try_into()
-                    .map_err(|_| TxBuildError::Overflow("frame execution gas"))?,
-                state: frame
-                    .state_gas_limit
-                    .try_into()
-                    .map_err(|_| TxBuildError::Overflow("frame state gas"))?,
-            },
-            value: frame.value,
-            data: frame.data,
-        })
-    }
-}
-
-impl TryFrom<TestFrameSignature> for FrameSignature {
-    type Error = TxBuildError;
-
-    fn try_from(signature: TestFrameSignature) -> Result<Self, Self::Error> {
-        Ok(Self {
-            scheme: u8::try_from(signature.scheme)
-                .ok()
-                .and_then(|scheme| SignatureScheme::try_from(scheme).ok())
-                .ok_or_else(|| TxBuildError::BuildTransaction("invalid signature scheme".into()))?,
-            signer: FrameAddress::try_from(signature.signer.as_ref())
-                .map_err(|error| TxBuildError::BuildTransaction(error.to_string()))?,
-            msg: SignatureMessage::try_from(signature.msg.as_ref())
-                .map_err(|error| TxBuildError::BuildTransaction(error.to_string()))?,
-            signature: signature.signature,
-        })
-    }
-}
-
-/// Decodes canonical transaction bytes, including self-authorized frame envelopes.
-pub(crate) fn build_recovered_tx_bytes(bytes: &[u8]) -> Result<RecoveredTxEnvelope, TxBuildError> {
-    let mut input = bytes;
-    let envelope = EthereumTxEnvelope::<TxEip4844>::decode_2718(&mut input)
-        .map_err(|error| TxBuildError::BuildTransaction(error.to_string()))?;
-    if !input.is_empty() {
-        return Err(TxBuildError::BuildTransaction("trailing transaction bytes".into()));
-    }
-    let sender = envelope
-        .recover_signer()
-        .map_err(|error| TxBuildError::BuildTransaction(error.to_string()))?;
-    Ok(Recovered::new_unchecked(envelope.into(), sender))
+    let tx =
+        request.build_consensus_tx().map_err(|err| TxBuildError::BuildTransaction(err.error))?;
+    Ok(recovered_envelope(tx, fields.caller))
 }
 
 /// Converts EEST access list items into RPC access list items.
@@ -354,22 +204,13 @@ fn recovered_envelope(tx: TypedTransaction, caller: Address) -> RecoveredTxEnvel
         TypedTransaction::Eip1559(tx) => Recovered::new_unchecked(TxEnvelope::Eip1559(tx), caller),
         TypedTransaction::Eip4844(tx) => Recovered::new_unchecked(TxEnvelope::Eip4844(tx), caller),
         TypedTransaction::Eip7702(tx) => Recovered::new_unchecked(tx.into(), caller),
-        TypedTransaction::Eip8141(tx) => {
-            let sender = tx.sender;
-            Recovered::new_unchecked(TxEnvelope::Eip8141(tx), sender)
-        }
+        TypedTransaction::Eip8141(tx) => Recovered::new_unchecked(TxEnvelope::Eip8141(tx), caller),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use alloy_consensus::ReceiptEnvelope;
-    use alloy_eips::{
-        Encodable2718,
-        eip8141::{FrameGasUsed, FrameReceipt, FrameReceiptPayload, FrameStatus},
-    };
-    use alloy_primitives::{hex, keccak256};
+    use super::TestAuthorization;
     use serde_json::json;
 
     #[test]
@@ -385,170 +226,5 @@ mod tests {
         let authorization = TestAuthorization { value: value.clone() };
 
         assert_eq!(serde_json::to_value(authorization).unwrap(), value);
-    }
-
-    #[test]
-    fn canonical_frame_bytes_are_authoritative_and_require_exact_input() {
-        // Independently assembled type-6 seven-field list with one six-field frame.
-        let raw = hex!(
-            "06e60180941111111111111111111111111111111111111111c9c8808080c280808080c0c28080c0"
-        );
-        let recovered = build_recovered_tx_bytes(&raw).unwrap();
-        assert_eq!(recovered.signer(), Address::repeat_byte(0x11));
-        let frame = recovered.inner().as_eip8141().unwrap();
-        assert_eq!(frame.encoded_2718(), raw);
-        assert_eq!(frame.tx_hash(), keccak256(raw));
-        assert_eq!(frame.signature_hash(), keccak256(raw));
-        assert_eq!(frame.chain_id, 1);
-        assert_eq!(frame.nonce_keys, None);
-        assert_eq!(frame.frames, vec![Frame::default()]);
-
-        for length in 0..raw.len() {
-            assert!(build_recovered_tx_bytes(&raw[..length]).is_err(), "prefix {length}");
-        }
-        let mut trailing = raw.to_vec();
-        trailing.push(0x80);
-        assert!(matches!(build_recovered_tx_bytes(&trailing),
-            Err(TxBuildError::BuildTransaction(message)) if message == "trailing transaction bytes"));
-        let mut network = Vec::new();
-        frame.network_encode(&mut network);
-        assert!(build_recovered_tx_bytes(&network).is_err());
-    }
-
-    #[test]
-    fn frame_fixture_conversion_keeps_full_width_fields_and_signing_elision() {
-        for length in [0, 1, 55, 56, 255, 256] {
-            let mut tx = TxEip8141 {
-                chain_id: 1,
-                nonce: u64::MAX,
-                nonce_keys: Some(vec![U256::ONE, U256::MAX]),
-                sender: Address::repeat_byte(0x11),
-                frames: vec![Frame {
-                    data: vec![0x81; length].into(),
-                    value: U256::MAX,
-                    ..Default::default()
-                }],
-                signatures: vec![
-                    FrameSignature { signature: vec![0x82; length].into(), ..Default::default() },
-                    FrameSignature {
-                        msg: SignatureMessage::Explicit(B256::repeat_byte(0x33)),
-                        signature: vec![0x84; length].into(),
-                        ..Default::default()
-                    },
-                ],
-                fees: TransactionFees {
-                    max_fee: U256::MAX,
-                    max_priority_fee_per_gas: U256::MAX - U256::ONE,
-                },
-                ..Default::default()
-            };
-            let recovered = build_recovered_tx_bytes(&tx.encoded_2718()).unwrap();
-            assert_eq!(recovered.inner().as_eip8141().unwrap(), &tx);
-
-            let signature_hash = tx.signature_hash();
-            tx.signatures[0].signature = vec![0x85; length].into();
-            assert_eq!(tx.signature_hash(), signature_hash);
-            tx.signatures[0].signature = vec![0x85; length + 1].into();
-            assert_ne!(tx.signature_hash(), signature_hash);
-            tx.signatures[0].signature = vec![0x85; length].into();
-            tx.signatures[1].signature = vec![0x86; length + 1].into();
-            assert_ne!(tx.signature_hash(), signature_hash);
-        }
-    }
-
-    #[test]
-    fn frame_signature_hash_commits_to_elided_lengths_as_rlp_integers() {
-        for length in [0, 1, 55, 56, 127, 128, 255, 256] {
-            let tx = TxEip8141 {
-                chain_id: 1,
-                sender: Address::repeat_byte(0x11),
-                signatures: vec![FrameSignature {
-                    scheme: SignatureScheme::Arbitrary,
-                    signature: vec![0x81; length].into(),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            };
-            let signature = rlp_list(&[
-                alloy_rlp::encode(u8::from(SignatureScheme::Arbitrary)),
-                vec![0x80],
-                vec![0x80],
-                alloy_rlp::encode(length),
-            ]);
-            let mut sender = vec![0x94];
-            sender.extend_from_slice(tx.sender.as_slice());
-            let mut signing_bytes = vec![6];
-            signing_bytes.extend(rlp_list(&[
-                vec![1],
-                vec![0x80],
-                sender,
-                vec![0xc0],
-                rlp_list(&[signature]),
-                vec![0xc2, 0x80, 0x80],
-                vec![0xc0],
-            ]));
-            assert_eq!(tx.signature_hash(), keccak256(signing_bytes), "length {length}");
-        }
-    }
-
-    fn rlp_list(items: &[Vec<u8>]) -> Vec<u8> {
-        let payload_length = items.iter().map(Vec::len).sum::<usize>();
-        assert!(payload_length <= 55);
-        let mut out = vec![0xc0 + payload_length as u8];
-        for item in items {
-            out.extend_from_slice(item);
-        }
-        out
-    }
-
-    #[test]
-    fn frame_json_uses_the_full_width_total_budget() {
-        let transaction = crate::blockchaintest::Transaction {
-            transaction_type: Some(U256::from(6)),
-            sender: Some(Address::repeat_byte(0x11)),
-            frames: Some(vec![]),
-            max_fee: Some(U256::MAX),
-            max_fee_per_gas: Some(U256::ONE),
-            max_fee_per_blob_gas: Some(U256::ONE),
-            max_priority_fee_per_gas: Some(U256::MAX - U256::ONE),
-            ..Default::default()
-        };
-        let json = serde_json::to_value(&transaction).unwrap();
-        assert_eq!(json["maxFee"], serde_json::to_value(U256::MAX).unwrap());
-        let decoded = serde_json::from_value(json).unwrap();
-        let native = crate::blockchaintest::execute::build_tx(&decoded).unwrap();
-        let fees = &native.inner().as_eip8141().unwrap().fees;
-        assert_eq!(fees.max_fee, U256::MAX);
-        assert_eq!(fees.max_priority_fee_per_gas, U256::MAX - U256::ONE);
-    }
-
-    #[test]
-    fn canonical_frame_receipt_has_no_output_or_bloom_wire_fields() {
-        let receipt = ReceiptEnvelope::Eip8141(
-            FrameReceiptPayload {
-                cumulative_gas_used: 128,
-                payer: Address::repeat_byte(0x11),
-                frame_receipts: vec![
-                    FrameReceipt {
-                        status: FrameStatus::Success,
-                        gas_used: FrameGasUsed { execution: 1, state: 2 },
-                        logs: vec![],
-                    },
-                    FrameReceipt { status: FrameStatus::SkippedAtomicBatch, ..Default::default() },
-                ],
-            }
-            .into(),
-        );
-        // Type 6, [cumulative gas, payer, [[status, [execution,state], logs], ...]].
-        let expected =
-            hex!("06e48180941111111111111111111111111111111111111111ccc501c20102c0c502c28080c0");
-        assert_eq!(receipt.encoded_2718(), expected);
-        assert_eq!(ReceiptEnvelope::decode_2718_exact(&expected).unwrap(), receipt);
-        let mut invalid_status = expected;
-        invalid_status[27] = 3;
-        assert!(ReceiptEnvelope::decode_2718_exact(&invalid_status).is_err());
-        let mut trailing = expected.to_vec();
-        trailing.push(0x80);
-        assert!(ReceiptEnvelope::decode_2718_exact(&trailing).is_err());
     }
 }

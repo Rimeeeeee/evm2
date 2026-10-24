@@ -1,8 +1,8 @@
 //! Deterministic in-flight Bogota assertion state diffs.
 
 use super::State;
-use crate::ethereum::eip7906::TxTraceParam;
 use alloc::vec::Vec;
+use alloy_eips::eip7906::TxTraceParam;
 use alloy_primitives::{Address, U256};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

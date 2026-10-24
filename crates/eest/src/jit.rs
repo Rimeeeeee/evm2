@@ -19,7 +19,6 @@ pub(crate) fn make_backend(aot: bool) -> Result<JitBackend, String> {
         store,
         tuning: RuntimeTuning {
             jit_hot_threshold: 0,
-            jit_max_bytecode_len: 0,
             jit_worker_count: cpus,
             jit_opt_level: OptimizationLevel::None,
             aot_opt_level: OptimizationLevel::None,

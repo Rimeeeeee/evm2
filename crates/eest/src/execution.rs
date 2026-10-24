@@ -1,8 +1,7 @@
-use evm2::{BaseEvmTypes, Evm, NoopInspector};
-use std::{error::Error, fmt};
-
+use evm2::{BaseEvmTypes, Evm};
 #[cfg(feature = "jit")]
 use evm2_jit_runtime::{evm2_evm::JitInterpreterRunner, runtime::JitBackend};
+use std::{error::Error, fmt};
 
 /// EEST execution backend.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -10,8 +9,6 @@ pub enum ExecutionMode {
     /// Run through the evm2 interpreter.
     #[default]
     Interpreter,
-    /// Run through inspected instruction dispatch without producing debug output.
-    InspectedInterpreter,
     /// Run through the evm2 JIT runtime, falling back to the interpreter for unsupported code.
     #[cfg(feature = "jit")]
     Jit,
@@ -59,7 +56,6 @@ impl Error for ExecutionResourceError {}
 
 #[derive(Clone, Debug)]
 pub(crate) struct ExecutionResources {
-    inspected: bool,
     #[cfg(feature = "jit")]
     backend: Option<JitBackend>,
 }
@@ -68,18 +64,19 @@ impl ExecutionResources {
     #[cfg(feature = "jit")]
     pub(crate) fn new(mode: ExecutionMode) -> Result<Self, ExecutionResourceError> {
         let backend = match mode {
-            ExecutionMode::Interpreter | ExecutionMode::InspectedInterpreter => None,
+            ExecutionMode::Interpreter => None,
             ExecutionMode::Jit | ExecutionMode::Aot => {
                 let aot = mode == ExecutionMode::Aot;
                 Some(crate::jit::make_backend(aot).map_err(ExecutionResourceError)?)
             }
         };
-        Ok(Self { inspected: mode == ExecutionMode::InspectedInterpreter, backend })
+        Ok(Self { backend })
     }
 
     #[cfg(not(feature = "jit"))]
     pub(crate) const fn new(mode: ExecutionMode) -> Result<Self, ExecutionResourceError> {
-        Ok(Self { inspected: matches!(mode, ExecutionMode::InspectedInterpreter) })
+        let _ = mode;
+        Ok(Self {})
     }
 
     #[cfg(feature = "jit")]
@@ -87,9 +84,6 @@ impl ExecutionResources {
     pub(crate) fn configure_evm(&self, _evm: &mut Evm<'_, BaseEvmTypes>) {
         if let Some(backend) = &self.backend {
             _evm.set_interpreter_runner(JitInterpreterRunner::new(backend.clone()));
-        }
-        if self.inspected {
-            _evm.set_inspector(NoopInspector::default());
         }
     }
 
@@ -106,9 +100,7 @@ impl ExecutionResources {
 
     #[cfg(not(feature = "jit"))]
     #[inline]
-    pub(crate) fn configure_evm(&self, _evm: &mut Evm<'_, BaseEvmTypes>) {
-        if self.inspected {
-            _evm.set_inspector(NoopInspector::default());
-        }
+    pub(crate) const fn configure_evm(&self, _evm: &mut Evm<'_, BaseEvmTypes>) {
+        let _ = self;
     }
 }

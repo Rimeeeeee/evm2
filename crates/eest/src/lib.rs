@@ -52,7 +52,7 @@ pub use fixture_io::{
     write_blockchain as write_blockchain_fixture,
 };
 pub use runner::run as run_statetests;
-pub use tx::{AccessListItem, TestAuthorization, TestFrame, TestFrameSignature, TxBuildError};
+pub use tx::{AccessListItem, TestAuthorization};
 pub use types::{
     AccountInfo as StateTestAccountInfo, Env as StateTestEnv, SpecName as StateTestSpecName,
     Test as StateTestPost, TestSuite as StateTestSuite, TestUnit as StateTestUnit,
@@ -61,12 +61,12 @@ pub use types::{
 
 /// Runs all EEST harnesses.
 ///
-/// When `EVM2_ADDITIONAL_TESTS` is set, only that folder (or file) runs, as
-/// explicit suites with interpreter, inspected, and enabled compiled backends.
-/// Each suite detects fixture kinds and runs every selected file.
+/// When `EVM2_ADDITIONAL_TESTS` is set, only that folder (or file) runs, as a
+/// single suite that detects each fixture's kind, so no test-name filter is
+/// required.
 pub fn run() -> std::process::ExitCode {
     if let Some(path) = fixtures::additional_tests_path() {
-        return harness::run_json_harnesses(additional::suites(path));
+        return harness::run_json_harnesses(vec![additional::suite(path)]);
     }
 
     let mut suites = runner::suites();
