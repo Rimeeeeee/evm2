@@ -8,11 +8,10 @@ use alloy_eips::eip8141::{
     SignatureScheme, nonce_slot,
 };
 use alloy_primitives::{Address, B256, U256};
-use common::{APPROVE_BOTH, BODY, SENDER, recovered};
+use common::{APPROVE_BOTH, BODY, SENDER, recovered, set_version, stored};
 use evm2::{
-    BaseEvmTypes, Evm, EvmFeatures, ExecutionConfig, Precompiles, SpecId, bytecode::Bytecode,
-    ethereum::ethereum_tx_registry, evm::AccountInfo, interpreter::InstrStop,
-    registry::HandlerError, version::GasId,
+    BaseEvmTypes, Evm, EvmFeatures, SpecId, bytecode::Bytecode, evm::AccountInfo,
+    interpreter::InstrStop, registry::HandlerError, version::GasId,
 };
 
 const FAILURE: Address = Address::with_last_byte(0xc0);
@@ -39,24 +38,14 @@ fn nonce(evm: &mut Evm<'_, BaseEvmTypes>, key: U256) -> U256 {
     if key.is_zero() {
         U256::from(evm.state_mut().account(&SENDER).unwrap().nonce())
     } else {
-        evm.state_mut()
-            .storage(&NONCE_MANAGER)
-            .unwrap()
-            .into_slot(nonce_slot(SENDER, key))
-            .unwrap()
-            .current()
+        stored(evm, NONCE_MANAGER, nonce_slot(SENDER, key))
     }
 }
 
 fn set_placeholders(evm: &mut Evm<'_, BaseEvmTypes>, enabled: bool) {
     let mut version = *evm.version();
     version.features.set(EvmFeatures::FRAME_SIGNATURE_PLACEHOLDERS, enabled);
-    evm.set_execution_config(
-        ExecutionConfig::for_spec_and_version(SpecId::BOGOTA, version),
-        SpecId::BOGOTA,
-        ethereum_tx_registry(SpecId::BOGOTA),
-        Precompiles::base(SpecId::BOGOTA),
-    );
+    set_version(evm, version);
 }
 
 #[test]
@@ -201,12 +190,7 @@ fn mixed_first_use_and_existing_nonce_lanes_charge_only_new_storage() {
     // to transaction.sequence + 1 and determines first-use cost from current protocol storage.
     let mut version = *evm.version();
     version.features.remove(EvmFeatures::NONCE_CHECK);
-    evm.set_execution_config(
-        ExecutionConfig::for_spec_and_version(SpecId::BOGOTA, version),
-        SpecId::BOGOTA,
-        ethereum_tx_registry(SpecId::BOGOTA),
-        Precompiles::base(SpecId::BOGOTA),
-    );
+    set_version(&mut evm, version);
     let slot_cost = u64::from(evm.version().gas_params.get(GasId::SstoreSetState));
     let mut verify = frame(FrameMode::Verify, SENDER, 3);
     verify.limits.state = slot_cost;
@@ -263,10 +247,7 @@ fn atomic_restore_rollback_restores_the_original_frames_state_gas_ownership() {
         assert!(outcome.rolled_back[2]);
         assert_eq!(outcome.receipts[2].gas_used.state, 0);
         assert_eq!(outcome.receipts[3].status, FrameStatus::Failure);
-        assert_eq!(
-            evm.state_mut().storage(&BODY).unwrap().into_slot(U256::ZERO).unwrap().current(),
-            U256::from(u8::from(!final_restore))
-        );
+        assert_eq!(stored(&mut evm, BODY, U256::ZERO), U256::from(u8::from(!final_restore)));
     }
 }
 
@@ -281,10 +262,7 @@ fn later_frame_can_cancel_an_earlier_frames_storage_clear_refund() {
     let result = evm.transact(&tx).unwrap().commit();
     assert_eq!(result.refunded, 0);
     assert_eq!(result.state_gas_spent, 0);
-    assert_eq!(
-        evm.state_mut().storage(&BODY).unwrap().into_slot(U256::ZERO).unwrap().current(),
-        U256::from(9)
-    );
+    assert_eq!(stored(&mut evm, BODY, U256::ZERO), U256::from(9));
 }
 
 #[test]
@@ -368,12 +346,7 @@ fn keyed_payment_uses_the_active_state_gas_schedule() {
     let mut evm = evm(APPROVE_BOTH, &[]);
     let mut version = *evm.version();
     version.gas_params.set(GasId::SstoreSetState, 17);
-    evm.set_execution_config(
-        ExecutionConfig::for_spec_and_version(SpecId::BOGOTA, version),
-        SpecId::BOGOTA,
-        ethereum_tx_registry(SpecId::BOGOTA),
-        Precompiles::base(SpecId::BOGOTA),
-    );
+    set_version(&mut evm, version);
     let mut verify = frame(FrameMode::Verify, SENDER, 3);
     verify.limits.state = 34;
     let tx = recovered(payload(vec![verify], vec![U256::from(7), U256::MAX]));

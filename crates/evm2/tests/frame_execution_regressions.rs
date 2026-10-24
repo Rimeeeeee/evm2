@@ -397,33 +397,27 @@ fn assertion_cases() -> Vec<Case> {
         for selector in 0..=0x1au8 {
             let event_index = u8::from((0x12..=0x18).contains(&selector));
             let query = [0x60, event_index, 0x60, selector, 0xb6, 0x5f, 0x52, 0x60, 32, 0x5f, 0xf3];
-            let mut transfer = frame(FrameMode::Sender, BODY);
-            transfer.value = U256::from(7);
-            transfer.limits.state = 1_000_000;
-            let mut case = base_case(
+            let mut case = assertion_case(
                 &format!("txtrace_net_changes_{selector:02x}_keyed_{keyed}"),
                 &body,
                 &query,
-                vec![transfer, frame(FrameMode::Assert, OTHER)],
+                true,
             );
+            case.tx.frames[1].value = U256::from(7);
             if keyed {
                 case.tx.nonce_keys = Some(vec![U256::ZERO]);
             }
-            case.expected_success = Some(true);
             cases.push(case);
         }
     }
     for selector in [0, 1, 2, 3, 0x11, 0x19, 0x1a] {
         let query = [0x60, 1, 0x60, selector, 0xb6, 0x00];
-        let mut case = base_case(
+        cases.push(assertion_case(
             &format!("txtrace_scalar_rejects_nonzero_index_{selector:02x}"),
             &body,
             &query,
-            vec![frame(FrameMode::Sender, BODY), frame(FrameMode::Assert, OTHER)],
-        );
-        case.tx.frames[1].limits.state = 1_000_000;
-        case.expected_success = Some(false);
-        cases.push(case);
+            false,
+        ));
     }
     for (index, memory, offset, len, success) in [
         (U256::ZERO, U256::ZERO, U256::ZERO, 32, true),
@@ -441,25 +435,19 @@ fn assertion_cases() -> Vec<Case> {
             query.extend_from_slice(&operand.to_be_bytes::<32>());
         }
         query.extend_from_slice(&[0xb7, 0x60, 64, 0x5f, 0xf3]);
-        let mut case = base_case(
+        cases.push(assertion_case(
             &format!("eventdatacopy_{index}_{memory}_{offset}_{len}"),
             &body,
             &query,
-            vec![frame(FrameMode::Sender, BODY), frame(FrameMode::Assert, OTHER)],
-        );
-        case.tx.frames[1].limits.state = 1_000_000;
-        case.expected_success = Some(success);
-        cases.push(case);
+            success,
+        ));
     }
-    let mut old_copy = base_case(
+    cases.push(assertion_case(
         "old_eventdatacopy_byte_is_undefined",
         &body,
         &[0x5f, 0x5f, 0x5f, 0x5f, 0xb8, 0x00],
-        vec![frame(FrameMode::Sender, BODY), frame(FrameMode::Assert, OTHER)],
-    );
-    old_copy.tx.frames[1].limits.state = 1_000_000;
-    old_copy.expected_success = Some(false);
-    cases.push(old_copy);
+        false,
+    ));
     cases
 }
 
@@ -830,4 +818,16 @@ fn native_frame_execution_matches_explicit_protocol_expectations() {
             assert!(result.is_err(), "{} accepted an invalid payload", case.name);
         }
     }
+}
+
+fn assertion_case(name: &str, body: &[u8], query: &[u8], success: bool) -> Case {
+    let mut case = base_case(
+        name,
+        body,
+        query,
+        vec![frame(FrameMode::Sender, BODY), frame(FrameMode::Assert, OTHER)],
+    );
+    case.tx.frames[1].limits.state = 1_000_000;
+    case.expected_success = Some(success);
+    case
 }

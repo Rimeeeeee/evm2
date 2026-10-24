@@ -7,7 +7,7 @@ use alloy_eips::eip8141::{
     Frame, FrameLimits, FrameMode, FrameStatus, NONCE_MANAGER, nonce_keys_hash, nonce_slot,
 };
 use alloy_primitives::{Address, Bytes, U256};
-use common::{APPROVE_BOTH, BODY, SENDER};
+use common::{APPROVE_BOTH, BODY, SENDER, stored};
 use evm2::{
     BaseEvmTypes, Evm, Inspector,
     bytecode::Bytecode,
@@ -65,10 +65,6 @@ fn evm(
         evm.set_inspector(Observe);
     }
     evm
-}
-
-fn stored(evm: &mut Evm<'_, BaseEvmTypes>, address: Address, key: U256) -> U256 {
-    evm.state_mut().storage(&address).unwrap().into_slot(key).unwrap().current()
 }
 
 fn keyed_nonce(evm: &mut Evm<'_, BaseEvmTypes>, key: U256) -> U256 {

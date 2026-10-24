@@ -1,10 +1,15 @@
 #![allow(dead_code)]
 
 use alloy_consensus::{TxEip8141, transaction::Recovered};
-use alloy_eips::eip8141::{Frame, FrameLimits, FrameMode};
-use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_eips::{
+    eip8141::{Frame, FrameLimits, FrameMode},
+    eip8272::{
+        RECENT_ROOT_ADDRESS, RECENT_ROOT_CODE, RECENT_ROOT_ENTRY_DOMAIN, RECENT_ROOT_STORAGE_DOMAIN,
+    },
+};
+use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use evm2::{
-    BaseEvmTypes, Evm, InterpreterRunner, Precompiles, SpecId,
+    BaseEvmTypes, Evm, ExecutionConfig, InterpreterRunner, Precompiles, SpecId, Version,
     bytecode::Bytecode,
     env::BlockEnvExt,
     ethereum::{TxEnvelope, ethereum_tx_registry},
@@ -78,6 +83,46 @@ pub(crate) fn delegating_sender(target: Address, parent_exit: &[u8]) -> Vec<u8> 
     code.push(0x5b);
     code.extend_from_slice(APPROVE_BOTH);
     code
+}
+
+pub(crate) fn set_version(evm: &mut Evm<'_, BaseEvmTypes>, version: Version) {
+    evm.set_execution_config(
+        ExecutionConfig::for_spec_and_version(SpecId::BOGOTA, version),
+        SpecId::BOGOTA,
+        ethereum_tx_registry(SpecId::BOGOTA),
+        Precompiles::base(SpecId::BOGOTA),
+    );
+}
+
+pub(crate) fn stored(evm: &mut Evm<'_, BaseEvmTypes>, address: Address, key: U256) -> U256 {
+    evm.state_mut().storage(&address).unwrap().into_slot(key).unwrap().current()
+}
+
+pub(crate) fn install_recent_root(evm: &mut Evm<'_, BaseEvmTypes>) {
+    evm.overlay_db_mut().insert_account_info(
+        &RECENT_ROOT_ADDRESS,
+        AccountInfo::default().with_code(Bytecode::new_legacy(RECENT_ROOT_CODE.clone())),
+    );
+}
+
+pub(crate) fn recent_tuple(source: [u8; 32], slot: u64, root: [u8; 32]) -> Vec<u8> {
+    let mut data = source.to_vec();
+    data.extend_from_slice(&slot.to_be_bytes());
+    data.extend_from_slice(&root);
+    data
+}
+
+pub(crate) fn recent_slot(source: [u8; 32], slot: u64) -> U256 {
+    let mut key = RECENT_ROOT_STORAGE_DOMAIN.as_slice().to_vec();
+    key.extend_from_slice(&source);
+    key.extend_from_slice(&(slot % 8192).to_be_bytes());
+    U256::from_be_bytes(keccak256(key).0)
+}
+
+pub(crate) fn recent_entry(tuple: &[u8]) -> U256 {
+    let mut entry = RECENT_ROOT_ENTRY_DOMAIN.as_slice().to_vec();
+    entry.extend_from_slice(tuple);
+    U256::from_be_bytes(keccak256(entry).0)
 }
 
 #[derive(Debug)]

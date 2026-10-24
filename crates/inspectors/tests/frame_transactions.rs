@@ -20,55 +20,27 @@ use evm2::{
 use evm2_inspectors::tracing::{DebugInspector, TracingInspector, TracingInspectorConfig};
 use k256::ecdsa::SigningKey;
 
+const APPROVE_BOTH: &[u8] = &[0x60, 3, 0x5f, 0x5f, 0xaa];
+const STORE_AND_LOG: &[u8] = &[0x60, 1, 0x5f, 0x55, 0x5f, 0x5f, 0xa0, 0x00];
+const REVERT: &[u8] = &[0x5f, 0x5f, 0xfd];
+
 #[test]
 fn native_finalization_reconciles_assertion_rollback_and_skipped_frames() {
     let sender = Address::with_last_byte(0xa0);
     let body = Address::with_last_byte(0xb0);
     let assertion = Address::with_last_byte(0xc0);
-    let mut db = InMemoryDB::default();
-    for (address, code) in [
-        (sender, &[0x60, 3, 0x5f, 0x5f, 0xaa][..]),
-        (body, &[0x60, 1, 0x5f, 0x55, 0x5f, 0x5f, 0xa0, 0x00][..]),
-        (assertion, &[0x5f, 0x5f, 0xfd][..]),
-    ] {
-        db.insert_account_info(
-            &address,
-            AccountInfo::default()
-                .with_balance(U256::from(1_000_000_000))
-                .with_code(Bytecode::new_legacy(Bytes::copy_from_slice(code))),
-        );
-    }
-    let mut evm = Evm::<BaseEvmTypes>::new(
-        SpecId::BOGOTA,
-        BlockEnvExt::default(),
-        ethereum_tx_registry(SpecId::BOGOTA),
-        db,
-        Precompiles::base(SpecId::BOGOTA),
-    );
+    let mut evm = evm(&[(sender, APPROVE_BOTH), (body, STORE_AND_LOG), (assertion, REVERT)]);
     evm.set_inspector(TracingInspector::new(TracingInspectorConfig::all()));
-    let frames = [
-        (FrameMode::Verify, sender, 3),
-        (FrameMode::Sender, body, 0),
-        (FrameMode::Assert, assertion, 0),
-        (FrameMode::Assert, assertion, 0),
-    ]
-    .into_iter()
-    .map(|(mode, target, flags)| Frame {
-        mode,
-        target: target.into(),
-        flags,
-        limits: FrameLimits { execution: 100_000, state: 300_000 },
-        ..Default::default()
-    })
-    .collect();
     let tx = Recovered::new_unchecked(
-        TxEnvelope::Eip8141(TxEip8141 {
-            chain_id: 1,
+        TxEnvelope::Eip8141(payload(
             sender,
-            nonce_keys: Some(vec![]),
-            frames,
-            ..Default::default()
-        }),
+            vec![
+                frame(FrameMode::Verify, sender, 3),
+                frame(FrameMode::Sender, body, 0),
+                frame(FrameMode::Assert, assertion, 0),
+                frame(FrameMode::Assert, assertion, 0),
+            ],
+        )),
         Address::ZERO,
     );
     let result = evm.transact(&tx).unwrap().discard();
@@ -123,15 +95,13 @@ fn frame(mode: FrameMode, target: Address, flags: u8) -> Frame {
 
 fn transaction(frames: Vec<Frame>) -> Recovered<TxEnvelope> {
     Recovered::new_unchecked(
-        TxEnvelope::Eip8141(TxEip8141 {
-            chain_id: 1,
-            sender: Address::with_last_byte(0xa0),
-            nonce_keys: Some(vec![]),
-            frames,
-            ..Default::default()
-        }),
+        TxEnvelope::Eip8141(payload(Address::with_last_byte(0xa0), frames)),
         Address::with_last_byte(0xff),
     )
+}
+
+fn payload(sender: Address, frames: Vec<Frame>) -> TxEip8141 {
+    TxEip8141 { chain_id: 1, sender, nonce_keys: Some(vec![]), frames, ..Default::default() }
 }
 
 fn evm(codes: &[(Address, &[u8])]) -> Evm<'static, BaseEvmTypes> {
@@ -157,13 +127,7 @@ fn default_verification_transaction(data: Bytes) -> (Address, Recovered<TxEnvelo
     let key = SigningKey::from_slice(&[0x11; 32]).unwrap();
     let sender =
         Address::from_raw_public_key(&key.verifying_key().to_sec1_point(false).as_bytes()[1..]);
-    let mut tx = TxEip8141 {
-        chain_id: 1,
-        sender,
-        nonce_keys: Some(vec![]),
-        frames: vec![Frame { data, ..frame(FrameMode::Verify, sender, 3) }],
-        ..Default::default()
-    };
+    let mut tx = payload(sender, vec![Frame { data, ..frame(FrameMode::Verify, sender, 3) }]);
     tx.signatures.push(FrameSignature {
         scheme: SignatureScheme::Secp256k1,
         signature: vec![0; 65].into(),
@@ -223,11 +187,7 @@ fn native_atomic_failure_keeps_receipt_gas_and_skips_only_its_group() {
     let sender = Address::with_last_byte(0xa0);
     let body = Address::with_last_byte(0xb0);
     let revert = Address::with_last_byte(0xc0);
-    let mut evm = evm(&[
-        (sender, &[0x60, 3, 0x5f, 0x5f, 0xaa]),
-        (body, &[0x60, 1, 0x5f, 0x55, 0x5f, 0x5f, 0xa0, 0x00]),
-        (revert, &[0x5f, 0x5f, 0xfd]),
-    ]);
+    let mut evm = evm(&[(sender, APPROVE_BOTH), (body, STORE_AND_LOG), (revert, REVERT)]);
     evm.set_inspector(TracingInspector::new(TracingInspectorConfig::all()));
     let result = evm
         .transact(&transaction(vec![
@@ -293,7 +253,7 @@ fn native_atomic_failure_keeps_receipt_gas_and_skips_only_its_group() {
 fn native_debug_context_preserves_payload_sender_and_all_frame_entry_outcomes() {
     let sender = Address::with_last_byte(0xa0);
     let identity = Address::with_last_byte(4);
-    let mut evm = evm(&[(sender, &[0x60, 3, 0x5f, 0x5f, 0xaa])]);
+    let mut evm = evm(&[(sender, APPROVE_BOTH)]);
     let mut precompile = frame(FrameMode::Sender, identity, 0);
     precompile.data = Bytes::from_static(&[1, 2, 3]);
     let mut unaffordable = frame(FrameMode::Sender, Address::with_last_byte(0xb0), 0);
@@ -326,7 +286,7 @@ fn native_debug_context_preserves_payload_sender_and_all_frame_entry_outcomes() 
 #[test]
 fn prefix_inspection_finalizes_only_executed_frames_and_can_be_fused() {
     let sender = Address::with_last_byte(0xa0);
-    let mut evm = evm(&[(sender, &[0x60, 3, 0x5f, 0x5f, 0xaa])]);
+    let mut evm = evm(&[(sender, APPROVE_BOTH)]);
     evm.set_inspector(TracingInspector::new(TracingInspectorConfig::all()));
     let tx =
         transaction(vec![frame(FrameMode::Verify, sender, 3), frame(FrameMode::Sender, sender, 0)]);
@@ -347,7 +307,7 @@ fn synthetic_roots_keep_nested_steps_and_global_structlog_limits() {
     let body = Address::with_last_byte(0xb0);
     let child = Address::with_last_byte(0xd0);
     let mut evm = evm(&[
-        (sender, &[0x60, 3, 0x5f, 0x5f, 0xaa]),
+        (sender, APPROVE_BOTH),
         (body, &[0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x60, 0xd0, 0x61, 0xff, 0xff, 0xf1, 0x00]),
         (child, &[0x60, 42, 0x50, 0x00]),
     ]);
@@ -391,7 +351,7 @@ fn assertion_failure_preserves_payment_prefix_logs_and_the_block_log_offset() {
     let mut evm = evm(&[
         (sender, &[0x5f, 0x5f, 0xa0, 0x60, 3, 0x5f, 0x5f, 0xaa]),
         (body, &[0x5f, 0x5f, 0xa0, 0x00]),
-        (assertion, &[0x5f, 0x5f, 0xfd]),
+        (assertion, REVERT),
     ]);
     let mut inspector = TracingInspector::new(TracingInspectorConfig::all());
     inspector.set_next_log_index(7);
@@ -453,22 +413,20 @@ mod js {
         }
     }"#;
 
+    const STORE_LOG_RETURN: &[u8] =
+        &[0x60, 1, 0x5f, 0x55, 0x5f, 0x5f, 0xa0, 0x60, 42, 0x5f, 0x53, 0x60, 1, 0x5f, 0xf3];
+
     #[test]
     fn javascript_gas_price_reports_the_transaction_lower_bound() {
         let sender = Address::with_last_byte(0xa0);
         let body = Address::with_last_byte(0xb0);
-        let mut evm = evm(&[
-            (sender, &[0x60, 3, 0x5f, 0x5f, 0xaa]),
-            (body, &[0x3a, 0x5f, 0x52, 0x60, 32, 0x5f, 0xf3]),
-        ]);
+        let mut evm =
+            evm(&[(sender, APPROVE_BOTH), (body, &[0x3a, 0x5f, 0x52, 0x60, 32, 0x5f, 0xf3])]);
         evm.set_block(BlockEnvExt { basefee: U256::from(3), ..Default::default() });
-        let mut payload = TxEip8141 {
-            chain_id: 1,
+        let mut payload = payload(
             sender,
-            nonce_keys: Some(vec![]),
-            frames: vec![frame(FrameMode::Verify, sender, 3), frame(FrameMode::Sender, body, 0)],
-            ..Default::default()
-        };
+            vec![frame(FrameMode::Verify, sender, 3), frame(FrameMode::Sender, body, 0)],
+        );
         let maximum = U256::from(FrameGas::calculate(&payload, evm.version()).unwrap().maximum);
         payload.fees.max_priority_fee_per_gas = U256::from(11);
         payload.fees.max_fee = maximum * U256::from(3) + maximum / U256::from(2);
@@ -515,14 +473,7 @@ mod js {
         let sender = Address::with_last_byte(0xa0);
         let body = Address::with_last_byte(0xb0);
         let assertion = Address::with_last_byte(0xc0);
-        let mut evm = evm(&[
-            (sender, &[0x60, 3, 0x5f, 0x5f, 0xaa]),
-            (
-                body,
-                &[0x60, 1, 0x5f, 0x55, 0x5f, 0x5f, 0xa0, 0x60, 42, 0x5f, 0x53, 0x60, 1, 0x5f, 0xf3],
-            ),
-            (assertion, &[0x5f, 0x5f, 0xfd]),
-        ]);
+        let mut evm = evm(&[(sender, APPROVE_BOTH), (body, STORE_LOG_RETURN), (assertion, REVERT)]);
         let tx = transaction(vec![
             frame(FrameMode::Verify, sender, 3),
             frame(FrameMode::Sender, body, 0),
@@ -568,7 +519,7 @@ mod js {
     #[test]
     fn javascript_prefix_reset_and_precompile_and_entry_failure_have_balanced_hooks() {
         let sender = Address::with_last_byte(0xa0);
-        let mut evm = evm(&[(sender, &[0x60, 3, 0x5f, 0x5f, 0xaa])]);
+        let mut evm = evm(&[(sender, APPROVE_BOTH)]);
         let mut identity = frame(FrameMode::Sender, Address::with_last_byte(4), 0);
         identity.data = Bytes::from_static(&[42]);
         let mut unaffordable = frame(FrameMode::Sender, Address::with_last_byte(0xb0), 0);
@@ -595,7 +546,7 @@ mod js {
     #[test]
     fn javascript_frame_notification_errors_surface_when_collecting_results() {
         let sender = Address::with_last_byte(0xa0);
-        let mut evm = evm(&[(sender, &[0x60, 3, 0x5f, 0x5f, 0xaa])]);
+        let mut evm = evm(&[(sender, APPROVE_BOTH)]);
         let tx = transaction(vec![frame(FrameMode::Verify, sender, 3)]);
         evm.set_inspector(
             JsInspector::new(
@@ -626,14 +577,7 @@ mod js {
         let sender = Address::with_last_byte(0xa0);
         let body = Address::with_last_byte(0xb0);
         let failure = Address::with_last_byte(0xc0);
-        let mut evm = evm(&[
-            (sender, &[0x60, 3, 0x5f, 0x5f, 0xaa]),
-            (
-                body,
-                &[0x60, 1, 0x5f, 0x55, 0x5f, 0x5f, 0xa0, 0x60, 42, 0x5f, 0x53, 0x60, 1, 0x5f, 0xf3],
-            ),
-            (failure, &[0x5f, 0x5f, 0xfd]),
-        ]);
+        let mut evm = evm(&[(sender, APPROVE_BOTH), (body, STORE_LOG_RETURN), (failure, REVERT)]);
         let tx = transaction(vec![
             frame(FrameMode::Verify, sender, 3),
             frame(FrameMode::Sender, body, 4),
@@ -670,11 +614,7 @@ fn synthetic_and_executed_frames_respect_input_recording() {
         TracingInspectorConfig::parity_vm_trace(),
         TracingInspectorConfig::default_parity(),
     ] {
-        let mut evm = evm(&[
-            (sender, &[0x60, 3, 0x5f, 0x5f, 0xaa]),
-            (body, &[0x00]),
-            (assertion, &[0x5f, 0x5f, 0xfd]),
-        ]);
+        let mut evm = evm(&[(sender, APPROVE_BOTH), (body, &[0x00]), (assertion, REVERT)]);
         let mut frames = [
             (FrameMode::Verify, sender, 3),
             (FrameMode::Sender, body, 0),
@@ -735,11 +675,7 @@ fn many_frame_vm_traces_keep_nested_calls_and_excluded_precompiles_in_each_subtr
         code.extend_from_slice(&[0x5a, 0xf1, 0x50]);
     }
     code.push(0x00);
-    let mut evm = evm(&[
-        (sender, &[0x60, 3, 0x5f, 0x5f, 0xaa]),
-        (body, &code),
-        (child, &[0x60, 42, 0x50, 0x00]),
-    ]);
+    let mut evm = evm(&[(sender, APPROVE_BOTH), (body, &code), (child, &[0x60, 42, 0x50, 0x00])]);
     evm.set_inspector(TracingInspector::new(
         TracingInspectorConfig::parity_vm_trace().set_exclude_precompile_calls(true),
     ));
@@ -782,7 +718,7 @@ fn pre_evm_frame_failures_keep_receipt_gas_and_later_frame_traces() {
         ),
     ] {
         let mut evm = evm(&[
-            (sender, &[0x60, 3, 0x5f, 0x5f, 0xaa]),
+            (sender, APPROVE_BOTH),
             (failed, &[0x00]),
             (later, &[0x60, 42, 0x5f, 0x53, 0x60, 1, 0x5f, 0xf3]),
         ]);

@@ -8,21 +8,18 @@ use alloy_eips::{
         Frame, FrameMode, FrameSignature, FrameStatus, NONCE_MANAGER, SignatureMessage,
         SignatureScheme, nonce_slot,
     },
-    eip8272::{
-        RECENT_ROOT_ADDRESS, RECENT_ROOT_CODE, RECENT_ROOT_CODE_HASH, RECENT_ROOT_ENTRY_DOMAIN,
-        RECENT_ROOT_STORAGE_DOMAIN,
-    },
+    eip8272::{RECENT_ROOT_ADDRESS, RECENT_ROOT_CODE, RECENT_ROOT_CODE_HASH},
 };
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256};
 use common::{
-    APPROVE_BOTH, BODY, CountingRunner, FailingDatabase, SENDER, frame, payload, recovered,
+    APPROVE_BOTH, BODY, CountingRunner, FailingDatabase, SENDER, frame, install_recent_root,
+    payload, recent_entry, recent_slot, recent_tuple, recovered, set_version, stored,
 };
 use evm2::{
-    BaseEvmTypes, Evm, EvmFeatures, ExecutionConfig, FrameTransactionResult, Precompiles, SpecId,
-    TxResultExt, Version,
+    BaseEvmTypes, Evm, EvmFeatures, FrameTransactionResult, SpecId, TxResultExt, Version,
     bytecode::Bytecode,
     env::BlockEnvExt,
-    ethereum::{TxEnvelope, eip8141::FrameGas, ethereum_tx_registry},
+    ethereum::{TxEnvelope, eip8141::FrameGas},
     evm::{AccountInfo, Bal, BalError, BlockAccessIndex, Db, InMemoryDB},
     interpreter::{GasTracker, InstrStop},
     registry::HandlerError,
@@ -83,10 +80,7 @@ fn approval_executes_body_and_commits_explicit_sender_nonce() {
     assert!(outcome.receipts.iter().all(|r| r.status == FrameStatus::Success));
     assert!(outcome.receipts[1].gas_used.state > 0);
     assert_eq!(evm.state_mut().account(&SENDER).unwrap().nonce(), 1);
-    assert_eq!(
-        evm.state_mut().storage(&BODY).unwrap().into_slot(U256::ZERO).unwrap().current(),
-        U256::from(42)
-    );
+    assert_eq!(stored(&mut evm, BODY, U256::ZERO), U256::from(42));
 }
 
 #[test]
@@ -112,10 +106,7 @@ fn assertion_failure_reverts_body_and_preserves_payment_prefix() {
     );
     assert_eq!(outcome.receipts[1].gas_used.state, 0);
     assert_eq!(evm.state_mut().account(&SENDER).unwrap().nonce(), 1);
-    assert_eq!(
-        evm.state_mut().storage(&BODY).unwrap().into_slot(U256::ZERO).unwrap().current(),
-        U256::ZERO
-    );
+    assert_eq!(stored(&mut evm, BODY, U256::ZERO), U256::ZERO);
 }
 
 #[test]
@@ -140,12 +131,7 @@ fn keyed_nonce_updates_protocol_storage_without_bumping_account_nonce() {
     assert_eq!(evm.state_mut().account(&SENDER).unwrap().nonce(), 0);
     for key in [7, 9] {
         assert_eq!(
-            evm.state_mut()
-                .storage(&NONCE_MANAGER)
-                .unwrap()
-                .into_slot(nonce_slot(SENDER, U256::from(key)))
-                .unwrap()
-                .current(),
+            stored(&mut evm, NONCE_MANAGER, nonce_slot(SENDER, U256::from(key))),
             U256::from(1)
         );
     }
@@ -210,10 +196,7 @@ fn restoration_does_not_fund_a_later_frame() {
     assert_eq!(frames.receipts[1].gas_used.state, 0);
     assert_eq!(frames.receipts[2].status, FrameStatus::Success);
     assert_eq!(frames.receipts[3].status, FrameStatus::Failure);
-    assert_eq!(
-        evm.state_mut().storage(&BODY).unwrap().into_slot(U256::ZERO).unwrap().current(),
-        U256::ZERO
-    );
+    assert_eq!(stored(&mut evm, BODY, U256::ZERO), U256::ZERO);
 }
 
 #[test]
@@ -233,10 +216,7 @@ fn reverted_restoration_preserves_the_original_owners_state_charge() {
     let frames = result.frame.unwrap();
     assert!(frames.receipts[1].gas_used.state > 0);
     assert_eq!(frames.receipts[2].status, FrameStatus::Failure);
-    assert_eq!(
-        evm.state_mut().storage(&BODY).unwrap().into_slot(U256::ZERO).unwrap().current(),
-        U256::from(1)
-    );
+    assert_eq!(stored(&mut evm, BODY, U256::ZERO), U256::from(1));
 }
 
 #[test]
@@ -265,10 +245,7 @@ fn atomic_failure_preserves_status_and_skips_the_linked_suffix() {
     );
     assert_eq!(frames.receipts[1].gas_used.state, 0);
     assert!(frames.rolled_back[1]);
-    assert_eq!(
-        evm.state_mut().storage(&BODY).unwrap().into_slot(U256::ZERO).unwrap().current(),
-        U256::ZERO
-    );
+    assert_eq!(stored(&mut evm, BODY, U256::ZERO), U256::ZERO);
 }
 
 #[test]
@@ -320,20 +297,10 @@ fn recent_root_runtime_uses_actual_slot_and_the_locked_window() {
         let slot = current_slot - age;
         let source = [0x11; 32];
         let root = [0x22; 32];
-        let mut tuple = source.to_vec();
-        tuple.extend_from_slice(&slot.to_be_bytes());
-        tuple.extend_from_slice(&root);
-        let mut entry = RECENT_ROOT_ENTRY_DOMAIN.as_slice().to_vec();
-        entry.extend_from_slice(&tuple);
-        let value = U256::from_be_bytes(alloy_primitives::keccak256(entry).0);
-        let mut key = RECENT_ROOT_STORAGE_DOMAIN.as_slice().to_vec();
-        key.extend_from_slice(&source);
-        key.extend_from_slice(&(slot % 8192).to_be_bytes());
-        let key = U256::from_be_bytes(alloy_primitives::keccak256(key).0);
-        evm.overlay_db_mut().insert_account_info(
-            &RECENT_ROOT_ADDRESS,
-            AccountInfo::default().with_code(Bytecode::new_legacy(RECENT_ROOT_CODE.clone())),
-        );
+        let tuple = recent_tuple(source, slot, root);
+        let value = recent_entry(&tuple);
+        let key = recent_slot(source, slot);
+        install_recent_root(&mut evm);
         evm.overlay_db_mut().insert_account_storage(&RECENT_ROOT_ADDRESS, &key, &value);
         evm.set_block(BlockEnvExt {
             slot_num: U256::from(current_slot),
@@ -414,19 +381,10 @@ fn bal_positioned_frames_preserve_prefix_writes_after_assertion_failure() {
     );
 
     assert_eq!(
-        serial
-            .state_mut()
-            .storage(&NONCE_MANAGER)
-            .unwrap()
-            .into_slot(nonce_slot(SENDER, U256::from(7)))
-            .unwrap()
-            .current(),
+        stored(&mut serial, NONCE_MANAGER, nonce_slot(SENDER, U256::from(7))),
         U256::from(2)
     );
-    assert_eq!(
-        serial.state_mut().storage(&BODY).unwrap().into_slot(U256::ZERO).unwrap().current(),
-        U256::from(42)
-    );
+    assert_eq!(stored(&mut serial, BODY, U256::ZERO), U256::from(42));
 }
 
 #[test]
@@ -450,12 +408,7 @@ fn preparation_uses_the_active_execution_cap() {
     let mut evm = evm(&[], &[]);
     let mut version = *evm.version();
     version.tx_gas_limit_cap = 40_000_000;
-    evm.set_execution_config(
-        evm2::ExecutionConfig::for_spec_and_version(SpecId::BOGOTA, version),
-        SpecId::BOGOTA,
-        ethereum_tx_registry(SpecId::BOGOTA),
-        Precompiles::base(SpecId::BOGOTA),
-    );
+    set_version(&mut evm, version);
     evm.set_block(BlockEnvExt { gas_limit: U256::from(50_000_000), ..*evm.block() });
     let mut verify = frame(FrameMode::Verify, SENDER);
     verify.limits.execution = 20_000_000;
@@ -773,12 +726,7 @@ fn disabling_base_fee_checks_keeps_zero_budget_simulation_coherent() {
     assert!(evm.transact(&tx).is_err());
     let mut version = *evm.version();
     version.features.remove(EvmFeatures::BASE_FEE_CHECK);
-    evm.set_execution_config(
-        ExecutionConfig::for_spec_and_version(SpecId::BOGOTA, version),
-        SpecId::BOGOTA,
-        ethereum_tx_registry(SpecId::BOGOTA),
-        Precompiles::base(SpecId::BOGOTA),
-    );
+    set_version(&mut evm, version);
     let result = evm.transact(&tx).unwrap().commit();
     assert!(result.status);
     let frame = result.frame.unwrap();
@@ -800,12 +748,7 @@ fn custom_refund_quotients_keep_prefix_and_full_execution_consistent() {
         evm.overlay_db_mut().insert_account_storage(&BODY, &U256::ZERO, &U256::ONE);
         let mut version = *evm.version();
         version.gas_params.set(GasId::MaxRefundQuotient, quotient);
-        evm.set_execution_config(
-            ExecutionConfig::for_spec_and_version(SpecId::BOGOTA, version),
-            SpecId::BOGOTA,
-            ethereum_tx_registry(SpecId::BOGOTA),
-            Precompiles::base(SpecId::BOGOTA),
-        );
+        set_version(&mut evm, version);
         let prefix = evm.validate_frame_prefix(&tx, 1).unwrap();
         assert_eq!(prefix, *expected_prefix.get_or_insert(prefix));
         assert_eq!(evm.state_mut().account(&SENDER).unwrap().nonce(), 0);
@@ -821,10 +764,7 @@ fn custom_refund_quotients_keep_prefix_and_full_execution_consistent() {
             assert_eq!(result, *uncapped.get_or_insert_with(|| result.clone()));
         }
         assert_eq!(evm.state_mut().account(&SENDER).unwrap().nonce(), 1);
-        assert_eq!(
-            evm.state_mut().storage(&BODY).unwrap().into_slot(U256::ZERO).unwrap().current(),
-            U256::ZERO
-        );
+        assert_eq!(stored(&mut evm, BODY, U256::ZERO), U256::ZERO);
     }
 }
 
@@ -856,12 +796,7 @@ fn payment_approval_honors_balance_top_up_independently_of_fee_and_balance_check
                     ] {
                         version.features.set(feature, enabled);
                     }
-                    evm.set_execution_config(
-                        ExecutionConfig::for_spec_and_version(SpecId::BOGOTA, version),
-                        SpecId::BOGOTA,
-                        ethereum_tx_registry(SpecId::BOGOTA),
-                        Precompiles::base(SpecId::BOGOTA),
-                    );
+                    set_version(&mut evm, version);
                     let mut payload = payload(vec![
                         frame(FrameMode::Verify, SENDER),
                         frame(FrameMode::Sender, BODY),

@@ -74,13 +74,7 @@ fn async_prefix_returns_payment_facts_and_discards_legacy_and_keyed_consumption(
         assert!(actual.sender_approved);
         assert_eq!(evm.state_mut().account(&SENDER).unwrap().nonce(), 0);
         assert_eq!(
-            evm.state_mut()
-                .storage(&NONCE_MANAGER)
-                .unwrap()
-                .into_slot(nonce_slot(SENDER, U256::from(1)))
-                .unwrap()
-                .get()
-                .current,
+            common::stored(&mut evm, NONCE_MANAGER, nonce_slot(SENDER, U256::from(1))),
             U256::ZERO,
         );
         assert!(evm.transact(&transaction).unwrap().discard().status);

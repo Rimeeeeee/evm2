@@ -2,13 +2,13 @@
 
 mod common;
 
-use alloy_consensus::{TxEip8141, transaction::Recovered};
+use alloy_consensus::TxEip8141;
 use alloy_eips::eip8141::{Frame, FrameMode, FrameStatus, NONCE_MANAGER, nonce_slot};
 use alloy_primitives::{Address, Bytes, U256};
 use common::{APPROVE_BOTH, BODY, SENDER};
 use evm2::{
     BaseEvmTypes, Evm, Inspector,
-    ethereum::{TxEnvelope, eip8141::FrameGas},
+    ethereum::eip8141::FrameGas,
     evm::{AccountInfo, PendingState},
     interpreter::{InstrStop, Interpreter, Message, MessageResult},
 };
@@ -121,16 +121,10 @@ fn generated_sequences_match_rollback_model_and_inspected_prefix_reuse() {
                     if assertions != 0 {
                         frames.extend(vec![frame(FrameMode::Assert, ASSERTION, 0); 2]);
                     }
-                    let tx = Recovered::new_unchecked(
-                        TxEnvelope::Eip8141(TxEip8141 {
-                            chain_id: 1,
-                            sender: SENDER,
-                            nonce_keys: Some(if keyed { vec![U256::from(1)] } else { vec![] }),
-                            frames,
-                            ..Default::default()
-                        }),
-                        Address::ZERO,
-                    );
+                    let tx = common::recovered(TxEip8141 {
+                        nonce_keys: Some(if keyed { vec![U256::from(1)] } else { vec![] }),
+                        ..common::payload(frames)
+                    });
                     let mut plain_evm = evm(assertions == 2);
                     let plain = plain_evm
                         .transact(&tx)

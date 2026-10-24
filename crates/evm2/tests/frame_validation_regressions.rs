@@ -155,9 +155,7 @@ fn malformed_frame_structure_and_nonce_schemas_are_rejected_without_reads() {
         (
             "expiry repeated",
             |tx| {
-                let mut expiry = frame(FrameMode::Verify, EXPIRY_VERIFIER, 0);
-                expiry.limits.state = 0;
-                expiry.data = vec![0; EXPIRY_DATA_LENGTH].into();
+                let expiry = valid_expiry();
                 tx.frames.extend([expiry.clone(), expiry]);
             },
             "invalid or repeated expiry verifier frame",
@@ -353,115 +351,89 @@ fn every_signature_is_validated_before_account_or_nonce_reads() {
 
 #[test]
 fn resource_fee_and_blob_validation_precedes_database_reads() {
-    let mut cases = Vec::new();
+    type Case = (&'static str, fn(&mut TxEip8141, &mut Version, &mut BlockEnvExt), HandlerError);
     let version = Version::new(SpecId::BOGOTA);
-    let block = BlockEnvExt::default();
-    let tx = payload();
-    let gas = FrameGas::calculate(&tx, &version).unwrap();
-    let mut capped = version;
-    capped.tx_gas_limit_cap = gas.execution - 1;
-    cases.push((
-        "active execution cap",
-        tx.clone(),
-        capped,
-        block,
-        HandlerError::TxGasLimitGreaterThanCap { gas_limit: gas.execution, cap: gas.execution - 1 },
-    ));
-    let mut small_block = block;
-    small_block.gas_limit = U256::from(1);
-    cases.push((
-        "independent block dimensions",
-        tx.clone(),
-        version,
-        small_block,
-        HandlerError::GasLimitMoreThanBlock {
-            gas_limit: gas.execution.max(gas.state),
-            block_gas_limit: U256::from(1),
-        },
-    ));
-    let mut chain = tx.clone();
-    chain.chain_id = 2;
-    cases.push((
-        "chain",
-        chain,
-        version,
-        block,
-        HandlerError::InvalidChainId { expected: 1, got: 2 },
-    ));
-    let mut priced_block = block;
-    priced_block.basefee = U256::from(10);
-    cases.push((
-        "base-fee budget",
-        tx.clone(),
-        version,
-        priced_block,
-        HandlerError::FrameFeeBudgetTooLow {
-            required: U256::from(gas.maximum) * U256::from(10),
-            got: tx.fees.max_fee,
-        },
-    ));
-    let mut blobs = tx.clone();
-    blobs.blob_versioned_hashes = vec![blob_hash(); version.max_blobs_per_tx + 1];
-    cases.push((
-        "blob count",
-        blobs,
-        version,
-        block,
-        HandlerError::TooManyBlobs {
-            have: version.max_blobs_per_tx + 1,
-            max: version.max_blobs_per_tx,
-        },
-    ));
-    let mut blob_version = tx.clone();
-    blob_version.blob_versioned_hashes.push(B256::ZERO);
-    cases.push((
-        "blob version",
-        blob_version,
-        version,
-        block,
-        HandlerError::BlobVersionNotSupported,
-    ));
-    let mut blob_fee = tx.clone();
-    blob_fee.blob_versioned_hashes.push(blob_hash());
-    blob_fee.fees.max_fee = U256::from(2 * 131_072 - 1);
-    let mut blob_block = block;
-    blob_block.blob_basefee = U256::from(2);
-    cases.push((
-        "blob base-fee budget",
-        blob_fee,
-        version,
-        blob_block,
-        HandlerError::FrameFeeBudgetTooLow {
-            required: U256::from(2 * 131_072),
-            got: U256::from(2 * 131_072 - 1),
-        },
-    ));
-    let mut overflow = tx;
-    overflow.fees.max_fee = U256::MAX;
-    let mut expensive_execution = block;
-    expensive_execution.basefee = U256::MAX;
-    cases.push((
-        "payment overflow",
-        overflow,
-        version,
-        expensive_execution,
-        invalid("payment overflow"),
-    ));
-    let mut blobs = payload();
-    blobs.blob_versioned_hashes.push(blob_hash());
-    blobs.fees.max_fee = U256::MAX;
-    let mut expensive_blobs = block;
-    expensive_blobs.blob_basefee = U256::MAX;
-    cases.push((
-        "blob charge overflow",
-        blobs,
-        version,
-        expensive_blobs,
-        invalid("payment overflow"),
-    ));
-    for (name, tx, version, block, expected) in cases {
+    let gas = FrameGas::calculate(&payload(), &version).unwrap();
+    let cases: &[Case] = &[
+        (
+            "active execution cap",
+            |tx, version, _| {
+                version.tx_gas_limit_cap = FrameGas::calculate(tx, version).unwrap().execution - 1;
+            },
+            HandlerError::TxGasLimitGreaterThanCap {
+                gas_limit: gas.execution,
+                cap: gas.execution - 1,
+            },
+        ),
+        (
+            "independent block dimensions",
+            |_, _, block| block.gas_limit = U256::from(1),
+            HandlerError::GasLimitMoreThanBlock {
+                gas_limit: gas.execution.max(gas.state),
+                block_gas_limit: U256::from(1),
+            },
+        ),
+        ("chain", |tx, _, _| tx.chain_id = 2, HandlerError::InvalidChainId { expected: 1, got: 2 }),
+        (
+            "base-fee budget",
+            |_, _, block| block.basefee = U256::from(10),
+            HandlerError::FrameFeeBudgetTooLow {
+                required: U256::from(gas.maximum) * U256::from(10),
+                got: payload().fees.max_fee,
+            },
+        ),
+        (
+            "blob count",
+            |tx, version, _| {
+                tx.blob_versioned_hashes = vec![blob_hash(); version.max_blobs_per_tx + 1];
+            },
+            HandlerError::TooManyBlobs {
+                have: version.max_blobs_per_tx + 1,
+                max: version.max_blobs_per_tx,
+            },
+        ),
+        (
+            "blob version",
+            |tx, _, _| tx.blob_versioned_hashes.push(B256::ZERO),
+            HandlerError::BlobVersionNotSupported,
+        ),
+        (
+            "blob base-fee budget",
+            |tx, _, block| {
+                tx.blob_versioned_hashes.push(blob_hash());
+                tx.fees.max_fee = U256::from(2 * 131_072 - 1);
+                block.blob_basefee = U256::from(2);
+            },
+            HandlerError::FrameFeeBudgetTooLow {
+                required: U256::from(2 * 131_072),
+                got: U256::from(2 * 131_072 - 1),
+            },
+        ),
+        (
+            "payment overflow",
+            |tx, _, block| {
+                tx.fees.max_fee = U256::MAX;
+                block.basefee = U256::MAX;
+            },
+            invalid("payment overflow"),
+        ),
+        (
+            "blob charge overflow",
+            |tx, _, block| {
+                tx.blob_versioned_hashes.push(blob_hash());
+                tx.fees.max_fee = U256::MAX;
+                block.blob_basefee = U256::MAX;
+            },
+            invalid("payment overflow"),
+        ),
+    ];
+    for (name, prepare, expected) in cases {
+        let mut tx = payload();
+        let mut version = version;
+        let mut block = BlockEnvExt::default();
+        prepare(&mut tx, &mut version, &mut block);
         let (mut evm, reads) = evm(version, block);
-        assert_eq!(evm.validate_tx(&recovered(tx)).unwrap_err(), expected, "{name}");
+        assert_eq!(evm.validate_tx(&recovered(tx)).unwrap_err(), *expected, "{name}");
         assert_eq!(reads.load(Ordering::Relaxed), 0, "{name}");
     }
 }
@@ -554,58 +526,39 @@ fn activation_and_signature_placeholder_controls_do_not_relax_static_shape() {
 
 #[test]
 fn valid_structure_boundaries_reach_database_validation() {
-    let version = Version::new(SpecId::BOGOTA);
-    let mut cases = vec![("baseline", payload(), version)];
-    let mut tx = payload();
-    tx.frames.truncate(1);
-    cases.push(("one frame", tx, version));
-    let mut tx = payload();
-    tx.frames.resize(64, frame(FrameMode::Sender, BODY, 0));
-    cases.push(("64 frames", tx, version));
-    let mut tx = payload();
-    tx.nonce_keys = Some((1..=16).map(U256::from).collect());
-    cases.push(("16 keys", tx, version));
-    let mut tx = payload();
-    tx.nonce_keys = Some(vec![U256::ZERO]);
-    cases.push(("zero keyed domain", tx, version));
-    let mut tx = payload();
-    tx.nonce_keys = Some(vec![U256::ZERO, U256::from(1)]);
-    cases.push(("zero mixed with another key", tx, version));
-    let mut tx = payload();
-    tx.nonce_keys = Some(vec![U256::ZERO]);
-    tx.nonce = u64::MAX;
-    cases.push(("single-use zero keyed domain", tx, version));
-    let mut tx = payload();
-    tx.nonce_keys = None;
-    let mut legacy = version;
-    legacy.features.remove(EvmFeatures::EIP8250);
-    cases.push(("pre-keyed schema", tx, legacy));
-    let mut tx = payload();
-    tx.frames[0].target = Default::default();
-    cases.push(("implicit sender approval target", tx, version));
-    let mut tx = payload();
-    tx.nonce = u64::MAX - 1;
-    cases.push(("last incrementable sequence", tx, version));
-    let mut tx = payload();
-    tx.frames[1].limits = FrameLimits::default();
-    cases.push(("zero frame budgets", tx, version));
-    let mut tx = payload();
-    let mut expiry = frame(FrameMode::Verify, EXPIRY_VERIFIER, 0);
-    expiry.limits.state = 0;
-    expiry.data = vec![0; EXPIRY_DATA_LENGTH].into();
-    tx.frames.push(expiry);
-    cases.push(("constrained expiry", tx, version));
-    let mut tx = payload();
-    tx.blob_versioned_hashes = vec![blob_hash(); version.max_blobs_per_tx];
-    tx.fees.max_fee = U256::MAX;
-    cases.push(("maximum blob count", tx, version));
-    let mut tx = payload();
-    tx.fees.max_fee = U256::MAX;
-    cases.push(("maximum aggregate budget", tx, version));
-    let mut tx = payload();
-    tx.fees.max_priority_fee_per_gas = U256::MAX;
-    cases.push(("maximum priority with zero budget", tx, version));
-    for (name, tx, version) in cases {
+    type Case = (&'static str, fn(&mut TxEip8141, &mut Version));
+    let cases: &[Case] = &[
+        ("baseline", |_, _| {}),
+        ("one frame", |tx, _| tx.frames.truncate(1)),
+        ("64 frames", |tx, _| tx.frames.resize(64, frame(FrameMode::Sender, BODY, 0))),
+        ("16 keys", |tx, _| tx.nonce_keys = Some((1..=16).map(U256::from).collect())),
+        ("zero keyed domain", |tx, _| tx.nonce_keys = Some(vec![U256::ZERO])),
+        ("zero mixed with another key", |tx, _| {
+            tx.nonce_keys = Some(vec![U256::ZERO, U256::from(1)]);
+        }),
+        ("single-use zero keyed domain", |tx, _| {
+            tx.nonce_keys = Some(vec![U256::ZERO]);
+            tx.nonce = u64::MAX;
+        }),
+        ("pre-keyed schema", |tx, version| {
+            tx.nonce_keys = None;
+            version.features.remove(EvmFeatures::EIP8250);
+        }),
+        ("implicit sender approval target", |tx, _| tx.frames[0].target = Default::default()),
+        ("last incrementable sequence", |tx, _| tx.nonce = u64::MAX - 1),
+        ("zero frame budgets", |tx, _| tx.frames[1].limits = FrameLimits::default()),
+        ("constrained expiry", |tx, _| tx.frames.push(valid_expiry())),
+        ("maximum blob count", |tx, version| {
+            tx.blob_versioned_hashes = vec![blob_hash(); version.max_blobs_per_tx];
+            tx.fees.max_fee = U256::MAX;
+        }),
+        ("maximum aggregate budget", |tx, _| tx.fees.max_fee = U256::MAX),
+        ("maximum priority with zero budget", |tx, _| tx.fees.max_priority_fee_per_gas = U256::MAX),
+    ];
+    for (name, prepare) in cases {
+        let mut tx = payload();
+        let mut version = Version::new(SpecId::BOGOTA);
+        prepare(&mut tx, &mut version);
         let (mut evm, reads) = evm(version, BlockEnvExt::default());
         assert!(
             matches!(evm.validate_tx(&recovered(tx)), Err(HandlerError::Database(error)) if error.is_fatal()),

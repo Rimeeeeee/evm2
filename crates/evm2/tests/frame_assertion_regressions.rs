@@ -5,12 +5,13 @@ mod common;
 use alloy_consensus::{TxLegacy, transaction::Recovered};
 use alloy_eips::{
     eip8141::{Frame, FrameLimits, FrameMode, FrameStatus, NONCE_MANAGER},
-    eip8272::{
-        RECENT_ROOT_ADDRESS, RECENT_ROOT_CODE, RECENT_ROOT_ENTRY_DOMAIN, RECENT_ROOT_STORAGE_DOMAIN,
-    },
+    eip8272::{RECENT_ROOT_ADDRESS, RECENT_ROOT_CODE},
 };
 use alloy_primitives::{Address, Bytes, KECCAK256_EMPTY, TxKind, U256, keccak256};
-use common::{APPROVE_BOTH, BODY, SENDER, payload, recovered};
+use common::{
+    APPROVE_BOTH, BODY, SENDER, install_recent_root, payload, recent_entry, recent_slot,
+    recent_tuple, recovered, stored,
+};
 use evm2::{
     BaseEvmTypes, Evm,
     bytecode::Bytecode,
@@ -227,10 +228,7 @@ fn selector_and_index_operands_are_checked_at_full_width() {
         assert_eq!(result.stops[2], InstrStop::OpcodeNotFound, "case {i}");
         assert_eq!(result.assertion_failure, Some(2));
         assert_eq!(evm.state_mut().account(&SENDER).unwrap().nonce(), 1);
-        assert_eq!(
-            evm.state_mut().storage(&BODY).unwrap().into_slot(U256::ZERO).unwrap().current(),
-            U256::ZERO
-        );
+        assert_eq!(stored(&mut evm, BODY, U256::ZERO), U256::ZERO);
     }
 }
 
@@ -349,33 +347,6 @@ fn old_event_copy_byte_is_undefined_and_repurposed_byte_requires_four_operands()
     }
 }
 
-fn install_recent_root(evm: &mut Evm<'_, BaseEvmTypes>) {
-    evm.overlay_db_mut().insert_account_info(
-        &RECENT_ROOT_ADDRESS,
-        AccountInfo::default().with_code(Bytecode::new_legacy(RECENT_ROOT_CODE.clone())),
-    );
-}
-
-fn recent_tuple(source: [u8; 32], slot: u64, root: [u8; 32]) -> Vec<u8> {
-    let mut tuple = source.to_vec();
-    tuple.extend_from_slice(&slot.to_be_bytes());
-    tuple.extend_from_slice(&root);
-    tuple
-}
-
-fn recent_slot(source: [u8; 32], slot: u64) -> U256 {
-    let mut input = RECENT_ROOT_STORAGE_DOMAIN.as_slice().to_vec();
-    input.extend_from_slice(&source);
-    input.extend_from_slice(&(slot % 8192).to_be_bytes());
-    U256::from_be_bytes(keccak256(input).0)
-}
-
-fn recent_entry(tuple: &[u8]) -> U256 {
-    let mut input = RECENT_ROOT_ENTRY_DOMAIN.as_slice().to_vec();
-    input.extend_from_slice(tuple);
-    U256::from_be_bytes(keccak256(input).0)
-}
-
 fn recent_query(target: Address, data: Vec<u8>) -> Recovered<TxEnvelope> {
     let mut verifier = frame(FrameMode::Verify, target);
     verifier.flags = 0;
@@ -412,12 +383,7 @@ fn recent_root_write_read_and_ring_overwrite_execute_ordinary_contract_code() {
         assert!(evm.transact(&write).unwrap().commit().status);
         let tuple = recent_tuple(source, slot, root);
         assert_eq!(
-            evm.state_mut()
-                .storage(&RECENT_ROOT_ADDRESS)
-                .unwrap()
-                .into_slot(recent_slot(source, slot))
-                .unwrap()
-                .current(),
+            stored(&mut evm, RECENT_ROOT_ADDRESS, recent_slot(source, slot)),
             recent_entry(&tuple)
         );
         assert!(evm.transact(&recent_query(RECENT_ROOT_ADDRESS, tuple.clone())).is_err());
