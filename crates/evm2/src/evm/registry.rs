@@ -7,7 +7,9 @@
 //! it does not force a particular transaction or receipt representation onto
 //! the rest of the crate.
 
-use crate::{AnyError, DatabaseError, EvmTypesHost, ExecutionError};
+use crate::{
+    AnyError, DatabaseError, EvmTypesHost, ExecutionError, ethereum::eip8141::FrameValidationResult,
+};
 use alloc::sync::Arc;
 use alloy_consensus::transaction::Recovered;
 use alloy_primitives::{U256, map::HashMap};
@@ -204,6 +206,17 @@ pub trait TxHandler<T: EvmTypesHost, Tx, Output> {
 
     /// Validates and executes the transaction.
     fn execute(&self, req: TxRequest<'_, '_, T, Tx>) -> HandlerResult<Output>;
+
+    /// Executes a payable frame prefix without finalizing the transaction.
+    ///
+    /// The caller owns discarding the prefix's state changes and execution context.
+    fn validate_frame_prefix(
+        &self,
+        _req: TxRequest<'_, '_, T, Tx>,
+        _prefix_end: usize,
+    ) -> HandlerResult<FrameValidationResult> {
+        Err(HandlerError::InvalidFrameTransaction("prefix requires a frame transaction"))
+    }
 }
 
 /// Builds a handler from shared preparation and execution closures.
@@ -281,6 +294,18 @@ impl<T: EvmTypesHost, Output> AnyTxHandler<T, Output> {
     ) -> HandlerResult<()> {
         self.inner.validate(env, host)
     }
+
+    /// Executes a frame prefix through its typed handler.
+    ///
+    /// The caller owns discarding prefix effects, as with [`Self::validate`].
+    pub fn validate_frame_prefix<'host>(
+        &self,
+        env: &Recovered<T::Tx>,
+        host: &mut T::Host<'host>,
+        prefix_end: usize,
+    ) -> HandlerResult<FrameValidationResult> {
+        self.inner.validate_frame_prefix(env, host, prefix_end)
+    }
 }
 
 trait ErasedTxHandler<T: EvmTypesHost, Output>: Send + Sync {
@@ -295,6 +320,13 @@ trait ErasedTxHandler<T: EvmTypesHost, Output>: Send + Sync {
         env: &Recovered<T::Tx>,
         host: &mut T::Host<'host>,
     ) -> HandlerResult<()>;
+
+    fn validate_frame_prefix<'host>(
+        &self,
+        env: &Recovered<T::Tx>,
+        host: &mut T::Host<'host>,
+        prefix_end: usize,
+    ) -> HandlerResult<FrameValidationResult>;
 }
 
 struct HandlerAdapter<Tx, H, F> {
@@ -344,6 +376,25 @@ where
             host,
             _non_exhaustive: (),
         })
+    }
+
+    fn validate_frame_prefix<'host>(
+        &self,
+        env: &Recovered<T::Tx>,
+        host: &mut T::Host<'host>,
+        prefix_end: usize,
+    ) -> HandlerResult<FrameValidationResult> {
+        let tx = (self.extract)(env.inner())
+            .ok_or(HandlerError::WrongTransactionType { expected: self.type_id })?;
+        self.handler.validate_frame_prefix(
+            TxRequest {
+                envelope: env.inner(),
+                tx: Recovered::new_unchecked(tx, env.signer()),
+                host,
+                _non_exhaustive: (),
+            },
+            prefix_end,
+        )
     }
 }
 
@@ -665,6 +716,14 @@ mod tests {
         );
         let handler = registry.try_get_by_type(0x01).unwrap();
         let mut host = TestHost { block: BlockEnvExt::default() };
+        let tx =
+            Recovered::new_unchecked(Envelope::Transfer(TransferTx { amount: 0 }), Address::ZERO);
+        assert_eq!(
+            handler.validate_frame_prefix(&tx, &mut host, 1),
+            Err(HandlerError::InvalidFrameTransaction("prefix requires a frame transaction"))
+        );
+        assert_eq!(prepared_count.load(Ordering::Relaxed), 0);
+        assert_eq!(executed_count.load(Ordering::Relaxed), 0);
         for amount in 0..3 {
             let tx =
                 Recovered::new_unchecked(Envelope::Transfer(TransferTx { amount }), Address::ZERO);
@@ -700,6 +759,10 @@ mod tests {
         );
         assert_eq!(
             handler.validate(&wrong, &mut host),
+            Err(HandlerError::WrongTransactionType { expected: 0x01 })
+        );
+        assert_eq!(
+            handler.validate_frame_prefix(&wrong, &mut host, 1),
             Err(HandlerError::WrongTransactionType { expected: 0x01 })
         );
         assert_eq!(prepared_count.load(Ordering::Relaxed), 6);

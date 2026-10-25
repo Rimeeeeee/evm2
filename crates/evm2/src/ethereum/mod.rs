@@ -326,11 +326,7 @@ pub fn ethereum_tx_registry<T: EvmTypes<Tx = TxEnvelope>>(
     }
 
     if spec_id.enables(SpecId::BOGOTA) {
-        registry.register(
-            6,
-            TxEnvelope::as_eip8141,
-            handler(eip8141::prepare::<T>, eip8141::execute_prepared::<T>),
-        );
+        registry.register(6, TxEnvelope::as_eip8141, eip8141::FrameHandler);
     }
     registry
 }

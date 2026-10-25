@@ -1041,7 +1041,7 @@ impl<'a, T: EvmTypes<Tx: Typed2718>> Evm<'a, T> {
     ///
     /// Uses the active validation rules; callers must configure any pool-specific relaxations.
     /// For frame transactions this checks preparation only. Executable payment/approval
-    /// validation requires the Ethereum type family's `validate_frame_prefix()`.
+    /// validation requires [`Self::validate_frame_prefix`].
     pub fn validate_tx(&mut self, tx: &Recovered<T::Tx>) -> HandlerResult<()> {
         let handler = self.registry.try_get_by_type(tx.ty())?;
         let mut guard = self.enter_execution();

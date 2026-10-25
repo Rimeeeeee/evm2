@@ -5,16 +5,14 @@ use super::{
 };
 use crate::{
     Evm, EvmFeatures, EvmTypes, EvmTypesHost, HostError,
-    ethereum::{
-        TxEnvelope,
-        eip8141::{self, FrameValidationResult},
-    },
+    ethereum::eip8141::FrameValidationResult,
     interpreter::{GasTracker, InstrStop, Message, MessageResult, MessageResultExt},
     registry::{HandlerError, HandlerResult},
 };
 use alloc::{sync::Arc, vec::Vec};
 use alloy_consensus::{TxEip8141, transaction::Recovered};
 use alloy_eips::{
+    Typed2718,
     eip7906::TxTraceParam,
     eip8141::{FrameMode, FrameStatus, NONCE_MANAGER, SignatureScheme, nonce_slot},
 };
@@ -537,7 +535,7 @@ impl<T: EvmTypesHost> Drop for FrameSimulationGuard<'_, '_, T> {
     }
 }
 
-impl<'a, T: EvmTypes<Tx = TxEnvelope>> Evm<'a, T> {
+impl<'a, T: EvmTypes<Tx: Typed2718>> Evm<'a, T> {
     /// Validates all signatures, executes only the payable prefix, and discards all effects.
     ///
     /// Prefix execution always uses the interpreter, including when full transactions use a
@@ -547,12 +545,8 @@ impl<'a, T: EvmTypes<Tx = TxEnvelope>> Evm<'a, T> {
         tx: &Recovered<T::Tx>,
         prefix_end: usize,
     ) -> HandlerResult<FrameValidationResult> {
-        self.simulate_frames(|host| {
-            let payload = tx.inner().as_eip8141().ok_or(HandlerError::InvalidFrameTransaction(
-                "prefix requires a frame transaction",
-            ))?;
-            eip8141::validate_prefix(host, payload, prefix_end)
-        })
+        let handler = self.registry.try_get_by_type(tx.ty())?;
+        self.simulate_frames(|host| handler.validate_frame_prefix(tx, host, prefix_end))
     }
 
     /// Executes and discards a frame validation prefix on an async host fiber.
@@ -587,6 +581,7 @@ impl<'a, T: EvmTypes<Tx = TxEnvelope>> Evm<'a, T> {
     ) -> impl Future<Output = r#async::AsyncResult<FrameValidationResult, HandlerError>> + Send + 'fut
     where
         T::SpecId: Send,
+        T::Tx: Send + Sync,
         T::EvmExt: Send,
         T::MessageExt: Send,
         T::MessageResultExt: Send,

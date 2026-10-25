@@ -10,7 +10,7 @@ use crate::{
         GasTracker, Host, InstrStop, Message, MessageExt, MessageKind, MessageResultExt,
     },
     precompiles,
-    registry::{HandlerError, HandlerResult, TxRequest},
+    registry::{HandlerError, HandlerResult, TxHandler, TxRequest},
     version::GasId,
 };
 use alloc::{sync::Arc, vec::Vec};
@@ -194,6 +194,28 @@ pub fn execute_prepared<T: EvmTypes>(
     let result = run(host, &prepared, None);
     host.frame_tx = None;
     result
+}
+
+/// Native frame transaction handler with executable prefix validation.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FrameHandler;
+
+impl<T: EvmTypes> TxHandler<T, TxEip8141, TxResult<T>> for FrameHandler {
+    fn validate(&self, mut req: TxRequest<'_, '_, T, TxEip8141>) -> HandlerResult<()> {
+        prepare(&mut req).map(|_| ())
+    }
+
+    fn execute(&self, req: TxRequest<'_, '_, T, TxEip8141>) -> HandlerResult<TxResult<T>> {
+        handle(req)
+    }
+
+    fn validate_frame_prefix(
+        &self,
+        req: TxRequest<'_, '_, T, TxEip8141>,
+        prefix_end: usize,
+    ) -> HandlerResult<FrameValidationResult> {
+        validate_prefix(req.host, req.tx.inner(), prefix_end)
+    }
 }
 
 pub(crate) fn validate_prefix<T: EvmTypes>(

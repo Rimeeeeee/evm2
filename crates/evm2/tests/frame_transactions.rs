@@ -2,8 +2,9 @@
 
 mod common;
 
-use alloy_consensus::{TxLegacy, transaction::Recovered};
+use alloy_consensus::{TxEip8141, TxLegacy, transaction::Recovered};
 use alloy_eips::{
+    Typed2718,
     eip8141::{
         Frame, FrameMode, FrameSignature, FrameStatus, NONCE_MANAGER, SignatureMessage,
         SignatureScheme, nonce_slot,
@@ -16,13 +17,17 @@ use common::{
     payload, recent_entry, recent_slot, recent_tuple, recovered, set_version, stored,
 };
 use evm2::{
-    BaseEvmTypes, Evm, EvmFeatures, FrameTransactionResult, SpecId, TxResultExt, Version,
+    BaseEvmConfigSelector, BaseEvmTypes, Evm, EvmFeatures, EvmTypesHost, FrameTransactionResult,
+    Precompiles, SpecId, TxResultExt, Version,
     bytecode::Bytecode,
     env::BlockEnvExt,
-    ethereum::{TxEnvelope, eip8141::FrameGas},
+    ethereum::{
+        TxEnvelope,
+        eip8141::{FrameGas, FrameHandler},
+    },
     evm::{AccountInfo, Bal, BalError, BlockAccessIndex, Db, InMemoryDB},
     interpreter::{GasTracker, InstrStop},
-    registry::HandlerError,
+    registry::{HandlerError, TxRegistry},
     version::GasId,
 };
 use k256::ecdsa::SigningKey;
@@ -863,4 +868,58 @@ fn payment_approval_honors_balance_top_up_independently_of_fee_and_balance_check
             }
         }
     }
+}
+
+struct FrameEnvelope(TxEip8141);
+
+impl Typed2718 for FrameEnvelope {
+    fn ty(&self) -> u8 {
+        6
+    }
+}
+
+struct FrameTypes;
+
+impl EvmTypesHost for FrameTypes {
+    type ConfigSelector = BaseEvmConfigSelector;
+    type SpecId = SpecId;
+    type Tx = FrameEnvelope;
+    type EvmExt = ();
+    type MessageExt = ();
+    type MessageResultExt = ();
+    type TxEnvExt = ();
+    type TxResultExt = ();
+    type BlockEnvExt = ();
+    type Host<'a> = Evm<'a, Self>;
+}
+
+#[test]
+fn native_frame_prefix_dispatches_for_custom_transaction_envelopes() {
+    let registry = TxRegistry::<FrameTypes, _>::new().with_handler(
+        6,
+        |tx: &FrameEnvelope| Some(&tx.0),
+        FrameHandler,
+    );
+    let mut evm = Evm::new(
+        SpecId::BOGOTA,
+        BlockEnvExt::default(),
+        registry,
+        common::database([(SENDER, APPROVE_BOTH), (BODY, &[0xfe])]),
+        Precompiles::base(SpecId::BOGOTA),
+    );
+    let tx = Recovered::new_unchecked(
+        FrameEnvelope(payload(vec![
+            frame(FrameMode::Verify, SENDER),
+            frame(FrameMode::Sender, BODY),
+        ])),
+        Address::ZERO,
+    );
+    let prefix = evm.validate_frame_prefix(&tx, 1).unwrap();
+    assert_eq!(prefix.payer, SENDER);
+    assert!(prefix.sender_approved);
+    assert_eq!(prefix.prefix_end, 1);
+    assert_eq!(evm.state_mut().account(&SENDER).unwrap().nonce(), 0);
+    let result = evm.transact(&tx).unwrap().discard();
+    assert_eq!(result.frame.unwrap().receipts[1].status, FrameStatus::Failure);
+    assert_eq!(evm.state_mut().account(&SENDER).unwrap().nonce(), 0);
 }
