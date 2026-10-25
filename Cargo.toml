@@ -156,12 +156,21 @@ syn = "3.0"
 
 # testing
 revm = { version = "43.0.3", default-features = true, features = ["asm-keccak"] }
+revm-bytecode = { version = "43", default-features = false }
 criterion = { package = "codspeed-criterion-compat", version = "4", default-features = false, features = [
     "cargo_bench_support",
 ] }
 
 [profile.dev]
 opt-level = 3
+
+# Debug info makes the C and C++ precompile backends build about a third slower.
+[profile.dev.package]
+aws-lc-sys.debug = false
+blst.debug = false
+c-kzg.debug = false
+mcl_rust.debug = false
+secp256k1-sys.debug = false
 
 [profile.release]
 opt-level = 3
@@ -181,24 +190,24 @@ codegen-units = 1
 
 [patch.crates-io]
 # Frame transaction dependencies from bogota-devnet-2.
-alloy-consensus = { git = "https://github.com/Rimeeeeee/alloy", rev = "8dd448f877c020c48ae1a83f43cf29b222dab052" }
-alloy-consensus-any = { git = "https://github.com/Rimeeeeee/alloy", rev = "8dd448f877c020c48ae1a83f43cf29b222dab052" }
-alloy-contract = { git = "https://github.com/Rimeeeeee/alloy", rev = "8dd448f877c020c48ae1a83f43cf29b222dab052" }
-alloy-eips = { git = "https://github.com/Rimeeeeee/alloy", rev = "8dd448f877c020c48ae1a83f43cf29b222dab052" }
-alloy-genesis = { git = "https://github.com/Rimeeeeee/alloy", rev = "8dd448f877c020c48ae1a83f43cf29b222dab052" }
-alloy-json-rpc = { git = "https://github.com/Rimeeeeee/alloy", rev = "8dd448f877c020c48ae1a83f43cf29b222dab052" }
-alloy-network = { git = "https://github.com/Rimeeeeee/alloy", rev = "8dd448f877c020c48ae1a83f43cf29b222dab052" }
-alloy-network-primitives = { git = "https://github.com/Rimeeeeee/alloy", rev = "8dd448f877c020c48ae1a83f43cf29b222dab052" }
-alloy-provider = { git = "https://github.com/Rimeeeeee/alloy", rev = "8dd448f877c020c48ae1a83f43cf29b222dab052" }
-alloy-pubsub = { git = "https://github.com/Rimeeeeee/alloy", rev = "8dd448f877c020c48ae1a83f43cf29b222dab052" }
-alloy-rpc-client = { git = "https://github.com/Rimeeeeee/alloy", rev = "8dd448f877c020c48ae1a83f43cf29b222dab052" }
-alloy-rpc-types-eth = { git = "https://github.com/Rimeeeeee/alloy", rev = "8dd448f877c020c48ae1a83f43cf29b222dab052" }
-alloy-rpc-types-trace = { git = "https://github.com/Rimeeeeee/alloy", rev = "8dd448f877c020c48ae1a83f43cf29b222dab052" }
-alloy-serde = { git = "https://github.com/Rimeeeeee/alloy", rev = "8dd448f877c020c48ae1a83f43cf29b222dab052" }
-alloy-signer = { git = "https://github.com/Rimeeeeee/alloy", rev = "8dd448f877c020c48ae1a83f43cf29b222dab052" }
-alloy-transport = { git = "https://github.com/Rimeeeeee/alloy", rev = "8dd448f877c020c48ae1a83f43cf29b222dab052" }
-alloy-transport-http = { git = "https://github.com/Rimeeeeee/alloy", rev = "8dd448f877c020c48ae1a83f43cf29b222dab052" }
-alloy-tx-macros = { git = "https://github.com/Rimeeeeee/alloy", rev = "8dd448f877c020c48ae1a83f43cf29b222dab052" }
+alloy-consensus = { git = "https://github.com/Rimeeeeee/alloy", rev = "b64161812f8917c3be89337411bdfc6247d458fe" }
+alloy-consensus-any = { git = "https://github.com/Rimeeeeee/alloy", rev = "b64161812f8917c3be89337411bdfc6247d458fe" }
+alloy-contract = { git = "https://github.com/Rimeeeeee/alloy", rev = "b64161812f8917c3be89337411bdfc6247d458fe" }
+alloy-eips = { git = "https://github.com/Rimeeeeee/alloy", rev = "b64161812f8917c3be89337411bdfc6247d458fe" }
+alloy-genesis = { git = "https://github.com/Rimeeeeee/alloy", rev = "b64161812f8917c3be89337411bdfc6247d458fe" }
+alloy-json-rpc = { git = "https://github.com/Rimeeeeee/alloy", rev = "b64161812f8917c3be89337411bdfc6247d458fe" }
+alloy-network = { git = "https://github.com/Rimeeeeee/alloy", rev = "b64161812f8917c3be89337411bdfc6247d458fe" }
+alloy-network-primitives = { git = "https://github.com/Rimeeeeee/alloy", rev = "b64161812f8917c3be89337411bdfc6247d458fe" }
+alloy-provider = { git = "https://github.com/Rimeeeeee/alloy", rev = "b64161812f8917c3be89337411bdfc6247d458fe" }
+alloy-pubsub = { git = "https://github.com/Rimeeeeee/alloy", rev = "b64161812f8917c3be89337411bdfc6247d458fe" }
+alloy-rpc-client = { git = "https://github.com/Rimeeeeee/alloy", rev = "b64161812f8917c3be89337411bdfc6247d458fe" }
+alloy-rpc-types-eth = { git = "https://github.com/Rimeeeeee/alloy", rev = "b64161812f8917c3be89337411bdfc6247d458fe" }
+alloy-rpc-types-trace = { git = "https://github.com/Rimeeeeee/alloy", rev = "b64161812f8917c3be89337411bdfc6247d458fe" }
+alloy-serde = { git = "https://github.com/Rimeeeeee/alloy", rev = "b64161812f8917c3be89337411bdfc6247d458fe" }
+alloy-signer = { git = "https://github.com/Rimeeeeee/alloy", rev = "b64161812f8917c3be89337411bdfc6247d458fe" }
+alloy-transport = { git = "https://github.com/Rimeeeeee/alloy", rev = "b64161812f8917c3be89337411bdfc6247d458fe" }
+alloy-transport-http = { git = "https://github.com/Rimeeeeee/alloy", rev = "b64161812f8917c3be89337411bdfc6247d458fe" }
+alloy-tx-macros = { git = "https://github.com/Rimeeeeee/alloy", rev = "b64161812f8917c3be89337411bdfc6247d458fe" }
 
 # faster compile times: https://github.com/arkworks-rs/algebra/issues/1104
 ark-ec = { git = "https://github.com/DaniPopes/algebra", rev = "a71d9795e2e527cd0c80e6831bd957134de30d22" }

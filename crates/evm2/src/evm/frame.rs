@@ -1,13 +1,14 @@
 //! Frame transaction runtime, scoped approvals, and executable-prefix validation.
 
 use super::{
-    ExecutionGuard, InterpreterRunner, State, frame_diff::FrameDiff, inspector::Inspector,
+    ExecutionGuard, InterpreterRunner, ScopedInspector, State, frame_diff::FrameDiff,
+    inspector::Inspector,
 };
 use crate::{
     Evm, EvmFeatures, EvmTypes, EvmTypesHost, HostError,
     ethereum::eip8141::FrameValidationResult,
     interpreter::{GasTracker, InstrStop, Message, MessageResult, MessageResultExt},
-    registry::{HandlerError, HandlerResult},
+    registry::HandlerResult,
 };
 use alloc::{sync::Arc, vec::Vec};
 use alloy_consensus::{TxEip8141, transaction::Recovered};
@@ -20,6 +21,8 @@ use alloy_primitives::{Address, B256, Bytes, KECCAK256_EMPTY, U256, map::HashMap
 
 #[cfg(feature = "async")]
 use super::{SendEvmRef, r#async};
+#[cfg(feature = "async")]
+use crate::registry::HandlerError;
 #[cfg(feature = "async")]
 use core::future::Future;
 
@@ -507,8 +510,8 @@ impl<T: EvmTypes> Evm<'_, T> {
     /// Invokes a frame lifecycle hook while preventing inspector mutation.
     pub(crate) fn inspect_frame(&mut self, f: impl FnOnce(&mut dyn Inspector<T>, &mut Self)) {
         let guard = self.enter_execution();
-        if let Some(inspector) = guard.evm.inspector.as_deref_mut() {
-            // SAFETY: the execution guard prevents replacing the boxed inspector.
+        if let Some(inspector) = guard.evm.active_inspector() {
+            // SAFETY: the execution guard prevents replacing the active inspector.
             let inspector = unsafe { &mut *(inspector as *mut dyn Inspector<T>) };
             f(inspector, guard.evm);
         }
@@ -547,6 +550,22 @@ impl<'a, T: EvmTypes<Tx: Typed2718>> Evm<'a, T> {
     ) -> HandlerResult<FrameValidationResult> {
         let handler = self.registry.try_get_by_type(tx.ty())?;
         self.simulate_frames(|host| handler.validate_frame_prefix(tx, host, prefix_end))
+    }
+
+    /// Executes a discarded frame prefix using a borrowed inspector.
+    ///
+    /// Restores the previous inspector on success, error, or unwind.
+    pub fn validate_frame_prefix_with_inspector(
+        &mut self,
+        tx: &Recovered<T::Tx>,
+        prefix_end: usize,
+        inspector: &mut (dyn Inspector<T> + '_),
+    ) -> HandlerResult<FrameValidationResult> {
+        self.assert_inspector_mutable();
+        let mut scope = ScopedInspector::install(self, inspector);
+        let result = scope.evm.validate_frame_prefix(tx, prefix_end);
+        scope.completed = true;
+        result
     }
 
     /// Executes and discards a frame validation prefix on an async host fiber.

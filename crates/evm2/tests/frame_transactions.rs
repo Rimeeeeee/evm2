@@ -450,19 +450,34 @@ impl evm2::Inspector<BaseEvmTypes> for PanicAtFrameEnd {
 
 #[test]
 fn prefix_unwind_discards_approved_nonce_and_restores_runner() {
-    let mut evm = evm(&[], &[]);
-    let calls = Arc::new(AtomicUsize::new(0));
-    evm.set_interpreter_runner(CountingRunner(calls.clone()));
-    evm.set_inspector(PanicAtFrameEnd);
-    let tx = recovered(payload(vec![frame(FrameMode::Verify, SENDER)]));
-    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        evm.validate_frame_prefix(&tx, 1).unwrap();
-    }));
-    assert!(panic.is_err());
-    evm.clear_inspector();
-    assert_eq!(evm.state_mut().account(&SENDER).unwrap().nonce(), 0);
-    assert!(evm.transact(&tx).unwrap().discard().status);
-    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    for borrowed in [false, true] {
+        let mut evm = evm(&[], &[]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        evm.set_interpreter_runner(CountingRunner(calls.clone()));
+        if borrowed {
+            evm.set_inspector(EntryFailureInspector::default());
+        } else {
+            evm.set_inspector(PanicAtFrameEnd);
+        }
+        let tx = recovered(payload(vec![frame(FrameMode::Verify, SENDER)]));
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if borrowed {
+                evm.validate_frame_prefix_with_inspector(&tx, 1, &mut PanicAtFrameEnd).unwrap();
+            } else {
+                evm.validate_frame_prefix(&tx, 1).unwrap();
+            }
+        }));
+        assert!(panic.is_err());
+        if borrowed {
+            let inspector = evm.clear_inspector_as::<EntryFailureInspector>().unwrap();
+            assert!(inspector.starts.is_empty());
+        } else {
+            evm.clear_inspector();
+        }
+        assert_eq!(evm.state_mut().account(&SENDER).unwrap().nonce(), 0);
+        assert!(evm.transact(&tx).unwrap().discard().status);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
 }
 
 #[test]
@@ -552,8 +567,8 @@ struct EntryFailureInspector {
     ends: Vec<(usize, FrameStatus, InstrStop)>,
 }
 
-impl evm2::Inspector<BaseEvmTypes> for EntryFailureInspector {
-    fn frame_start(&mut self, index: usize, _: &Frame, _: &mut Evm<'_, BaseEvmTypes>) {
+impl<T: evm2::EvmTypes> evm2::Inspector<T> for EntryFailureInspector {
+    fn frame_start(&mut self, index: usize, _: &Frame, _: &mut Evm<'_, T>) {
         self.starts.push(index);
     }
 
@@ -563,7 +578,7 @@ impl evm2::Inspector<BaseEvmTypes> for EntryFailureInspector {
         receipt: &alloy_eips::eip8141::FrameReceipt,
         _: &Bytes,
         stop: InstrStop,
-        _: &mut Evm<'_, BaseEvmTypes>,
+        _: &mut Evm<'_, T>,
     ) {
         self.ends.push((index, receipt.status, stop));
     }
@@ -914,12 +929,19 @@ fn native_frame_prefix_dispatches_for_custom_transaction_envelopes() {
         ])),
         Address::ZERO,
     );
-    let prefix = evm.validate_frame_prefix(&tx, 1).unwrap();
+    evm.set_inspector(EntryFailureInspector::default());
+    let mut inspector = EntryFailureInspector::default();
+    let prefix = evm.validate_frame_prefix_with_inspector(&tx, 1, &mut inspector).unwrap();
     assert_eq!(prefix.payer, SENDER);
     assert!(prefix.sender_approved);
     assert_eq!(prefix.prefix_end, 1);
     assert_eq!(evm.state_mut().account(&SENDER).unwrap().nonce(), 0);
-    let result = evm.transact(&tx).unwrap().discard();
+    assert_eq!(inspector.starts, vec![0]);
+    let previous = evm.clear_inspector_as::<EntryFailureInspector>().unwrap();
+    assert!(previous.starts.is_empty());
+    let result = evm.transact_with_inspector(&tx, &mut inspector).unwrap().discard();
     assert_eq!(result.frame.unwrap().receipts[1].status, FrameStatus::Failure);
+    assert_eq!(inspector.starts, vec![0, 0, 1]);
+    assert!(evm.inspector().is_none());
     assert_eq!(evm.state_mut().account(&SENDER).unwrap().nonce(), 0);
 }
