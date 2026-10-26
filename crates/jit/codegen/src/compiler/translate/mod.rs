@@ -1111,6 +1111,10 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
                 goto_return!(no_branch);
             }
             op::INVALID => goto_return!(fail InstrStop::InvalidFEOpcode),
+            op::SETCODEFROM => {
+                let sp = self.sp_after_inputs();
+                self.call_fallible_builtin(Builtin::SetCodeFrom, &[self.ecx, sp]);
+            }
             op::SELFDESTRUCT => {
                 let sp = self.sp_after_inputs();
                 self.sync_diverging_stack_effect();

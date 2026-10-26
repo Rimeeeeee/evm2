@@ -2,17 +2,18 @@
 
 use super::*;
 use crate::runtime::{ArtifactStore, RuntimeArtifactStore, RuntimeConfig, RuntimeTuning};
-use alloy_consensus::{TxEip8141, transaction::Recovered};
+use alloy_consensus::{TxEip8141, TxLegacy, transaction::Recovered};
 use alloy_eips::eip8141::{
     Frame, FrameLimits, FrameMode, FrameSignature, FrameStatus, SignatureScheme,
 };
-use alloy_primitives::{Address, Bytes, U256};
+use alloy_primitives::{Address, Bytes, TxKind, U256};
 use evm2::{
     Precompiles, SpecId, TxResultWithState,
     bytecode::Bytecode,
     env::BlockEnvExt,
     ethereum::{TxEnvelope, ethereum_tx_registry},
     evm::{AccountInfo, InMemoryDB},
+    interpreter::op,
 };
 use std::{
     sync::Arc,
@@ -240,6 +241,81 @@ fn repeated_frames_reuse_compilations_and_release_cleared_programs() {
             }
             assert!(Instant::now() < deadline, "frame programs retained after clearing aot={aot}");
             std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+
+fn run_code_adoption(backend: Option<&JitBackend>, revert: bool) -> TxResultWithState {
+    let sender = Address::with_last_byte(0xa0);
+    let body = Address::with_last_byte(0xb0);
+    let source = Address::with_last_byte(0xc0);
+    let beneficiary = Address::with_last_byte(0xd0);
+    let mut code = vec![op::PUSH20];
+    code.extend_from_slice(source.as_slice());
+    code.extend_from_slice(&[op::SETCODEFROM, op::POP]);
+    if revert {
+        code.extend_from_slice(&[op::PUSH0, op::PUSH0, op::REVERT]);
+    } else {
+        code.push(op::PUSH20);
+        code.extend_from_slice(beneficiary.as_slice());
+        code.push(op::SELFDESTRUCT);
+    }
+    let mut database = InMemoryDB::default();
+    for (address, balance, code) in [
+        (sender, 1_000_000_000, Bytecode::default()),
+        (body, 7, Bytecode::new_legacy(code.into())),
+        (source, 0, Bytecode::new_legacy(Bytes::from_static(&[op::STOP]))),
+    ] {
+        database.insert_account_info(
+            &address,
+            AccountInfo::default().with_balance(U256::from(balance)).with_code(code),
+        );
+    }
+    let mut evm = Evm::<BaseEvmTypes>::new(
+        SpecId::BOGOTA,
+        BlockEnvExt::default(),
+        ethereum_tx_registry(SpecId::BOGOTA),
+        database,
+        Precompiles::base(SpecId::BOGOTA),
+    );
+    if let Some(backend) = backend {
+        evm.set_interpreter_runner(JitInterpreterRunner::new(backend.clone()));
+    }
+    let tx = TxLegacy { gas_limit: 1_000_000, to: TxKind::Call(body), ..Default::default() };
+    evm.transact(&Recovered::new_unchecked(TxEnvelope::Legacy(tx), sender)).unwrap().detach()
+}
+
+#[test]
+fn code_adoption_and_sendall_match_interpreter_jit_aot_and_reloaded_artifacts() {
+    for aot in [false, true] {
+        let store = Arc::new(RuntimeArtifactStore::new().unwrap()) as Arc<dyn ArtifactStore>;
+        let config = RuntimeConfig {
+            enabled: true,
+            blocking: true,
+            aot,
+            store: aot.then_some(store),
+            tuning: RuntimeTuning {
+                jit_hot_threshold: 0,
+                jit_worker_count: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut backend = JitBackend::new(config.clone()).unwrap();
+        for reload in [false, true] {
+            if reload && aot {
+                backend = JitBackend::new(config.clone()).unwrap();
+            }
+            for revert in [false, true] {
+                let interpreted = run_code_adoption(None, revert);
+                let before = backend.stats().lookup_hits;
+                let compiled = run_code_adoption(Some(&backend), revert);
+                assert_eq!(interpreted.result.status, !revert);
+                assert_eq!(compiled.result, interpreted.result);
+                assert_eq!(compiled.pending_state, interpreted.pending_state);
+                assert!(backend.stats().lookup_hits > before);
+                assert_eq!(backend.stats().compilations_failed, 0);
+            }
         }
     }
 }

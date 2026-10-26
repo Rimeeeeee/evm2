@@ -374,6 +374,22 @@ mod tests {
         amsterdam_without_eip8037.features.remove(EvmFeatures::EIP8037);
         assert_eq!(amsterdam_without_eip8037.tx_gas_caps(), (MAX_TX_GAS_LIMIT_OSAKA, u64::MAX));
     }
+
+    #[test]
+    fn bogota_enables_code_adoption_sendall_and_restricted_recovery() {
+        let amsterdam = Version::base(SpecId::AMSTERDAM);
+        let bogota = Version::base(SpecId::BOGOTA);
+        for feature in [EvmFeatures::EIP8298, EvmFeatures::EIP4758, EvmFeatures::EIP8151] {
+            assert!(!amsterdam.feature(feature));
+            assert!(bogota.feature(feature));
+        }
+        assert_eq!(op::SETCODEFROM, 0xa7);
+        assert!(opcode_config(SpecId::AMSTERDAM).is_unknown_opcode(op::SETCODEFROM));
+        assert!(!opcode_config(SpecId::BOGOTA).is_unknown_opcode(op::SETCODEFROM));
+        assert_eq!(opcode_config(SpecId::BOGOTA).static_gas(op::SETCODEFROM), 0);
+        assert_eq!(bogota.gas_params.get(GasId::SetCodeFromWrite), 9_000);
+        assert_eq!(amsterdam.gas_params.get(GasId::SetCodeFromWrite), 0);
+    }
 }
 
 /// EIP-8037 cost per state byte (CPSB) for Glamsterdam.
@@ -880,6 +896,9 @@ evm_versions! {
             EIP8141,
             EIP8250,
             EIP7906,
+            EIP8298,
+            EIP4758,
+            EIP8151,
         ],
         ops: [
             APPROVE: ZERO,
@@ -891,6 +910,10 @@ evm_versions! {
             SIGDATACOPY: VERYLOW,
             TXTRACE: WARM_STORAGE_READ_COST,
             EVENTDATACOPY: VERYLOW,
+            SETCODEFROM: ZERO,
+        ],
+        dynamic_gas: [
+            SetCodeFromWrite: 9000,
         ],
     }
 }
@@ -1054,6 +1077,7 @@ macro_rules! op_instr {
     (@path $ty:ident, REVERT) => { instr::revert<$ty> };
     (@path $ty:ident, INVALID) => { instr::invalid<$ty> };
     (@path $ty:ident, SELFDESTRUCT) => { instr::selfdestruct<$ty> };
+    (@path $ty:ident, SETCODEFROM) => { instr::setcodefrom<$ty> };
     (@path $ty:ident, APPROVE) => { instr::approve<$ty> };
     (@path $ty:ident, TXPARAM) => { instr::txparam<$ty> };
     (@path $ty:ident, FRAMEDATALOAD) => { instr::framedataload<$ty> };

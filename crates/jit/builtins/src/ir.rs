@@ -314,6 +314,7 @@ builtins! {
     EventDataCopy  = __revmc_builtin_eventdatacopy(@[ecx] ptr, @[sp] ptr) None,
 
     SelfDestruct   = #[NoReturn] __revmc_builtin_selfdestruct(@[ecx] ptr, @[sp] ptr) None,
+    SetCodeFrom    = __revmc_builtin_setcodefrom(@[ecx] ptr, @[sp] ptr) None,
 }
 
 impl Builtin {

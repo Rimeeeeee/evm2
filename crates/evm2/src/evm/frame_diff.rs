@@ -86,7 +86,7 @@ mod tests {
         env::BlockEnvExt,
         ethereum::ethereum_tx_registry,
         evm::{AccountInfo, InMemoryDB, frame::FrameTransactionRuntime},
-        interpreter::Host,
+        interpreter::{Gas, Host},
     };
     use alloc::sync::Arc;
     use alloy_eips::eip8141::{Frame, FrameMode};
@@ -135,6 +135,35 @@ mod tests {
             ]
         );
         assert_eq!(diff.nonces, [(empty, 0, 1)]);
+    }
+
+    #[test]
+    fn code_adoption_reports_stored_delegation_hash_before_execution() {
+        let authority = Address::with_last_byte(0xa1);
+        let delegated = Address::with_last_byte(0xa2);
+        let source = Address::with_last_byte(0xa3);
+        let delegation = Bytecode::new_eip7702(delegated);
+        let code = Bytecode::new_legacy(Bytes::from_static(&[0x00]));
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(&authority, AccountInfo::default().with_code(delegation.clone()));
+        db.insert_account_info(&source, AccountInfo::default().with_code(code.clone()));
+        let mut host = Evm::<BaseEvmTypes>::new(
+            SpecId::BOGOTA,
+            BlockEnvExt::default(),
+            ethereum_tx_registry(SpecId::BOGOTA),
+            db,
+            Precompiles::base(SpecId::BOGOTA),
+        );
+        host.set_code_from(&authority, &source, &mut Gas::new(50_000)).unwrap();
+        let diff = FrameDiff::capture(&host.state);
+        assert_eq!(
+            diff.codes,
+            [(
+                authority,
+                U256::from_be_bytes(delegation.hash_slow().0),
+                U256::from_be_bytes(code.hash_slow().0),
+            )]
+        );
     }
 
     #[test]
@@ -194,7 +223,7 @@ mod tests {
     }
 
     #[test]
-    fn created_and_destroyed_accounts_keep_inflight_code_and_nonce_changes() {
+    fn sendall_preserves_created_accounts_and_inflight_code_and_nonce_changes() {
         let created = Address::with_last_byte(0x80);
         let recipient = Address::with_last_byte(0x90);
         let code = Bytecode::new_legacy(Bytes::from_static(&[0xff]));
@@ -212,7 +241,7 @@ mod tests {
             account.set_code_slow(code.clone());
         }
         host.selfdestruct(&created, &recipient, false).unwrap();
-        assert!(host.state.account(&created).unwrap().is_destructed());
+        assert!(!host.state.account(&created).unwrap().is_destructed());
         let diff = FrameDiff::capture(&host.state);
         assert_eq!(diff.nonces, [(created, 0, 1)]);
         assert_eq!(

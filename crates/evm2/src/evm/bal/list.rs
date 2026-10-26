@@ -10,7 +10,10 @@ use alloy_eip7928::{
     AccountChanges as AlloyAccountChanges, BlockAccessList as AlloyBal,
     CodeChange as AlloyCodeChange, SlotChanges as AlloySlotChanges,
 };
-use alloy_primitives::{Address, U256, map::AddressMap};
+use alloy_primitives::{
+    Address, U256,
+    map::{AddressMap, B256Map},
+};
 
 /// BAL structure.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -61,10 +64,14 @@ impl Bal {
                     .changes
                     .iter()
                     .map(|change| {
-                        AlloyCodeChange::new(
-                            change.block_access_index,
-                            change.code.1.original_bytes(),
-                        )
+                        if change.adopted {
+                            AlloyCodeChange::new_hash(change.block_access_index, change.code.0)
+                        } else {
+                            AlloyCodeChange::new(
+                                change.block_access_index,
+                                change.code.1.original_bytes(),
+                            )
+                        }
                     })
                     .collect(),
             };
@@ -108,7 +115,44 @@ impl Bal {
             account.original.as_ref().unwrap_or(&absent),
             account.present.as_ref().unwrap_or(&absent),
         );
+        if account.code_adopted {
+            bal_account.account_info.mark_code_adopted(bal_index);
+        }
         bal_account.storage.update_pending(bal_index, &account.storage.slots);
+    }
+
+    /// Resolves adopted hashes using bytecode deployed at a strictly earlier index.
+    fn resolve_adopted_code(&mut self) {
+        if !self
+            .accounts
+            .values()
+            .any(|account| account.account_info.code.changes.iter().any(|change| change.adopted))
+        {
+            return;
+        }
+        let mut deployed = B256Map::default();
+        for account in self.accounts.values() {
+            for change in &account.account_info.code.changes {
+                if !change.adopted {
+                    let entry = deployed
+                        .entry(change.code.0)
+                        .or_insert_with(|| (change.block_access_index, change.code.1.clone()));
+                    if change.block_access_index < entry.0 {
+                        *entry = (change.block_access_index, change.code.1.clone());
+                    }
+                }
+            }
+        }
+        for account in self.accounts.values_mut() {
+            for change in &mut account.account_info.code.changes {
+                if change.adopted
+                    && let Some((index, code)) = deployed.get(&change.code.0)
+                    && *index < change.block_access_index
+                {
+                    change.code.1 = code.clone();
+                }
+            }
+        }
     }
 
     /// Populate storage slot from BAL by account address.
@@ -183,7 +227,9 @@ impl TryFrom<&[AlloyAccountChanges]> for Bal {
             accounts.insert(alloy_account.address, AccountBal::try_from(alloy_account)?);
         }
 
-        Ok(Self { accounts })
+        let mut bal = Self { accounts };
+        bal.resolve_adopted_code();
+        Ok(bal)
     }
 }
 
@@ -207,7 +253,9 @@ impl TryFrom<AlloyBal> for Bal {
             accounts.insert(address, AccountBal::try_from(alloy_account)?);
         }
 
-        Ok(Self { accounts })
+        let mut bal = Self { accounts };
+        bal.resolve_adopted_code();
+        Ok(bal)
     }
 }
 
@@ -578,5 +626,41 @@ mod tests {
         }];
 
         assert!(Bal::try_from(alloy_bal.as_slice()).is_err());
+    }
+
+    #[test]
+    fn adopted_code_roundtrips_and_resolves_only_earlier_deployments() {
+        let code = Bytecode::new_legacy(Bytes::from_static(&[0x00]));
+        let hash = code.hash_slow();
+        let alloy = vec![
+            AlloyAccountChanges {
+                address: Address::with_last_byte(1),
+                code_changes: vec![AlloyCodeChange::new(idx(2), code.original_bytes())],
+                ..Default::default()
+            },
+            AlloyAccountChanges {
+                address: Address::with_last_byte(2),
+                code_changes: vec![AlloyCodeChange::new_hash(idx(3), hash)],
+                ..Default::default()
+            },
+            AlloyAccountChanges {
+                address: Address::with_last_byte(3),
+                code_changes: vec![AlloyCodeChange::new_hash(idx(2), hash)],
+                ..Default::default()
+            },
+        ];
+        let bal = Bal::try_from(alloy.as_slice()).unwrap();
+        assert_eq!(bal.to_alloy_bal().as_slice(), alloy.as_slice());
+        assert_eq!(
+            bal.accounts[&Address::with_last_byte(2)].account_info.code.changes[0].code.1,
+            code
+        );
+        assert!(
+            bal.accounts[&Address::with_last_byte(3)].account_info.code.changes[0]
+                .code
+                .1
+                .is_empty()
+        );
+        assert_eq!(Bal::try_from(alloy).unwrap(), bal);
     }
 }

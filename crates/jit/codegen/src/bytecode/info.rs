@@ -120,7 +120,7 @@ const DYNAMIC_WITH_BASE_GAS: &[u8] = &[
 ];
 
 /// Opcodes whose gas cost is entirely dynamic — computed fully in builtins at runtime.
-const FULLY_DYNAMIC: &[u8] = &[op::SSTORE, op::CREATE, op::CREATE2, op::APPROVE];
+const FULLY_DYNAMIC: &[u8] = &[op::SSTORE, op::CREATE, op::CREATE2, op::APPROVE, op::SETCODEFROM];
 
 /// Opcodes that are gated behind a specific `SpecId`, paired with the spec they were introduced in.
 const SPEC_GATED_OPCODES: &[(u8, SpecId)] = &[
@@ -149,6 +149,7 @@ const SPEC_GATED_OPCODES: &[(u8, SpecId)] = &[
     (op::EXCHANGE, SpecId::AMSTERDAM),
     (op::SLOTNUM, SpecId::AMSTERDAM),
     (op::APPROVE, SpecId::BOGOTA),
+    (op::SETCODEFROM, SpecId::BOGOTA),
     (op::TXPARAM, SpecId::BOGOTA),
     (op::FRAMEDATALOAD, SpecId::BOGOTA),
     (op::FRAMEDATACOPY, SpecId::BOGOTA),

@@ -545,7 +545,7 @@ opcodes! {
     0xA4 => LOG4 => log<4> => stack_io(6, 0);
     // 0xA5
     // 0xA6
-    // 0xA7
+    0xA7 => SETCODEFROM => setcodefrom => stack_io(1, 1);
     // 0xA8
     // 0xA9
     0xAA => APPROVE => approve => stack_io(3, 0);

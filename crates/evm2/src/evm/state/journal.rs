@@ -56,6 +56,8 @@ pub enum JournalEntry {
         previous_just_created: bool,
         /// Previous code-changed flag.
         previous_code_changed: bool,
+        /// Previous code-adoption flag.
+        previous_code_adopted: bool,
     },
     /// Persistent storage changed.
     StorageChange {

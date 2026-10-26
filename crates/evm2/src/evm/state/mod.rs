@@ -448,6 +448,13 @@ impl<'a> State<'a> {
         self.inner.prewarm_set.warm(address);
     }
 
+    /// Checks account warmth without loading the account or recording a BAL access.
+    #[inline]
+    pub(crate) fn is_account_warm(&self, address: &Address) -> bool {
+        self.inner.prewarm_set.is_warm(address)
+            || self.accounts.get(address).is_some_and(|account| account.is_warm)
+    }
+
     /// Marks an address and a set of storage slots as warm in the pre-warmed set. See
     /// [`PrewarmSet::warm_storage`].
     #[inline]
@@ -836,6 +843,7 @@ impl<'a> State<'a> {
                     previous_is_destroyed,
                     previous_just_created,
                     previous_code_changed,
+                    previous_code_adopted,
                 } => {
                     // Reconcile the self-destruct set with the restored destroyed flag.
                     let was_destroyed =
@@ -857,6 +865,7 @@ impl<'a> State<'a> {
                         entry.is_destroyed = previous_is_destroyed;
                         entry.just_created = previous_just_created;
                         entry.code_changed = previous_code_changed;
+                        entry.code_adopted = previous_code_adopted;
                     }
                 }
                 JournalEntry::StorageChange { address, key, previous } => {

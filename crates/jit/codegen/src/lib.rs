@@ -20,7 +20,7 @@ pub use linker::{Linker, shared_library_path};
 
 /// ABI version of compiled artifacts. Bump when the calling convention, execution layout or opcode
 /// semantics change.
-pub const ABI_VERSION: u32 = 5;
+pub const ABI_VERSION: u32 = 6;
 
 /// Internal tests and testing utilities. Not public API.
 #[cfg(test)]

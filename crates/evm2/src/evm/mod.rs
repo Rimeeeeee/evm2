@@ -725,19 +725,6 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         self.state.into_db()
     }
 
-    /// Returns the mutable EVM state.
-    #[inline]
-    pub const fn state(&self) -> &State<'a> {
-        &self.state
-    }
-
-    /// Returns the mutable EVM state.
-    #[inline]
-    pub const fn state_mut(&mut self) -> &mut State<'a> {
-        self.evm_send = false;
-        &mut self.state
-    }
-
     /// Returns logs emitted by the current in-flight transaction.
     #[inline]
     pub fn logs(&self) -> &[Log] {
@@ -958,18 +945,6 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         self.interpreter_runner.take()
     }
 
-    /// Returns the active EVM version.
-    #[inline]
-    pub const fn version(&self) -> &crate::Version {
-        self.execution_config.version()
-    }
-
-    /// Returns `true` if the active EVM feature set contains `feature`.
-    #[inline]
-    pub const fn feature(&self, feature: EvmFeatures) -> bool {
-        self.features.contains(feature)
-    }
-
     /// Returns the active base specification ID.
     #[inline]
     pub fn spec_id(&self) -> SpecId {
@@ -980,6 +955,33 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     #[inline]
     pub const fn config_spec_id(&self) -> T::SpecId {
         self.spec_id
+    }
+}
+
+impl<'a, T: EvmTypesHost> Evm<'a, T> {
+    /// Returns the mutable EVM state.
+    #[inline]
+    pub const fn state(&self) -> &State<'a> {
+        &self.state
+    }
+
+    /// Returns the mutable EVM state.
+    #[inline]
+    pub const fn state_mut(&mut self) -> &mut State<'a> {
+        self.evm_send = false;
+        &mut self.state
+    }
+
+    /// Returns the active EVM version.
+    #[inline]
+    pub const fn version(&self) -> &crate::Version {
+        self.execution_config.version()
+    }
+
+    /// Returns `true` if the active EVM feature set contains `feature`.
+    #[inline]
+    pub const fn feature(&self, feature: EvmFeatures) -> bool {
+        self.features.contains(feature)
     }
 }
 
@@ -1456,9 +1458,22 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         address: &Address,
         stop: InstrStop,
     ) -> Result<MessageResult<T>, ExecutionError> {
+        let code_adoption = self.feature(EvmFeatures::EIP8298);
         let interp = self.interpreter_pool.last_mut().unwrap();
         let mut gas = interp.gas();
-        let output = if stop.is_success() {
+        let adopted = if stop.is_success() && code_adoption {
+            let mut account = self.state.account(address)?;
+            if account.is_empty_code_hash() {
+                None
+            } else {
+                Some(account.load_code()?.original_bytes())
+            }
+        } else {
+            None
+        };
+        let output = if let Some(output) = adopted {
+            output
+        } else if stop.is_success() {
             let mut output = Bytes::copy_from_slice(interp.output());
             if let Err(stop) = self.validate_create_output(&mut gas, &mut output) {
                 self.state.rollback(checkpoint, self.features);
@@ -1922,6 +1937,54 @@ impl<'a, T: EvmTypes> Host<T> for Evm<'a, T> {
         self.frame_tx.as_ref()?.event_data(&self.state, index)
     }
 
+    fn set_code_from(
+        &mut self,
+        contract: &Address,
+        source: &Address,
+        gas: &mut Gas,
+    ) -> Result<bool, HostError> {
+        if matches!(
+            *contract,
+            BEACON_ROOTS_ADDRESS
+                | HISTORY_STORAGE_ADDRESS
+                | WITHDRAWAL_REQUEST_ADDRESS
+                | CONSOLIDATION_REQUEST_ADDRESS
+                | BUILDER_DEPOSIT_REQUEST_ADDRESS
+                | BUILDER_EXIT_REQUEST_ADDRESS
+                | alloy_eips::eip8272::RECENT_ROOT_ADDRESS
+        ) {
+            return Err(InstrStop::SystemContractCodeChange.into());
+        }
+        let params = &self.version().gas_params;
+        let warm = u64::from(params.get(GasId::WarmStorageReadCost));
+        let cold = if self.state.is_account_warm(source) {
+            0
+        } else {
+            u64::from(params.get(GasId::ColdAccountAdditionalCost))
+        };
+        gas.spend(warm * 2 + cold)?;
+        let (hash, code) = {
+            let mut account = self.state.account(source)?;
+            account.warm();
+            if !account.exists() || account.is_empty_code_hash() || account.is_created() {
+                return Ok(false);
+            }
+            let code = account.load_code()?;
+            if code.original_byte_slice().first() == Some(&0xef) {
+                return Ok(false);
+            }
+            (account.code_hash(), code)
+        };
+        gas.spend(warm)?;
+        let write = u64::from(self.version().gas_params.get(GasId::SetCodeFromWrite));
+        let mut account = self.state.account(contract)?;
+        if account.code_hash() != hash {
+            gas.spend(write)?;
+            account.adopt_code(hash, code);
+        }
+        Ok(true)
+    }
+
     fn selfdestruct(
         &mut self,
         contract: &Address,
@@ -1944,7 +2007,8 @@ impl<'a, T: EvmTypes> Host<T> for Evm<'a, T> {
         }
         let (previously_destroyed, balance, should_destroy) = {
             let account = self.state.account(contract)?;
-            let should_destroy = !features.contains(EvmFeatures::EIP6780) || account.is_created();
+            let should_destroy = !features.contains(EvmFeatures::EIP4758)
+                && (!features.contains(EvmFeatures::EIP6780) || account.is_created());
             (account.is_destructed(), account.balance(), should_destroy)
         };
 
@@ -2126,6 +2190,241 @@ mod tests {
     const TEST_TX_TYPE: u8 = 0x00;
     const TEST_PRECOMPILE: Address = Address::with_last_byte(0x42);
     const INNER_TEST_PRECOMPILE: Address = Address::with_last_byte(0x43);
+
+    fn code_adoption_evm() -> Evm<'static, BaseEvmTypes> {
+        let mut database = InMemoryDB::default();
+        database.insert_account_info(
+            &Address::repeat_byte(0x11),
+            AccountInfo::default().with_code(legacy_bytecode(vec![op::STOP])),
+        );
+        database.insert_account_info(
+            &Address::repeat_byte(0x22),
+            AccountInfo::default().with_code(legacy_bytecode(vec![op::INVALID])),
+        );
+        Evm::new(
+            SpecId::BOGOTA,
+            BlockEnvExt::default(),
+            TxRegistry::new(),
+            database,
+            Precompiles::base(SpecId::BOGOTA),
+        )
+    }
+
+    #[test]
+    fn setcodefrom_charges_access_and_write_separately() {
+        let mut evm = code_adoption_evm();
+        let source = Address::repeat_byte(0x11);
+        let destination = Address::repeat_byte(0x22);
+        let mut gas = Gas::new(50_000);
+        assert!(evm.set_code_from(&destination, &source, &mut gas).unwrap());
+        assert_eq!(gas.spent(), 12_200);
+        assert_eq!(
+            evm.state.account(&destination).unwrap().load_code().unwrap().original_byte_slice(),
+            [op::STOP]
+        );
+        let mut gas = Gas::new(50_000);
+        assert!(evm.set_code_from(&destination, &source, &mut gas).unwrap());
+        assert_eq!(gas.spent(), 300);
+        assert_eq!(gas.tracker().state_gas_spent(), 0);
+    }
+
+    #[test]
+    fn setcodefrom_source_oog_precedes_access_and_system_guard_precedes_gas() {
+        let mut evm = code_adoption_evm();
+        let source = Address::repeat_byte(0x11);
+        let destination = Address::repeat_byte(0x22);
+        let mut gas = Gas::new(3_099);
+        assert_eq!(
+            evm.set_code_from(&destination, &source, &mut gas),
+            Err(HostError::Halt(InstrStop::OutOfGas))
+        );
+        assert!(!evm.state.is_account_warm(&source));
+        let mut gas = Gas::new(50_000);
+        assert_eq!(
+            evm.set_code_from(&HISTORY_STORAGE_ADDRESS, &source, &mut gas),
+            Err(HostError::Halt(InstrStop::SystemContractCodeChange))
+        );
+        assert_eq!(gas.spent(), 0);
+        assert!(!evm.state.is_account_warm(&source));
+    }
+
+    #[test]
+    fn setcodefrom_rejects_empty_delegated_and_created_sources() {
+        for case in 0..3 {
+            let mut evm = code_adoption_evm();
+            let source = Address::repeat_byte(0x33);
+            if case == 1 {
+                evm.state.account(&source).unwrap().set_delegation(Address::repeat_byte(0x11));
+            } else if case == 2 {
+                evm.state
+                    .create_account(&Address::ZERO, &source, &Word::ZERO, evm.features)
+                    .unwrap()
+                    .unwrap();
+                evm.state.account(&source).unwrap().set_code_slow(legacy_bytecode(vec![op::STOP]));
+            }
+            let mut gas = Gas::new(50_000);
+            assert!(!evm.set_code_from(&Address::repeat_byte(0x22), &source, &mut gas).unwrap());
+            assert_eq!(gas.spent(), 3_100);
+            assert!(evm.state.is_account_warm(&source));
+        }
+    }
+
+    #[test]
+    fn setcodefrom_rollback_restores_code_origin_and_warmth() {
+        let mut evm = code_adoption_evm();
+        let source = Address::repeat_byte(0x11);
+        let destination = Address::repeat_byte(0x22);
+        let checkpoint = evm.state.checkpoint();
+        evm.set_code_from(&destination, &source, &mut Gas::new(50_000)).unwrap();
+        assert!(
+            evm.state
+                .transaction_account_changes()
+                .find(|change| change.address == destination)
+                .unwrap()
+                .code_adopted
+        );
+        evm.state.rollback(checkpoint, evm.features);
+        assert!(!evm.state.is_account_warm(&source));
+        assert_eq!(
+            evm.state.account(&destination).unwrap().load_code().unwrap().original_byte_slice(),
+            [op::INVALID]
+        );
+        assert!(
+            !evm.state
+                .transaction_account_changes()
+                .find(|change| change.address == destination)
+                .unwrap()
+                .code_adopted
+        );
+    }
+
+    #[test]
+    fn setcodefrom_uses_execution_destination_and_keeps_loaded_code_running() {
+        let source = Address::repeat_byte(0x11);
+        let destination = Address::repeat_byte(0x22);
+        let proxy = Address::repeat_byte(0x66);
+        for is_static in [false, true] {
+            let mut evm = code_adoption_evm();
+            let mut code = Vec::new();
+            push_address(&mut code, &source);
+            code.extend_from_slice(&[
+                op::SETCODEFROM,
+                op::POP,
+                op::PUSH1,
+                7,
+                op::PUSH0,
+                op::SSTORE,
+            ]);
+            let mut message = MessageExt {
+                kind: MessageKind::DelegateCall,
+                destination,
+                code_address: proxy,
+                caller_is_static: is_static,
+                gas_limit: 1_000_000,
+                code: legacy_bytecode(code),
+                ..MessageExt::default()
+            };
+            let result = evm.execute_message(&TxEnvExt::default(), &mut message).unwrap();
+            if is_static {
+                assert_eq!(result.stop, InstrStop::StateChangeDuringStaticCall);
+                assert!(!evm.state.is_account_warm(&source));
+            } else {
+                assert!(result.stop.is_success());
+                assert_eq!(evm.state.get_storage(&destination, &Word::ZERO), Some(Word::from(7)));
+                assert!(evm.state.account(&proxy).unwrap().is_empty_code_hash());
+                assert_eq!(
+                    evm.state
+                        .account(&destination)
+                        .unwrap()
+                        .load_code()
+                        .unwrap()
+                        .original_byte_slice(),
+                    [op::STOP]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn setcodefrom_streamed_and_detached_bal_agree_on_hash_change() {
+        let mut evm = code_adoption_evm();
+        let source = Address::repeat_byte(0x11);
+        let destination = Address::repeat_byte(0x22);
+        evm.set_code_from(&destination, &source, &mut Gas::new(50_000)).unwrap();
+        let mut streamed = BalContext::new().with_bal_builder();
+        streamed.set_bal_index(BlockAccessIndex::new(1));
+        evm.state.visit_transaction_changes(&mut streamed).unwrap();
+        let mut detached = Bal::new();
+        detached.commit(BlockAccessIndex::new(1), evm.state.take_pending_state());
+        let streamed = streamed.take_alloy_bal().unwrap();
+        assert_eq!(streamed, detached.to_alloy_bal());
+        let code_change =
+            &streamed.iter().find(|account| account.address == destination).unwrap().code_changes
+                [0];
+        assert_eq!(code_change.new_code_hash(), Some(legacy_bytecode(vec![op::STOP]).hash_slow()));
+        assert!(code_change.new_code().is_empty());
+    }
+
+    #[test]
+    fn setcodefrom_initcode_ignores_returned_code_and_reports_adoption() {
+        let mut evm = code_adoption_evm();
+        let destination = Address::repeat_byte(0x44);
+        let mut initcode = Vec::new();
+        push_address(&mut initcode, &Address::repeat_byte(0x11));
+        initcode.extend_from_slice(&[
+            op::SETCODEFROM,
+            op::POP,
+            op::PUSH1,
+            0xef,
+            op::PUSH0,
+            op::MSTORE8,
+            op::PUSH1,
+            1,
+            op::PUSH0,
+            op::RETURN,
+        ]);
+        let mut message = MessageExt {
+            kind: MessageKind::Create,
+            destination,
+            gas_limit: 50_000,
+            code: legacy_bytecode(initcode),
+            ..MessageExt::default()
+        };
+        let result = evm.execute_message(&TxEnvExt::default(), &mut message).unwrap();
+        assert_eq!(result.stop, InstrStop::Return);
+        assert_eq!(result.output.as_ref(), &[op::STOP]);
+        assert_eq!(
+            evm.state.account(&destination).unwrap().load_code().unwrap().original_byte_slice(),
+            [op::STOP]
+        );
+    }
+
+    #[test]
+    fn sendall_preserves_created_adopter_and_self_balance() {
+        let mut evm = code_adoption_evm();
+        let destination = Address::repeat_byte(0x44);
+        let beneficiary = Address::repeat_byte(0x55);
+        evm.state
+            .create_account(&Address::ZERO, &destination, &Word::ZERO, evm.features)
+            .unwrap()
+            .unwrap();
+        evm.set_code_from(&destination, &Address::repeat_byte(0x11), &mut Gas::new(50_000))
+            .unwrap();
+        evm.state.account(&destination).unwrap().set_balance(Word::from(7));
+        evm.selfdestruct(&destination, &destination, false).unwrap();
+        assert_eq!(evm.state.account(&destination).unwrap().balance(), Word::from(7));
+        let checkpoint = evm.state.checkpoint();
+        evm.selfdestruct(&destination, &beneficiary, false).unwrap();
+        assert_eq!(evm.state.account(&beneficiary).unwrap().balance(), Word::from(7));
+        assert!(!evm.state.account(&destination).unwrap().is_destructed());
+        evm.state.rollback(checkpoint, evm.features);
+        assert_eq!(evm.state.account(&destination).unwrap().balance(), Word::from(7));
+        evm.state.finalize_transaction_(Version::base(SpecId::BOGOTA));
+        assert_eq!(
+            evm.state.account(&destination).unwrap().load_code().unwrap().original_byte_slice(),
+            [op::STOP]
+        );
+    }
 
     struct ExtensionTestTypes;
 

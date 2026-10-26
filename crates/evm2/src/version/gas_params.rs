@@ -190,6 +190,8 @@ gas_ids! {
     Custom6;
     /// Reserved custom gas parameter slot 7.
     Custom7;
+    /// SETCODEFROM account write charge.
+    SetCodeFromWrite;
 }
 
 /// Dynamic gas parameter table.
@@ -545,7 +547,7 @@ mod tests {
     fn gas_id_roundtrips_values() {
         assert_eq!(GasId::from_usize(0), Some(GasId::ExpByte));
         assert_eq!(GasId::ExpByte.as_usize(), 0);
-        assert_eq!(GasId::from_usize(GasId::MAX as usize), Some(GasId::Custom7));
+        assert_eq!(GasId::from_usize(GasId::MAX as usize), Some(GasId::MAX));
         assert_eq!(GasId::from_usize(GasId::COUNT), None);
     }
 

@@ -931,6 +931,24 @@ pub unsafe extern "C" fn __revmc_builtin_do_return_cc(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn __revmc_builtin_setcodefrom(
+    ecx: &mut EvmContext,
+    source: &mut EvmWord,
+) -> BuiltinResult {
+    require_non_staticcall(ecx)?;
+    let destination = ecx.message().destination;
+    let address = source.to_address();
+    // SAFETY: The context exclusively owns the interpreter borrow; its gas is stored separately.
+    let interpreter = unsafe { ecx.interpreter.as_mut() };
+    let adopted = interpreter
+        .host()
+        .set_code_from(&destination, &address, &mut ecx.gas)
+        .map_err(|error| interpreter.fail(error))?;
+    *source = EvmWord::from(Word::from(adopted));
+    Ok(())
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __revmc_builtin_selfdestruct(
     ecx: &mut EvmContext,
     target: &mut EvmWord,
@@ -957,7 +975,7 @@ pub unsafe extern "C" fn __revmc_builtin_selfdestruct(
         ecx.gas.spend_state(u64::from(ecx.gas_params().get(GasId::NewAccountState)))?;
     }
 
-    if !res.previously_destroyed {
+    if !res.previously_destroyed && !ecx.enables(EvmFeatures::EIP4758) {
         ecx.gas.record_refund(i64::from(ecx.gas_params().get(GasId::SelfdestructRefund)));
     }
 

@@ -366,18 +366,18 @@ fn additional_cases() -> Vec<Case> {
         &[],
         vec![frame(FrameMode::Sender, BODY)],
     ));
-    let mut destroy = vec![0x7f];
-    destroy.extend_from_slice(
+    let mut sendall = vec![0x7f];
+    sendall.extend_from_slice(
         &U256::from_be_slice(&[0x60, 2, 0x60, 10, 0x5f, 0x39, 0x60, 2, 0x5f, 0xf3, 0x5f, 0xff])
             .to_be_bytes::<32>(),
     );
-    destroy.extend_from_slice(&[
+    sendall.extend_from_slice(&[
         0x5f, 0x52, 0x60, 12, 0x60, 20, 0x5f, 0xf0, 0x5f, 0x52, 0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x5f,
         0x51, 0x61, 0xc3, 0x50, 0xf1, 0x50, 0x00,
     ]);
     cases.push(base_case(
-        "created_then_selfdestructed_stream",
-        &destroy,
+        "created_then_sendall_stream",
+        &sendall,
         &[],
         vec![frame(FrameMode::Sender, BODY)],
     ));
@@ -590,12 +590,19 @@ fn assert_native_case(case: &Case, result: &Outcome) {
             created,
             Account { nonce: 1, code_hash: alloy_primitives::keccak256([0]), ..Default::default() },
         );
-    } else if name == "created_then_selfdestructed_stream" {
-        // The zero beneficiary is already warm; the newly created zero-balance
-        // contract destroys itself without an ETH transfer or surviving account.
+    } else if name == "created_then_sendall_stream" {
+        // The warm zero beneficiary receives no value; SENDALL preserves the created contract.
         executions[1] = 20_170 + gp.keccak256_word_cost(2);
         state[1] = gp.create_state_gas() + gp.code_deposit_state_gas(2);
         accounts.get_mut(&BODY).unwrap().nonce = 1;
+        accounts.insert(
+            BODY.create(0),
+            Account {
+                nonce: 1,
+                code_hash: alloy_primitives::keccak256([0x5f, 0xff]),
+                ..Default::default()
+            },
+        );
     } else if name == "sstore" || name.starts_with("paid_budget_") {
         executions[1] = 15_105;
         if name.ends_with("assert_true") {

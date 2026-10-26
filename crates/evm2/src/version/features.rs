@@ -256,6 +256,12 @@ evm_features! {
     ///
     /// Default: off
     FRAME_SIGNATURE_PLACEHOLDERS,
+    /// Applies [EIP-8298](https://eips.ethereum.org/EIPS/eip-8298) code adoption.
+    EIP8298,
+    /// Applies [EIP-4758](https://eips.ethereum.org/EIPS/eip-4758) SENDALL semantics.
+    EIP4758,
+    /// Applies [EIP-8151](https://eips.ethereum.org/EIPS/eip-8151) recovery restrictions.
+    EIP8151,
 }
 
 #[cfg(test)]

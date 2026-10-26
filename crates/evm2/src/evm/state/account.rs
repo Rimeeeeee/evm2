@@ -196,6 +196,8 @@ pub(crate) struct Account {
     pub(crate) just_created: bool,
     /// Whether the present overlay account's code has been modified.
     pub(crate) code_changed: bool,
+    /// Whether the last code write adopted an existing code hash.
+    pub(crate) code_adopted: bool,
     /// Persistent transaction storage owned by this account.
     pub(crate) storage: StorageOverlay,
 }
@@ -214,6 +216,9 @@ impl Account {
         self.is_touched |= child.is_touched;
         self.is_destroyed |= child.is_destroyed;
         self.just_created |= child.just_created;
+        if child.code_changed {
+            self.code_adopted = child.code_adopted;
+        }
         self.code_changed |= child.code_changed;
         self.storage.merge_isolated(child.storage);
     }
@@ -223,6 +228,7 @@ impl Account {
     pub(crate) const fn mark_created(&mut self) {
         self.just_created = true;
         self.code_changed = true;
+        self.code_adopted = false;
     }
 
     /// Returns whether the account was created during the transaction.
@@ -272,6 +278,7 @@ impl Account {
             current: self.present.as_ref(),
             created: self.is_created(),
             selfdestructed,
+            code_adopted: self.code_adopted,
             code: self.changed_code(),
             storage: &self.storage,
         }
@@ -369,6 +376,7 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
                 previous_is_destroyed: self.tracked.is_destroyed,
                 previous_just_created: self.tracked.just_created,
                 previous_code_changed: self.tracked.code_changed,
+                previous_code_adopted: self.tracked.code_adopted,
             });
         }
     }
@@ -606,6 +614,14 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
         account.code_hash = code_hash;
         account.code = Some(code);
         self.tracked.code_changed = true;
+        self.tracked.code_adopted = false;
+    }
+
+    /// Adopts existing code without recording another bytecode deployment in the BAL.
+    #[inline]
+    pub fn adopt_code(&mut self, code_hash: B256, code: Bytecode) {
+        self.set_code(code_hash, code);
+        self.tracked.code_adopted = true;
     }
 
     /// Sets the account code, computing its hash, touching the account and recording a revert

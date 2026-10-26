@@ -1,4 +1,4 @@
-use super::{GasTracker, InstrStop, Message, Result, Word};
+use super::{Gas, GasTracker, InstrStop, Message, Result, Word};
 use crate::{
     BaseEvmTypes, DatabaseError, EvmFeatures, EvmTypesHost, ExecutionConfig, ExecutionError,
     HostError, SpecId,
@@ -244,7 +244,17 @@ pub trait Host<T: EvmTypesHost> {
         None
     }
 
-    /// Registers the current contract for self-destruction.
+    /// Adopts another account's code, charging the opcode's dynamic gas.
+    fn set_code_from(
+        &mut self,
+        _contract: &Address,
+        _source: &Address,
+        _gas: &mut Gas,
+    ) -> Result<bool, HostError> {
+        Err(InstrStop::OpcodeNotFound.into())
+    }
+
+    /// Transfers the current contract's balance and applies the active destruction rules.
     fn selfdestruct(
         &mut self,
         contract: &Address,
