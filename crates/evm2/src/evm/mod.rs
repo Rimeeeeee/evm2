@@ -1260,6 +1260,30 @@ impl<'a, T: EvmTypes<Tx: Typed2718>> Evm<'a, T> {
 }
 
 impl<'a, T: EvmTypes> Evm<'a, T> {
+    fn execute_message_inner(
+        &mut self,
+        tx_env: &TxEnv<T>,
+        message: &mut Message<T>,
+    ) -> Result<MessageResult<T>, ExecutionError> {
+        let mut checkpoint = self.state.checkpoint();
+        if let Some(rt) = &mut self.frame_tx {
+            rt.enter_scope();
+        }
+        let result = if self.inspector.is_some() {
+            self.execute_message_inspected(tx_env, message, &mut checkpoint)
+        } else {
+            self.execute_message_impl(tx_env, message, &mut checkpoint)
+        };
+        let success = result.as_ref().is_ok_and(|r| r.stop.is_success());
+        if let Some(rt) = &mut self.frame_tx {
+            rt.exit_scope(success);
+        }
+        if !success {
+            self.state.rollback(checkpoint, self.features);
+        }
+        result
+    }
+
     #[inline]
     fn execute_message_impl(
         &mut self,
@@ -1865,23 +1889,19 @@ impl<'a, T: EvmTypes> Host<T> for Evm<'a, T> {
         tx_env: &TxEnv<T>,
         message: &mut Message<T>,
     ) -> Result<MessageResult<T>, ExecutionError> {
-        let mut checkpoint = self.state.checkpoint();
-        if let Some(rt) = &mut self.frame_tx {
-            rt.enter_scope();
+        #[cfg(feature = "async")]
+        if r#async::is_on_fiber() {
+            return self.execute_message_inner(tx_env, message);
         }
-        let result = if self.inspector.is_some() {
-            self.execute_message_inspected(tx_env, message, &mut checkpoint)
-        } else {
-            self.execute_message_impl(tx_env, message, &mut checkpoint)
-        };
-        let success = result.as_ref().is_ok_and(|r| r.stop.is_success());
-        if let Some(rt) = &mut self.frame_tx {
-            rt.exit_scope(success);
+        #[cfg(feature = "std")]
+        {
+            // Native calls recurse; grow only under stack pressure to preserve the EVM depth limit.
+            stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+                self.execute_message_inner(tx_env, message)
+            })
         }
-        if !success {
-            self.state.rollback(checkpoint, self.features);
-        }
-        result
+        #[cfg(not(feature = "std"))]
+        self.execute_message_inner(tx_env, message)
     }
 
     fn frame_transaction_active(&self) -> bool {
@@ -2190,6 +2210,109 @@ mod tests {
     const TEST_TX_TYPE: u8 = 0x00;
     const TEST_PRECOMPILE: Address = Address::with_last_byte(0x42);
     const INNER_TEST_PRECOMPILE: Address = Address::with_last_byte(0x43);
+
+    #[cfg(all(feature = "std", not(target_family = "wasm")))]
+    #[test]
+    fn nested_static_calls_reach_depth_limit_on_small_stack() {
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let outer = Address::repeat_byte(0x11);
+                let inner = Address::repeat_byte(0x22);
+                let recursive = legacy_bytecode(vec![
+                    op::PUSH1,
+                    32,
+                    op::PUSH0,
+                    op::PUSH0,
+                    op::PUSH0,
+                    op::ADDRESS,
+                    op::GAS,
+                    op::STATICCALL,
+                    op::POP,
+                    op::PUSH0,
+                    op::MLOAD,
+                    op::PUSH1,
+                    1,
+                    op::ADD,
+                    op::PUSH0,
+                    op::MSTORE,
+                    op::PUSH1,
+                    32,
+                    op::PUSH0,
+                    op::RETURN,
+                ]);
+                for inspected in [false, true] {
+                    for revert in [false, true] {
+                        let mut code = vec![
+                            op::PUSH1,
+                            7,
+                            op::PUSH0,
+                            op::SSTORE,
+                            op::PUSH1,
+                            32,
+                            op::PUSH0,
+                            op::PUSH0,
+                            op::PUSH0,
+                        ];
+                        push_address(&mut code, &inner);
+                        code.extend_from_slice(&[
+                            op::GAS,
+                            op::STATICCALL,
+                            op::POP,
+                            op::PUSH1,
+                            32,
+                            op::PUSH0,
+                            if revert { op::REVERT } else { op::RETURN },
+                        ]);
+                        let code = legacy_bytecode(code);
+                        let mut database = InMemoryDB::default();
+                        database.insert_account_info(
+                            &outer,
+                            AccountInfo::default().with_code(code.clone()),
+                        );
+                        database.insert_account_info(
+                            &inner,
+                            AccountInfo::default().with_code(recursive.clone()),
+                        );
+                        let mut evm = Evm::<BaseEvmTypes>::new(
+                            SpecId::SHANGHAI,
+                            BlockEnvExt::default(),
+                            ethereum_tx_registry(SpecId::SHANGHAI),
+                            database,
+                            Precompiles::base(SpecId::SHANGHAI),
+                        );
+                        if inspected {
+                            evm.set_inspector(NoopInspector::default());
+                        }
+                        let mut message = MessageExt {
+                            destination: outer,
+                            code_address: outer,
+                            call_target: outer,
+                            gas_limit: 1 << 60,
+                            code,
+                            ..Default::default()
+                        };
+                        let result =
+                            evm.execute_message(&TxEnvExt::default(), &mut message).unwrap();
+                        assert_eq!(
+                            result.stop,
+                            if revert { InstrStop::Revert } else { InstrStop::Return }
+                        );
+                        assert_eq!(
+                            U256::from_be_slice(&result.output),
+                            U256::from(CALL_DEPTH_LIMIT)
+                        );
+                        assert_eq!(
+                            evm.state.get_storage(&outer, &Word::ZERO).unwrap(),
+                            Word::from(if revert { 0 } else { 7 })
+                        );
+                    }
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 
     fn code_adoption_evm() -> Evm<'static, BaseEvmTypes> {
         let mut database = InMemoryDB::default();
