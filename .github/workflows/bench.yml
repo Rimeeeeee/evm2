@@ -22,7 +22,7 @@ env:
 jobs:
   jit:
     name: jit codegen benchmark
-    runs-on: depot-ubuntu-latest-4
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
       id-token: write
@@ -231,7 +231,7 @@ jobs:
   codspeed:
     name: codspeed (${{ matrix.shard }})
     if: ${{ !inputs.commit }}
-    runs-on: depot-ubuntu-latest
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
