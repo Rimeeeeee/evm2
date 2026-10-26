@@ -1,6 +1,6 @@
 //! Assertion-frame state diffs.
 
-use super::State;
+use super::{AccountInfo, State};
 use alloc::vec::Vec;
 use alloy_eips::eip7906::TxTraceParam;
 use alloy_primitives::{Address, U256};
@@ -16,9 +16,10 @@ pub(super) struct FrameDiff {
 impl FrameDiff {
     pub(super) fn capture(state: &State<'_>) -> Self {
         let mut diff = Self::default();
+        let absent = AccountInfo::default();
         for a in state.transaction_account_changes() {
-            let before = a.original.cloned().unwrap_or_default();
-            let after = a.current.cloned().unwrap_or_default();
+            let before = a.original.unwrap_or(&absent);
+            let after = a.current.unwrap_or(&absent);
             if before.nonce != after.nonce {
                 diff.nonces.push((a.address, before.nonce, after.nonce));
             }
