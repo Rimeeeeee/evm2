@@ -205,7 +205,7 @@ jobs:
 
   jit:
     name: jit ${{ matrix.os }} ${{ matrix.mode }}
-    runs-on: ${{ matrix.os == 'macos' && 'depot-macos-latest' || 'depot-ubuntu-latest-4' }}
+    runs-on: ${{ matrix.os == 'macos' && 'macos-latest' || 'ubuntu-latest' }}
     timeout-minutes: 120
     permissions:
       id-token: write
@@ -272,7 +272,7 @@ jobs:
 
   no-std:
     name: no_std ${{ matrix.target }}
-    runs-on: depot-ubuntu-latest
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       id-token: write
@@ -301,7 +301,7 @@ jobs:
 
   feature-checks:
     name: features ${{ matrix.flags }}
-    runs-on: depot-ubuntu-latest
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       id-token: write
@@ -337,7 +337,7 @@ jobs:
         run: cargo hack check --workspace --each-feature --skip nightly ${{ matrix.flags }}
 
   feature-propagation:
-    runs-on: depot-ubuntu-latest
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       id-token: write
@@ -361,7 +361,7 @@ jobs:
       - run: zepter run check
 
   examples:
-    runs-on: depot-ubuntu-latest
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       id-token: write
@@ -398,7 +398,7 @@ jobs:
       - uses: crate-ci/typos@7f9d0819ca1c008ade73f4b41fa9d258d48f605b # v1.51.1
 
   clippy:
-    runs-on: depot-ubuntu-latest
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       id-token: write
@@ -426,7 +426,7 @@ jobs:
           RUSTFLAGS: -Dwarnings
 
   docs:
-    runs-on: depot-ubuntu-latest
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       id-token: write

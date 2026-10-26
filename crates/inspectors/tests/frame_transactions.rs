@@ -568,7 +568,7 @@ mod js {
                 .json_result(&result, &tx, &block, evm.database_mut())
                 .unwrap_err()
                 .to_string(),
-            "Error: frame notification (unknown at :2:60)\n    at exit (unknown at :2:60)"
+            "Error: frame notification    in server-side tracer function 'exit' (unknown at :2:60)\n    at exit (unknown at :2:60)"
         );
     }
 

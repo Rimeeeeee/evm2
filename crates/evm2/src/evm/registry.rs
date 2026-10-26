@@ -282,7 +282,7 @@ impl<T: EvmTypesHost, Output> AnyTxHandler<T, Output> {
     /// Executes the erased handler against an envelope and host.
     pub fn execute<'host>(
         &self,
-        env: &Recovered<T::Tx>,
+        env: Recovered<&T::Tx>,
         host: &mut T::Host<'host>,
     ) -> HandlerResult<Output> {
         self.inner.execute(env, host)
@@ -294,7 +294,7 @@ impl<T: EvmTypesHost, Output> AnyTxHandler<T, Output> {
     /// owns cleanup; [`crate::Evm::validate_tx`] provides validation with state cleanup.
     pub fn validate<'host>(
         &self,
-        env: &Recovered<T::Tx>,
+        env: Recovered<&T::Tx>,
         host: &mut T::Host<'host>,
     ) -> HandlerResult<()> {
         self.inner.validate(env, host)
@@ -305,7 +305,7 @@ impl<T: EvmTypesHost, Output> AnyTxHandler<T, Output> {
     /// The caller owns discarding prefix effects, as with [`Self::validate`].
     pub fn validate_frame_prefix<'host>(
         &self,
-        env: &Recovered<T::Tx>,
+        env: Recovered<&T::Tx>,
         host: &mut T::Host<'host>,
         prefix_end: usize,
     ) -> HandlerResult<FrameValidationResult> {
@@ -316,19 +316,19 @@ impl<T: EvmTypesHost, Output> AnyTxHandler<T, Output> {
 trait ErasedTxHandler<T: EvmTypesHost, Output>: Send + Sync {
     fn execute<'host>(
         &self,
-        env: &Recovered<T::Tx>,
+        env: Recovered<&T::Tx>,
         host: &mut T::Host<'host>,
     ) -> HandlerResult<Output>;
 
     fn validate<'host>(
         &self,
-        env: &Recovered<T::Tx>,
+        env: Recovered<&T::Tx>,
         host: &mut T::Host<'host>,
     ) -> HandlerResult<()>;
 
     fn validate_frame_prefix<'host>(
         &self,
-        env: &Recovered<T::Tx>,
+        env: Recovered<&T::Tx>,
         host: &mut T::Host<'host>,
         prefix_end: usize,
     ) -> HandlerResult<FrameValidationResult>;
@@ -355,14 +355,15 @@ where
 {
     fn execute<'host>(
         &self,
-        env: &Recovered<T::Tx>,
+        env: Recovered<&T::Tx>,
         host: &mut T::Host<'host>,
     ) -> HandlerResult<Output> {
-        let tx = (self.extract)(env.inner())
+        let (envelope, signer) = env.into_parts();
+        let tx = (self.extract)(envelope)
             .ok_or(HandlerError::WrongTransactionType { expected: self.type_id })?;
         self.handler.execute(TxRequest {
-            envelope: env.inner(),
-            tx: Recovered::new_unchecked(tx, env.signer()),
+            envelope,
+            tx: Recovered::new_unchecked(tx, signer),
             host,
             _non_exhaustive: (),
         })
@@ -370,14 +371,15 @@ where
 
     fn validate<'host>(
         &self,
-        env: &Recovered<T::Tx>,
+        env: Recovered<&T::Tx>,
         host: &mut T::Host<'host>,
     ) -> HandlerResult<()> {
-        let tx = (self.extract)(env.inner())
+        let (envelope, signer) = env.into_parts();
+        let tx = (self.extract)(envelope)
             .ok_or(HandlerError::WrongTransactionType { expected: self.type_id })?;
         self.handler.validate(TxRequest {
-            envelope: env.inner(),
-            tx: Recovered::new_unchecked(tx, env.signer()),
+            envelope,
+            tx: Recovered::new_unchecked(tx, signer),
             host,
             _non_exhaustive: (),
         })
@@ -385,16 +387,17 @@ where
 
     fn validate_frame_prefix<'host>(
         &self,
-        env: &Recovered<T::Tx>,
+        env: Recovered<&T::Tx>,
         host: &mut T::Host<'host>,
         prefix_end: usize,
     ) -> HandlerResult<FrameValidationResult> {
-        let tx = (self.extract)(env.inner())
+        let (envelope, signer) = env.into_parts();
+        let tx = (self.extract)(envelope)
             .ok_or(HandlerError::WrongTransactionType { expected: self.type_id })?;
         self.handler.validate_frame_prefix(
             TxRequest {
-                envelope: env.inner(),
-                tx: Recovered::new_unchecked(tx, env.signer()),
+                envelope,
+                tx: Recovered::new_unchecked(tx, signer),
                 host,
                 _non_exhaustive: (),
             },
@@ -404,13 +407,22 @@ where
 }
 
 /// A type-erased transaction handler registry keyed by transaction type byte.
+///
+/// Cloning is cheap and clones share handler instances. Registering on a clone copies the table
+/// first, so it never affects the original.
 pub struct TxRegistry<T: EvmTypesHost, Output = ()> {
-    handlers: HashMap<u8, Arc<dyn ErasedTxHandler<T, Output>>>,
+    handlers: Arc<HashMap<u8, Arc<dyn ErasedTxHandler<T, Output>>>>,
 }
 
 impl<T: EvmTypesHost, Output> fmt::Debug for TxRegistry<T, Output> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TxRegistry").field("len", &self.handlers.len()).finish_non_exhaustive()
+    }
+}
+
+impl<T: EvmTypesHost, Output> Clone for TxRegistry<T, Output> {
+    fn clone(&self) -> Self {
+        Self { handlers: Arc::clone(&self.handlers) }
     }
 }
 
@@ -423,7 +435,7 @@ impl<T: EvmTypesHost, Output> Default for TxRegistry<T, Output> {
 impl<T: EvmTypesHost, Output> TxRegistry<T, Output> {
     /// Creates an empty registry.
     pub fn new() -> Self {
-        Self { handlers: HashMap::default() }
+        Self { handlers: Arc::default() }
     }
 
     /// Registers a typed handler for a transaction type byte.
@@ -436,7 +448,8 @@ impl<T: EvmTypesHost, Output> TxRegistry<T, Output> {
         H: TxHandler<T, Tx, Output> + Send + Sync + 'static,
         F: for<'a> Fn(&'a T::Tx) -> Option<&'a Tx> + Send + Sync + 'static,
     {
-        self.handlers.insert(type_id, Arc::new(HandlerAdapter::new(type_id, extract, handler)));
+        Arc::make_mut(&mut self.handlers)
+            .insert(type_id, Arc::new(HandlerAdapter::new(type_id, extract, handler)));
         self
     }
 
@@ -650,7 +663,7 @@ mod tests {
         env: &Envelope,
     ) -> HandlerResult<Receipt> {
         registry.try_get_by_type(type_id)?.execute(
-            &Recovered::new_unchecked(env.clone(), Address::ZERO),
+            Recovered::new_unchecked(env, Address::ZERO),
             &mut TestHost { block: BlockEnvExt::default() },
         )
     }
@@ -724,7 +737,7 @@ mod tests {
         let tx =
             Recovered::new_unchecked(Envelope::Transfer(TransferTx { amount: 0 }), Address::ZERO);
         assert_eq!(
-            handler.validate_frame_prefix(&tx, &mut host, 1),
+            handler.validate_frame_prefix(tx.as_recovered_ref(), &mut host, 1),
             Err(HandlerError::InvalidFrameTransaction("prefix requires a frame transaction"))
         );
         assert_eq!(prepared_count.load(Ordering::Relaxed), 0);
@@ -732,8 +745,8 @@ mod tests {
         for amount in 0..3 {
             let tx =
                 Recovered::new_unchecked(Envelope::Transfer(TransferTx { amount }), Address::ZERO);
-            let validation = handler.validate(&tx, &mut host);
-            let execution = handler.execute(&tx, &mut host);
+            let validation = handler.validate(tx.as_recovered_ref(), &mut host);
+            let execution = handler.execute(tx.as_recovered_ref(), &mut host);
             match amount {
                 0 => {
                     assert_eq!(validation, Ok(()));
@@ -763,13 +776,71 @@ mod tests {
             Address::ZERO,
         );
         assert_eq!(
-            handler.validate(&wrong, &mut host),
+            handler.validate(wrong.as_recovered_ref(), &mut host),
             Err(HandlerError::WrongTransactionType { expected: 0x01 })
         );
         assert_eq!(
-            handler.validate_frame_prefix(&wrong, &mut host, 1),
+            handler.validate_frame_prefix(wrong.as_recovered_ref(), &mut host, 1),
             Err(HandlerError::WrongTransactionType { expected: 0x01 })
         );
         assert_eq!(prepared_count.load(Ordering::Relaxed), 6);
+    }
+
+    /// Mirrors a handler wrapper that forwards the borrowed envelope to an inner handler.
+    struct Forwarding(AnyTxHandler<TestTypes, Receipt>);
+
+    impl TxHandler<TestTypes, TransferTx, Receipt> for Forwarding {
+        fn validate(&self, req: TxRequest<'_, '_, TestTypes, TransferTx>) -> HandlerResult<()> {
+            self.0.validate(Recovered::new_unchecked(req.envelope, req.tx.signer()), req.host)
+        }
+
+        fn execute(&self, req: TxRequest<'_, '_, TestTypes, TransferTx>) -> HandlerResult<Receipt> {
+            self.0.execute(Recovered::new_unchecked(req.envelope, req.tx.signer()), req.host)
+        }
+    }
+
+    #[test]
+    fn wrapper_forwards_borrowed_envelope() {
+        let mut inner = TxRegistry::<TestTypes, Receipt>::new();
+        inner.register(
+            0x01,
+            transfer,
+            handler(
+                |_| Ok(()),
+                |req: TxRequest<'_, '_, TestTypes, TransferTx>, ()| {
+                    assert_eq!(req.tx.signer(), Address::with_last_byte(1));
+                    handle_transfer(req)
+                },
+            ),
+        );
+        let mut outer = TxRegistry::<TestTypes, Receipt>::new();
+        outer.register(0x01, transfer, Forwarding(inner.try_get_by_type(0x01).unwrap()));
+
+        let tx = Recovered::new_unchecked(
+            Envelope::Transfer(TransferTx { amount: 3 }),
+            Address::with_last_byte(1),
+        );
+        let handler = outer.try_get_by_type(0x01).unwrap();
+        let mut host = TestHost { block: BlockEnvExt::default() };
+        assert_eq!(handler.validate(tx.as_recovered_ref(), &mut host), Ok(()));
+        assert_eq!(handler.execute(tx.as_recovered_ref(), &mut host), Ok(receipt(21_003)));
+    }
+
+    #[test]
+    fn cloned_registries_are_independent() {
+        let mut original = TxRegistry::<TestTypes, Receipt>::new();
+        original.register(0x01, transfer, handler(|_| Ok(()), |req, ()| handle_transfer(req)));
+
+        let mut cloned = original.clone();
+        assert!(Arc::ptr_eq(&original.handlers, &cloned.handlers));
+        cloned.register(0x02, create, handler(|_| Ok(()), |req, ()| handle_create(req)));
+        assert!(cloned.contains(0x01));
+        assert!(cloned.contains(0x02));
+        assert!(original.contains(0x01));
+        assert!(!original.contains(0x02));
+
+        original.register(0x03, transfer, handler(|_| Ok(()), |req, ()| handle_transfer(req)));
+        assert!(original.contains(0x03));
+        assert!(!cloned.contains(0x03));
     }
 }

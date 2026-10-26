@@ -75,8 +75,8 @@ fn legacy_nonce(evm: &mut Evm<'_, BaseEvmTypes>) -> u64 {
     evm.state_mut().account(&SENDER).unwrap().nonce()
 }
 
-fn first_use_cost(evm: &Evm<'_, BaseEvmTypes>) -> u64 {
-    u64::from(evm.version().gas_params.get(GasId::SstoreSetState))
+const fn first_use_cost(evm: &Evm<'_, BaseEvmTypes>) -> u64 {
+    evm.version().gas_params.get(GasId::SstoreSetState)
 }
 
 fn assert_nonce_mismatch(evm: &mut Evm<'_, BaseEvmTypes>, tx: &Recovered<TxEnvelope>) {

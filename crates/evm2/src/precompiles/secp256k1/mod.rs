@@ -57,7 +57,7 @@ pub fn run<T: EvmTypesHost>(
     };
     if evm.feature(EvmFeatures::EIP8151) {
         let address = Address::from_word(recovered.into());
-        let warm_cost = u64::from(evm.version().gas_params.get(GasId::WarmStorageReadCost));
+        let warm_cost = evm.version().gas_params.get(GasId::WarmStorageReadCost);
         let access_cost = if evm.state().is_account_warm(&address) {
             warm_cost
         } else {

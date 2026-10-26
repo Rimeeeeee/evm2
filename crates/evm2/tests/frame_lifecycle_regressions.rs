@@ -153,8 +153,7 @@ fn reverted_or_halted_parent_discards_nested_approval_and_nonce_debits() {
 
 #[test]
 fn all_key_first_use_charges_are_required_before_any_nonce_lane_advances() {
-    let slot_cost =
-        u64::from(evm2::Version::new(SpecId::BOGOTA).gas_params.get(GasId::SstoreSetState));
+    let slot_cost = evm2::Version::new(SpecId::BOGOTA).gas_params.get(GasId::SstoreSetState);
     for shortage in [1, slot_cost] {
         let mut evm = evm(APPROVE_BOTH, &[]);
         let keys = vec![U256::from(1), U256::MAX];
@@ -191,7 +190,7 @@ fn mixed_first_use_and_existing_nonce_lanes_charge_only_new_storage() {
     let mut version = *evm.version();
     version.features.remove(EvmFeatures::NONCE_CHECK);
     set_version(&mut evm, version);
-    let slot_cost = u64::from(evm.version().gas_params.get(GasId::SstoreSetState));
+    let slot_cost = evm.version().gas_params.get(GasId::SstoreSetState);
     let mut verify = frame(FrameMode::Verify, SENDER, 3);
     verify.limits.state = slot_cost;
     let result =
@@ -241,7 +240,7 @@ fn atomic_restore_rollback_restores_the_original_frames_state_gas_ownership() {
         }
         let result = evm.transact(&recovered(payload(frames, vec![]))).unwrap().commit();
         let outcome = result.frame.unwrap();
-        let slot_cost = u64::from(evm.version().gas_params.get(GasId::SstoreSetState));
+        let slot_cost = evm.version().gas_params.get(GasId::SstoreSetState);
         assert_eq!(outcome.receipts[1].gas_used.state, if final_restore { 0 } else { slot_cost });
         assert_eq!(outcome.receipts[2].status, FrameStatus::Success);
         assert!(outcome.rolled_back[2]);
@@ -317,7 +316,7 @@ fn protocol_nonce_reads_and_writes_do_not_warm_ordinary_evm_accesses() {
 #[test]
 fn overlapping_and_disjoint_domains_advance_independently_between_transactions() {
     let mut evm = evm(APPROVE_BOTH, &[]);
-    let slot_cost = u64::from(evm.version().gas_params.get(GasId::SstoreSetState));
+    let slot_cost = evm.version().gas_params.get(GasId::SstoreSetState);
     for (keys, sequence, expected_state_gas) in
         [(vec![7, 9], 0, 2 * slot_cost), (vec![9], 1, 0), (vec![11], 0, slot_cost)]
     {

@@ -1144,7 +1144,7 @@ impl<'a, T: EvmTypes<Tx: Typed2718>> Evm<'a, T> {
         let handler = self.registry.try_get_by_type(tx.ty())?;
         let mut guard = self.enter_execution();
         guard.discard_on_drop = true;
-        let result = handler.execute(tx, guard.evm);
+        let result = handler.execute(tx.as_recovered_ref(), guard.evm);
         guard.discard_on_drop = false;
         drop(guard);
         if result.is_err() {
@@ -1177,7 +1177,7 @@ impl<'a, T: EvmTypes<Tx: Typed2718>> Evm<'a, T> {
         let handler = self.registry.try_get_by_type(tx.ty())?;
         let mut guard = self.enter_execution();
         guard.discard_on_drop = true;
-        handler.validate(tx, guard.evm)
+        handler.validate(tx.as_recovered_ref(), guard.evm)
     }
 
     /// Dispatches the transaction to the handler registered for its EIP-2718 type byte on an async
@@ -1976,11 +1976,11 @@ impl<'a, T: EvmTypes> Host<T> for Evm<'a, T> {
             return Err(InstrStop::SystemContractCodeChange.into());
         }
         let params = &self.version().gas_params;
-        let warm = u64::from(params.get(GasId::WarmStorageReadCost));
+        let warm = params.get(GasId::WarmStorageReadCost);
         let cold = if self.state.is_account_warm(source) {
             0
         } else {
-            u64::from(params.get(GasId::ColdAccountAdditionalCost))
+            params.get(GasId::ColdAccountAdditionalCost)
         };
         gas.spend(warm * 2 + cold)?;
         let (hash, code) = {
@@ -1996,7 +1996,7 @@ impl<'a, T: EvmTypes> Host<T> for Evm<'a, T> {
             (account.code_hash(), code)
         };
         gas.spend(warm)?;
-        let write = u64::from(self.version().gas_params.get(GasId::SetCodeFromWrite));
+        let write = self.version().gas_params.get(GasId::SetCodeFromWrite);
         let mut account = self.state.account(contract)?;
         if account.code_hash() != hash {
             gas.spend(write)?;

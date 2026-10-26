@@ -402,11 +402,11 @@ impl<T: EvmTypes> Evm<'_, T> {
                         .is_zero();
                     if first {
                         charged = charged
-                            .checked_add(u64::from(
+                            .checked_add(
                                 self.version()
                                     .gas_params
                                     .get(crate::version::GasId::SstoreSetState),
-                            ))
+                            )
                             .ok_or(InstrStop::OutOfGas)?;
                     }
                 }
@@ -549,7 +549,9 @@ impl<'a, T: EvmTypes<Tx: Typed2718>> Evm<'a, T> {
         prefix_end: usize,
     ) -> HandlerResult<FrameValidationResult> {
         let handler = self.registry.try_get_by_type(tx.ty())?;
-        self.simulate_frames(|host| handler.validate_frame_prefix(tx, host, prefix_end))
+        self.simulate_frames(|host| {
+            handler.validate_frame_prefix(tx.as_recovered_ref(), host, prefix_end)
+        })
     }
 
     /// Executes a discarded frame prefix using a borrowed inspector.

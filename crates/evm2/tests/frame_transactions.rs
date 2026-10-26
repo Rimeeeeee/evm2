@@ -599,9 +599,9 @@ fn verify_entry_failure_emits_its_frame_end_before_invalidating_the_prefix() {
 #[test]
 fn elided_witness_hash_and_intrinsic_commit_to_length_instead_of_contents() {
     let version = Version::base(SpecId::BOGOTA);
-    let token = u64::from(version.gas_params.get(GasId::TxTokenNonZeroByteMultiplier));
-    let intrinsic_byte_cost = token * u64::from(version.gas_params.get(GasId::TxTokenCost));
-    let floor_byte_cost = token * u64::from(version.gas_params.get(GasId::TxFloorCostPerToken));
+    let token = version.gas_params.get(GasId::TxTokenNonZeroByteMultiplier);
+    let intrinsic_byte_cost = token * version.gas_params.get(GasId::TxTokenCost);
+    let floor_byte_cost = token * version.gas_params.get(GasId::TxFloorCostPerToken);
     for len in [0, 1, 55, 56, 64, 128, 256] {
         let mut zero = payload(vec![frame(FrameMode::Verify, SENDER)]);
         zero.signatures
@@ -633,11 +633,10 @@ fn explicit_signature_messages_preserve_content_sensitive_hashing_and_intrinsic_
     assert_ne!(nonzero.signature_hash(), zero.signature_hash());
     let zero_gas = FrameGas::calculate(&zero, version).unwrap();
     let nonzero_gas = FrameGas::calculate(&nonzero, version).unwrap();
-    let token_difference =
-        u64::from(version.gas_params.get(GasId::TxTokenNonZeroByteMultiplier)) - 1;
+    let token_difference = version.gas_params.get(GasId::TxTokenNonZeroByteMultiplier) - 1;
     assert_eq!(
         nonzero_gas.intrinsic - zero_gas.intrinsic,
-        64 * token_difference * u64::from(version.gas_params.get(GasId::TxTokenCost))
+        64 * token_difference * version.gas_params.get(GasId::TxTokenCost)
     );
     assert_eq!(nonzero_gas.floor, zero_gas.floor);
 }
@@ -713,12 +712,12 @@ fn aggregate_fee_escrow_settlement_and_gasprice_cover_full_partial_and_overflowi
 fn nonce_intrinsic_charges_zero_keys_and_exempts_only_single_use_sequences() {
     let version = Version::base(SpecId::BOGOTA);
     let gp = &version.gas_params;
-    let token = u64::from(gp.get(GasId::TxTokenNonZeroByteMultiplier));
-    let intrinsic_byte_cost = token * u64::from(gp.get(GasId::TxTokenCost));
-    let floor_byte_cost = token * u64::from(gp.get(GasId::TxFloorCostPerToken));
-    let key_cost = u64::from(gp.get(GasId::WarmStorageReadCost))
-        + u64::from(gp.get(GasId::ColdStorageAdditionalCost))
-        + u64::from(gp.get(GasId::SstoreSetWithoutLoadCost));
+    let token = gp.get(GasId::TxTokenNonZeroByteMultiplier);
+    let intrinsic_byte_cost = token * gp.get(GasId::TxTokenCost);
+    let floor_byte_cost = token * gp.get(GasId::TxFloorCostPerToken);
+    let key_cost = gp.get(GasId::WarmStorageReadCost)
+        + gp.get(GasId::ColdStorageAdditionalCost)
+        + gp.get(GasId::SstoreSetWithoutLoadCost);
     let mut tx = payload(vec![frame(FrameMode::Verify, SENDER)]);
     tx.nonce_keys = Some(vec![]);
     let legacy = FrameGas::calculate(&tx, version).unwrap();
@@ -774,7 +773,7 @@ fn custom_refund_quotients_keep_prefix_and_full_execution_consistent() {
         assert_eq!(evm.state_mut().account(&SENDER).unwrap().nonce(), 0);
         let result = evm.transact(&tx).unwrap().commit();
         assert!(result.status);
-        let available_refund = u64::from(version.gas_params.get(GasId::SstoreClearingSlotRefund));
+        let available_refund = version.gas_params.get(GasId::SstoreClearingSlotRefund);
         assert_eq!(
             result.refunded,
             available_refund.min(result.total_gas_spent / u64::from(quotient.max(1)))

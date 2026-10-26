@@ -476,7 +476,7 @@ fn put_storage(
 fn assert_native_case(case: &Case, result: &Outcome) {
     let version = Version::base(SpecId::BOGOTA);
     let gp = &version.gas_params;
-    let slot_cost = u64::from(gp.get(GasId::SstoreSetState));
+    let slot_cost = gp.get(GasId::SstoreSetState);
     let create_cost = gp.create_state_gas() + gp.code_deposit_state_gas(1);
     let mut statuses = vec![FrameStatus::Success; case.tx.frames.len()];
     let mut executions = vec![107; case.tx.frames.len()];
@@ -531,7 +531,7 @@ fn assert_native_case(case: &Case, result: &Outcome) {
             } else {
                 executions[index] = 207;
                 if present && !next {
-                    raw_refund += u64::from(gp.get(GasId::SstoreSetRefund));
+                    raw_refund += gp.get(GasId::SstoreSetRefund);
                 }
                 present = next;
             }
@@ -547,12 +547,12 @@ fn assert_native_case(case: &Case, result: &Outcome) {
                 executions[index] += 10_000;
             }
             if next == U256::from(7) && next != present {
-                raw_refund += u64::from(gp.get(GasId::SstoreResetRefund));
+                raw_refund += gp.get(GasId::SstoreResetRefund);
             }
             present = next;
         }
         if present.is_zero() {
-            raw_refund += u64::from(gp.get(GasId::SstoreClearingSlotRefund));
+            raw_refund += gp.get(GasId::SstoreClearingSlotRefund);
         }
         put_storage(&mut accounts, BODY, U256::ZERO, present);
     } else if name.starts_with("entry_execution_") {

@@ -102,11 +102,8 @@ impl FrameGas {
         let access = mul(
             count,
             sum(
-                sum(
-                    gp.get(GasId::WarmStorageReadCost).into(),
-                    u64::from(gp.get(GasId::ColdStorageAdditionalCost)),
-                )?,
-                gp.get(GasId::SstoreSetWithoutLoadCost).into(),
+                sum(gp.get(GasId::WarmStorageReadCost), gp.get(GasId::ColdStorageAdditionalCost))?,
+                gp.get(GasId::SstoreSetWithoutLoadCost),
             )?,
         )?;
         let signatures =
@@ -131,16 +128,12 @@ impl FrameGas {
             }));
         let (tokens, floor_tokens) = fields.try_fold((0, 0), |total, bytes| {
             bytes.iter().try_fold(total, |(tokens, floor), byte| {
-                let nonzero = u64::from(gp.get(GasId::TxTokenNonZeroByteMultiplier));
+                let nonzero = gp.get(GasId::TxTokenNonZeroByteMultiplier);
                 Ok::<_, HandlerError>((
                     sum(tokens, if *byte == 0 { 1 } else { nonzero })?,
                     sum(
                         floor,
-                        if *byte == 0 {
-                            gp.get(GasId::TxFloorZeroByteMultiplier).into()
-                        } else {
-                            nonzero
-                        },
+                        if *byte == 0 { gp.get(GasId::TxFloorZeroByteMultiplier) } else { nonzero },
                     )?,
                 ))
             })
@@ -154,16 +147,13 @@ impl FrameGas {
             .try_fold(0, |s, sig| {
                 sum(
                     s,
-                    mul(
-                        sig.signature.len() as u64,
-                        gp.get(GasId::TxTokenNonZeroByteMultiplier).into(),
-                    )?,
+                    mul(sig.signature.len() as u64, gp.get(GasId::TxTokenNonZeroByteMultiplier))?,
                 )
             })?;
         let tokens = sum(tokens, elided_tokens)?;
         let floor_tokens = sum(floor_tokens, elided_tokens)?;
-        let intrinsic = sum(base, mul(tokens, gp.get(GasId::TxTokenCost).into())?)?;
-        let floor = sum(base, mul(floor_tokens, gp.get(GasId::TxFloorCostPerToken).into())?)?;
+        let intrinsic = sum(base, mul(tokens, gp.get(GasId::TxTokenCost))?)?;
+        let floor = sum(base, mul(floor_tokens, gp.get(GasId::TxFloorCostPerToken))?)?;
         let execution =
             sum(intrinsic, tx.frames.iter().try_fold(0, |s, f| sum(s, f.limits.execution))?)?
                 .max(floor);
@@ -590,7 +580,7 @@ fn run<T: EvmTypes>(
     let spent =
         prepared.gas.intrinsic + receipts.iter().map(|r| r.gas_used.execution).sum::<u64>() + state;
     let refund = refunds.into_iter().fold(0i64, i64::saturating_add).max(0) as u64;
-    let refund_quotient = u64::from(host.version().gas_params.get(GasId::MaxRefundQuotient)).max(1);
+    let refund_quotient = host.version().gas_params.get(GasId::MaxRefundQuotient).max(1);
     let refund = refund.min(spent / refund_quotient);
     let result = TxResultExt {
         status: !failed,
@@ -713,7 +703,7 @@ fn execute_frame<T: EvmTypes>(
     let target = frame.resolved_target(tx.sender);
     let mut gas = GasTracker::new_isolated(frame.limits.execution, frame.limits.state);
     let run = (|| -> Result<MessageResultExt<T::MessageResultExt>, HostError> {
-        let warm = host.version().gas_params.get(GasId::WarmStorageReadCost) as u64;
+        let warm = host.version().gas_params.get(GasId::WarmStorageReadCost);
         let cold = host.version().gas_params.cold_account_additional_cost();
         gas.spend(warm)?;
         let load = host.load_account(&target, false, gas.remaining() < cold)?;
