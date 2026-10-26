@@ -13,6 +13,7 @@ permissions: {}
 jobs:
   audit:
     if: >-
+      github.repository == 'alloy-rs/evm2' &&
       contains(fromJSON('["pull_request","pull_request_target"]'), github.event_name) &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       (
@@ -39,6 +40,7 @@ jobs:
 
   audit-comment:
     if: >-
+      github.repository == 'alloy-rs/evm2' &&
       github.event_name == 'issue_comment' &&
       github.event.issue.pull_request &&
       (
