@@ -186,6 +186,10 @@ impl Typed2718 for TxEnvelope {
 }
 
 impl Transaction for TxEnvelope {
+    fn frame_transaction(&self) -> Option<&TxEip8141> {
+        self.as_eip8141()
+    }
+
     fn chain_id(&self) -> Option<u64> {
         delegate!(self, chain_id)
     }
@@ -264,6 +268,10 @@ impl Transaction for TxEnvelope {
 
     fn max_fee_per_blob_gas_u256(&self) -> Option<U256> {
         delegate!(self, max_fee_per_blob_gas_u256)
+    }
+
+    fn priority_fee_or_price_u256(&self) -> U256 {
+        delegate!(self, priority_fee_or_price_u256)
     }
 
     fn effective_gas_price_u256(&self, base_fee: Option<u64>) -> U256 {
@@ -980,7 +988,7 @@ mod tests {
     };
     use alloc::{string::ToString, vec};
     use alloy_consensus::{TxEip2930, transaction::Recovered};
-    use alloy_eips::eip2930::AccessList;
+    use alloy_eips::{eip2930::AccessList, eip8141::TransactionFees};
 
     #[rstest::rstest]
     fn adjusted_floor_gas_controls_validation_and_settlement(
@@ -1506,5 +1514,24 @@ mod tests {
             assert_eq!(intrinsic, base + calldata_gas + initcode_gas);
             assert_eq!(floor, base + floor_calldata_gas);
         }
+    }
+
+    #[test]
+    fn frame_envelope_exposes_payload_and_full_width_priority_fee() {
+        let payload = TxEip8141 {
+            fees: TransactionFees {
+                max_fee: U256::MAX,
+                max_priority_fee_per_gas: U256::ONE << 180,
+            },
+            ..Default::default()
+        };
+        let envelope = TxEnvelope::Eip8141(payload.clone());
+        assert_eq!(envelope.frame_transaction(), Some(&payload));
+        assert_eq!(envelope.priority_fee_or_price_u256(), payload.fees.max_priority_fee_per_gas);
+        let recovered = Recovered::new_unchecked(envelope, payload.sender);
+        assert_eq!(recovered.frame_transaction(), Some(&payload));
+        let legacy = TxEnvelope::Legacy(TxLegacy { gas_price: 42, ..Default::default() });
+        assert_eq!(legacy.frame_transaction(), None);
+        assert_eq!(legacy.priority_fee_or_price_u256(), U256::from(42));
     }
 }

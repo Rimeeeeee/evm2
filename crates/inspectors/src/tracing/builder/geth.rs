@@ -385,6 +385,8 @@ impl<'a> GethTraceBuilder<'a> {
             }
             let code = if code_enabled { load_account_code(db, &db_acc)? } else { None };
             let mut acc_state = AccountState::from_account_info(db_acc.nonce, db_acc.balance, code);
+            // Geth retains code hashes even when disableCode omits the bytecode.
+            acc_state.code_hash = (!db_acc.is_empty_code_hash()).then_some(db_acc.code_hash);
 
             // insert the original value of all loaded storage slots
             if storage_enabled {
@@ -435,6 +437,16 @@ impl<'a> GethTraceBuilder<'a> {
 
             let mut pre_state =
                 AccountState::from_account_info(db_acc.nonce, db_acc.balance, pre_code);
+            pre_state.code_hash = (!db_acc.is_empty_code_hash()).then_some(db_acc.code_hash);
+            // Empty hashes are omitted in prestate, but signal code removal in poststate.
+            post_state.code_hash = if !info.is_empty_code_hash() || pre_state.code_hash.is_some() {
+                Some(info.code_hash)
+            } else {
+                None
+            };
+            if code_enabled && pre_state.code.is_some() && post_state.code.is_none() {
+                post_state.code = Some(Bytes::new());
+            }
 
             // handle storage changes
             if storage_enabled {
@@ -971,9 +983,52 @@ mod tests {
                             U256::ZERO,
                             code_enabled.then(|| code.original_bytes()),
                         )
+                        .with_code_hash(code.hash_slow())
                     ),
                 ]))),
             );
+        }
+    }
+
+    #[test]
+    fn prestate_diff_retains_code_hash_changes_with_code_disabled() {
+        let address = Address::with_last_byte(1);
+        let code = Bytecode::new_legacy(Bytes::from_static(&[op::STOP]));
+        let original = AccountInfo::default().with_nonce(1).with_code(code.clone());
+        let builder = GethTraceBuilder::new(Vec::new());
+
+        for code_enabled in [false, true] {
+            for next_code in [
+                code.clone(),
+                Bytecode::new_legacy(Bytes::from_static(&[op::PUSH0, op::STOP])),
+                Bytecode::default(),
+            ] {
+                let current = original.clone().with_code(next_code.clone());
+                let mut db = CacheDB::new(EmptyDB::default());
+                db.insert_account_info(&address, original.clone());
+                let mut state = TxState::default();
+                state.accounts.insert(
+                    address,
+                    TxAccount { current: Some(current.clone()), ..Default::default() },
+                );
+                let PreStateFrame::Diff(diff) = builder
+                    .geth_prestate_diff_traces(&state, &mut db, code_enabled, false)
+                    .unwrap()
+                else {
+                    panic!("expected diff prestate frame")
+                };
+                if current.code_hash == original.code_hash {
+                    assert!(diff.pre.is_empty());
+                    assert!(diff.post.is_empty());
+                } else {
+                    assert_eq!(diff.pre[&address].code_hash, Some(original.code_hash));
+                    assert_eq!(diff.post[&address].code_hash, Some(current.code_hash));
+                    assert_eq!(
+                        diff.post[&address].code,
+                        code_enabled.then(|| next_code.original_bytes())
+                    );
+                }
+            }
         }
     }
 }
