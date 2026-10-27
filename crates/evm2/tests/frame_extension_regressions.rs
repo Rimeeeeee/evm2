@@ -440,3 +440,26 @@ fn reverted_nested_approval_cannot_authorize_the_next_sender_frame() {
         }
     }
 }
+
+#[test]
+fn setcodefrom_recent_root_address_is_an_ordinary_contract() {
+    let recent_root = alloy_eips::eip8272::RECENT_ROOT_ADDRESS;
+    let mut code = vec![0x73];
+    code.extend_from_slice(BODY.as_slice());
+    code.extend_from_slice(&[0xa7, 0x5f, 0x52, 0x60, 32, 0x5f, 0xf3]);
+    let db = common::database([
+        (SENDER, APPROVE_BOTH),
+        (BODY, &[0x00][..]),
+        (recent_root, code.as_slice()),
+    ]);
+    let mut evm = common::evm(db);
+    let tx = common::recovered(common::payload(vec![
+        common::frame(FrameMode::Verify, SENDER),
+        common::frame(FrameMode::Sender, recent_root),
+    ]));
+    let result = evm.call_tx(&tx).unwrap();
+    let frame = result.frame.unwrap();
+    assert_eq!(frame.stops[1], InstrStop::Return);
+    assert_eq!(frame.receipts[1].status, FrameStatus::Success);
+    assert_eq!(U256::from_be_slice(&frame.outputs[1]), U256::ONE);
+}

@@ -1971,7 +1971,6 @@ impl<'a, T: EvmTypes> Host<T> for Evm<'a, T> {
                 | CONSOLIDATION_REQUEST_ADDRESS
                 | BUILDER_DEPOSIT_REQUEST_ADDRESS
                 | BUILDER_EXIT_REQUEST_ADDRESS
-                | alloy_eips::eip8272::RECENT_ROOT_ADDRESS
         ) {
             return Err(InstrStop::SystemContractCodeChange.into());
         }
