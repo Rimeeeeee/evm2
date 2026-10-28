@@ -113,8 +113,6 @@ pub enum InstrStop {
     FatalExternalError,
     /// Invalid encoding of an instruction's immediate operand.
     InvalidImmediateEncoding,
-    /// Attempted to change a protocol system contract's code.
-    SystemContractCodeChange,
 }
 
 impl InstrStop {

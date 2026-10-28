@@ -2002,7 +2002,7 @@ impl<'a, T: EvmTypes> Host<T> for Evm<'a, T> {
                 | BUILDER_DEPOSIT_REQUEST_ADDRESS
                 | BUILDER_EXIT_REQUEST_ADDRESS
         ) {
-            return Err(InstrStop::SystemContractCodeChange.into());
+            return Err(InstrStop::OpcodeNotFound.into());
         }
         let params = &self.version().gas_params;
         let warm = params.get(GasId::WarmStorageReadCost);
@@ -2391,13 +2391,24 @@ mod tests {
             Err(HostError::Halt(InstrStop::OutOfGas))
         );
         assert!(!evm.state.is_account_warm(&source));
-        let mut gas = Gas::new(50_000);
-        assert_eq!(
-            evm.set_code_from(&HISTORY_STORAGE_ADDRESS, &source, &mut gas),
-            Err(HostError::Halt(InstrStop::SystemContractCodeChange))
-        );
-        assert_eq!(gas.spent(), 0);
-        assert!(!evm.state.is_account_warm(&source));
+        for destination in [
+            BEACON_ROOTS_ADDRESS,
+            HISTORY_STORAGE_ADDRESS,
+            WITHDRAWAL_REQUEST_ADDRESS,
+            CONSOLIDATION_REQUEST_ADDRESS,
+            BUILDER_DEPOSIT_REQUEST_ADDRESS,
+            BUILDER_EXIT_REQUEST_ADDRESS,
+        ] {
+            for available_gas in [0, 50_000] {
+                let mut gas = Gas::new(available_gas);
+                assert_eq!(
+                    evm.set_code_from(&destination, &source, &mut gas),
+                    Err(HostError::Halt(InstrStop::OpcodeNotFound))
+                );
+                assert_eq!(gas.spent(), 0);
+                assert!(!evm.state.is_account_warm(&source));
+            }
+        }
     }
 
     #[test]
