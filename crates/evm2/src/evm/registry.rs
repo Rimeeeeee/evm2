@@ -41,7 +41,7 @@ pub enum HandlerError {
         expected: u8,
     },
     /// Sender account does not have the expected nonce.
-    #[error("invalid nonce: expected {expected}, got {got}")]
+    #[error("nonce {got} too {direction}, expected {expected}", direction = if got < expected { "low" } else { "high" })]
     InvalidNonce {
         /// Expected nonce.
         expected: u64,
@@ -76,7 +76,7 @@ pub enum HandlerError {
         balance: U256,
     },
     /// Sender account has deployed code.
-    #[error("caller has code")]
+    #[error("reject transactions from senders with deployed code")]
     RejectCallerWithCode,
     /// Transaction nonce cannot be incremented.
     #[error("nonce overflow in transaction")]
@@ -90,7 +90,7 @@ pub enum HandlerError {
         block_gas_limit: U256,
     },
     /// Transaction gas limit exceeds the active per-transaction gas cap.
-    #[error("transaction gas limit {gas_limit} exceeds cap {cap}")]
+    #[error("transaction gas limit ({gas_limit}) is greater than the cap ({cap})")]
     TxGasLimitGreaterThanCap {
         /// Transaction gas limit.
         gas_limit: u64,
@@ -130,7 +130,7 @@ pub enum HandlerError {
     #[error("empty blobs")]
     EmptyBlobs,
     /// EIP-4844 blob transaction contains too many blob hashes.
-    #[error("too many blobs: have {have}, max {max}")]
+    #[error("too many blobs, have {have}, max {max}")]
     TooManyBlobs {
         /// Blob count in the transaction.
         have: usize,
@@ -147,7 +147,7 @@ pub enum HandlerError {
     #[error("{0}")]
     InvalidFrameTransaction(&'static str),
     /// Frame transaction fee budget does not cover execution and blob base fees.
-    #[error("EIP-8141 max fee does not cover the required base fees")]
+    #[error("gas price is less than basefee")]
     FrameFeeBudgetTooLow {
         /// Required base-fee budget for all reserved gas and blobs.
         required: U256,
@@ -853,11 +853,22 @@ mod tests {
         for (error, message) in [
             (
                 HandlerError::FrameFeeBudgetTooLow { required: U256::from(2), got: U256::ONE },
-                "EIP-8141 max fee does not cover the required base fees",
+                "gas price is less than basefee",
             ),
             (
                 HandlerError::InvalidFrameTransaction("EIP-8141 VERIFY frame failed"),
                 "EIP-8141 VERIFY frame failed",
+            ),
+            (HandlerError::InvalidNonce { expected: 5, got: 4 }, "nonce 4 too low, expected 5"),
+            (HandlerError::InvalidNonce { expected: 5, got: 6 }, "nonce 6 too high, expected 5"),
+            (
+                HandlerError::TxGasLimitGreaterThanCap { gas_limit: 16_777_217, cap: 16_777_216 },
+                "transaction gas limit (16777217) is greater than the cap (16777216)",
+            ),
+            (HandlerError::TooManyBlobs { have: 10, max: 9 }, "too many blobs, have 10, max 9"),
+            (
+                HandlerError::RejectCallerWithCode,
+                "reject transactions from senders with deployed code",
             ),
             (
                 HandlerError::Fatal(AnyError::from("JavaScript tracing interrupted")),

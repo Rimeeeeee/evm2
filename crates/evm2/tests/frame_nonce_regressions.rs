@@ -423,3 +423,26 @@ fn nonce_introspection_returns_zero_first_key_for_the_empty_legacy_set() {
         }
     }
 }
+
+#[test]
+fn empty_key_nonce_errors_match_revm_without_consuming_the_nonce() {
+    for inspected in [false, true] {
+        for (sequence, message) in
+            [(4, "nonce 4 too low, expected 5"), (6, "nonce 6 too high, expected 5")]
+        {
+            for entry in ["validate", "execute", "prefix"] {
+                let mut evm = evm(APPROVE_BOTH, &[], 5, inspected);
+                let tx = approval(vec![], sequence);
+                let error = match entry {
+                    "validate" => evm.validate_tx(&tx).unwrap_err(),
+                    "execute" => evm.transact(&tx).unwrap_err(),
+                    _ => evm.validate_frame_prefix(&tx, 1).unwrap_err(),
+                };
+                assert_eq!(error, HandlerError::InvalidNonce { expected: 5, got: sequence });
+                assert_eq!(error.to_string(), message);
+                assert_eq!(legacy_nonce(&mut evm), 5);
+                assert!(evm.logs().is_empty());
+            }
+        }
+    }
+}

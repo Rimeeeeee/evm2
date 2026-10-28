@@ -57,16 +57,35 @@ fn blob_hash() -> B256 {
 }
 
 fn assert_static_error(name: &str, tx: TxEip8141, expected: HandlerError) {
-    for prefix in [false, true].into_iter().filter(|prefix| !prefix || !tx.frames.is_empty()) {
-        let (mut evm, reads) = evm(Version::new(SpecId::BOGOTA), BlockEnvExt::default());
+    assert_static_error_with_env(
+        name,
+        tx,
+        Version::new(SpecId::BOGOTA),
+        BlockEnvExt::default(),
+        expected,
+    );
+}
+
+fn assert_static_error_with_env(
+    name: &str,
+    tx: TxEip8141,
+    version: Version,
+    block: BlockEnvExt,
+    expected: HandlerError,
+) {
+    for entry in ["validate", "execute", "prefix"] {
+        if entry == "prefix" && tx.frames.is_empty() {
+            continue;
+        }
+        let (mut evm, reads) = evm(version, block.clone());
         let tx = recovered(tx.clone());
-        let error = if prefix {
-            evm.validate_frame_prefix(&tx, 1).unwrap_err()
-        } else {
-            evm.validate_tx(&tx).unwrap_err()
+        let error = match entry {
+            "validate" => evm.validate_tx(&tx).unwrap_err(),
+            "execute" => evm.transact(&tx).unwrap_err(),
+            _ => evm.validate_frame_prefix(&tx, 1).unwrap_err(),
         };
-        assert_eq!(error, expected, "{name}, prefix={prefix}");
-        assert_eq!(reads.load(Ordering::Relaxed), 0, "{name}, prefix={prefix}");
+        assert_eq!(error, expected, "{name}, entry={entry}");
+        assert_eq!(reads.load(Ordering::Relaxed), 0, "{name}, entry={entry}");
         assert!(evm.logs().is_empty());
     }
 }
@@ -243,21 +262,17 @@ fn malformed_frame_structure_and_nonce_schemas_are_rejected_without_reads() {
     assert_static_error("sequence overflow", tx, HandlerError::NonceOverflow);
     let mut tx = payload();
     tx.frames[1].limits.execution = u64::MAX;
-    assert_static_error(
-        "execution sum overflow",
-        tx,
-        invalid("EIP-8141 derived gas limit overflow"),
-    );
+    assert_static_error("execution sum overflow", tx, invalid("overflow payment in transaction"));
     let mut tx = payload();
     tx.frames[1].limits.state = u64::MAX;
-    assert_static_error("state sum overflow", tx, invalid("EIP-8141 derived gas limit overflow"));
+    assert_static_error("state sum overflow", tx, invalid("overflow payment in transaction"));
     let mut tx = payload();
     tx.frames[0].limits.state = 0;
     tx.frames[1].limits.state = u64::MAX - 100_000;
     assert_static_error(
         "combined reservation overflow",
         tx,
-        invalid("EIP-8141 derived gas limit overflow"),
+        invalid("overflow payment in transaction"),
     );
 }
 
@@ -409,6 +424,7 @@ fn resource_fee_and_blob_validation_precedes_database_reads() {
             "blob count",
             |tx, version, _| {
                 tx.blob_versioned_hashes = vec![blob_hash(); version.max_blobs_per_tx + 1];
+                tx.fees.max_fee = U256::MAX;
             },
             HandlerError::TooManyBlobs {
                 have: version.max_blobs_per_tx + 1,
@@ -417,7 +433,10 @@ fn resource_fee_and_blob_validation_precedes_database_reads() {
         ),
         (
             "blob version",
-            |tx, _, _| tx.blob_versioned_hashes.push(B256::ZERO),
+            |tx, _, _| {
+                tx.blob_versioned_hashes.push(B256::ZERO);
+                tx.fees.max_fee = U256::MAX;
+            },
             HandlerError::BlobVersionNotSupported,
         ),
         (
@@ -433,12 +452,12 @@ fn resource_fee_and_blob_validation_precedes_database_reads() {
             },
         ),
         (
-            "overflow payment in transaction",
+            "base-fee charge overflow",
             |tx, _, block| {
                 tx.fees.max_fee = U256::MAX;
                 block.basefee = U256::MAX;
             },
-            invalid("overflow payment in transaction"),
+            invalid("gas price is less than basefee"),
         ),
         (
             "blob charge overflow",
@@ -447,7 +466,7 @@ fn resource_fee_and_blob_validation_precedes_database_reads() {
                 tx.fees.max_fee = U256::MAX;
                 block.blob_basefee = U256::MAX;
             },
-            invalid("overflow payment in transaction"),
+            invalid("gas price is less than basefee"),
         ),
     ];
     for (name, prepare, expected) in cases {
@@ -455,9 +474,7 @@ fn resource_fee_and_blob_validation_precedes_database_reads() {
         let mut version = version;
         let mut block = BlockEnvExt::default();
         prepare(&mut tx, &mut version, &mut block);
-        let (mut evm, reads) = evm(version, block);
-        assert_eq!(evm.validate_tx(&recovered(tx)).unwrap_err(), *expected, "{name}");
-        assert_eq!(reads.load(Ordering::Relaxed), 0, "{name}");
+        assert_static_error_with_env(name, tx, version, block, expected.clone());
     }
 }
 
@@ -467,17 +484,17 @@ fn competing_errors_follow_static_preparation_order_and_valid_payload_reaches_db
     tx.frames.clear();
     tx.nonce_keys = Some((1..=17).map(U256::from).collect());
     assert_static_error(
-        "frame count before nonce keys",
+        "nonce keys before frame count",
         tx,
-        invalid("EIP-8141 frame count must be in 1..=64"),
+        invalid(validate_nonce_keys(&(1..=17).map(U256::from).collect::<Vec<_>>()).unwrap_err()),
     );
     let mut tx = payload();
     tx.frames[1].flags = 0x80;
     tx.nonce_keys = Some((1..=17).map(U256::from).collect());
     assert_static_error(
-        "structure before nonce keys",
+        "nonce keys before structure",
         tx,
-        invalid("EIP-8141 reserved frame flag is set"),
+        invalid(validate_nonce_keys(&(1..=17).map(U256::from).collect::<Vec<_>>()).unwrap_err()),
     );
     let mut tx = payload();
     tx.nonce_keys = Some((1..=17).map(U256::from).collect());
@@ -490,7 +507,11 @@ fn competing_errors_follow_static_preparation_order_and_valid_payload_reaches_db
     let mut tx = payload();
     tx.nonce = u64::MAX;
     tx.frames[1].limits.execution = u64::MAX;
-    assert_static_error("sequence before gas arithmetic", tx, HandlerError::NonceOverflow);
+    assert_static_error(
+        "gas arithmetic before sequence",
+        tx,
+        invalid("overflow payment in transaction"),
+    );
     let mut tx = payload();
     tx.chain_id = 2;
     tx.fees.max_priority_fee_per_gas = U256::from(1);
@@ -503,9 +524,9 @@ fn competing_errors_follow_static_preparation_order_and_valid_payload_reaches_db
     tx.chain_id = 2;
     tx.signatures.push(FrameSignature { scheme: SignatureScheme::P256, ..Default::default() });
     assert_static_error(
-        "signature shape before chain",
+        "chain before signature shape",
         tx,
-        invalid("EIP-8141 signature validation failed"),
+        HandlerError::InvalidChainId { expected: 1, got: 2 },
     );
     let (mut evm, reads) = evm(Version::new(SpecId::BOGOTA), BlockEnvExt::default());
     assert!(
@@ -649,4 +670,146 @@ fn valid_expiry() -> Frame {
     expiry.limits.state = 0;
     expiry.data = vec![0; EXPIRY_DATA_LENGTH].into();
     expiry
+}
+
+#[test]
+fn frame_environment_errors_follow_revm_precedence() {
+    let version = Version::new(SpecId::BOGOTA);
+    let mut tx = payload();
+    tx.chain_id = 2;
+    tx.frames[1].limits.execution = u64::MAX;
+    assert_static_error(
+        "chain before gas arithmetic",
+        tx,
+        HandlerError::InvalidChainId { expected: 1, got: 2 },
+    );
+
+    let mut tx = payload();
+    tx.nonce = u64::MAX;
+    tx.nonce_keys = None;
+    assert_static_error("sequence before nonce schema", tx, HandlerError::NonceOverflow);
+
+    let mut tx = payload();
+    tx.frames[0].mode = FrameMode::Assert;
+    tx.frames[1].flags = 0x80;
+    assert_static_error(
+        "reserved flags before assertion suffix",
+        tx,
+        invalid("EIP-8141 reserved frame flag is set"),
+    );
+
+    let mut tx = payload();
+    tx.frames[1].mode = FrameMode::Assert;
+    tx.frames[1].flags = 4;
+    tx.frames[1].value = U256::from(1);
+    assert_static_error(
+        "value before assertion atomic flag",
+        tx,
+        invalid("only EIP-8141 SENDER frames may transfer value"),
+    );
+
+    let mut tx = payload();
+    tx.frames[1].flags = 0x80;
+    let gas = FrameGas::calculate(&tx, &version).unwrap();
+    let mut capped = version;
+    capped.tx_gas_limit_cap = gas.execution - 1;
+    assert_static_error_with_env(
+        "cap before frame flags",
+        tx,
+        capped,
+        BlockEnvExt::default(),
+        HandlerError::TxGasLimitGreaterThanCap { gas_limit: gas.execution, cap: gas.execution - 1 },
+    );
+
+    let mut tx = payload();
+    tx.blob_versioned_hashes = vec![B256::ZERO; version.max_blobs_per_tx + 1];
+    tx.fees.max_fee = U256::MAX;
+    tx.nonce = u64::MAX;
+    tx.frames[1].flags = 0x80;
+    assert_static_error(
+        "blob version before count and nonce",
+        tx.clone(),
+        HandlerError::BlobVersionNotSupported,
+    );
+    tx.blob_versioned_hashes.fill(blob_hash());
+    assert_static_error(
+        "blob count before nonce and structure",
+        tx,
+        HandlerError::TooManyBlobs {
+            have: version.max_blobs_per_tx + 1,
+            max: version.max_blobs_per_tx,
+        },
+    );
+
+    for blobs in [false, true] {
+        let mut tx = payload();
+        tx.nonce = u64::MAX;
+        tx.frames[1].flags = 0x80;
+        tx.signatures.push(FrameSignature { scheme: SignatureScheme::P256, ..Default::default() });
+        if blobs {
+            tx.blob_versioned_hashes = vec![B256::ZERO; version.max_blobs_per_tx + 1];
+        }
+        let block = BlockEnvExt {
+            basefee: U256::from(1),
+            blob_basefee: U256::from(2),
+            ..Default::default()
+        };
+        let gas = FrameGas::calculate(&tx, &version).unwrap();
+        let required =
+            U256::from(gas.maximum) + U256::from(tx.blob_versioned_hashes.len() * 131_072 * 2);
+        assert_static_error_with_env(
+            "fee before blobs, nonce, cap and structure",
+            tx,
+            capped,
+            block,
+            HandlerError::FrameFeeBudgetTooLow { required, got: U256::ZERO },
+        );
+    }
+}
+
+#[test]
+fn frame_fee_boundary_includes_blob_and_keyed_nonce_reservations() {
+    let version = Version::new(SpecId::BOGOTA);
+    for keyed in [false, true] {
+        for blobs in [false, true] {
+            let mut tx = payload();
+            if keyed {
+                tx.nonce_keys = Some(vec![U256::from(1)]);
+            }
+            if blobs {
+                tx.blob_versioned_hashes.push(blob_hash());
+            }
+            let gas = FrameGas::calculate(&tx, &version).unwrap();
+            let required =
+                U256::from(gas.maximum) + U256::from(tx.blob_versioned_hashes.len() * 131_072 * 2);
+            let block = BlockEnvExt {
+                basefee: U256::from(1),
+                blob_basefee: U256::from(2),
+                ..Default::default()
+            };
+            tx.fees.max_fee = required - U256::from(1);
+            assert_static_error_with_env(
+                "one wei short",
+                tx.clone(),
+                version,
+                block.clone(),
+                HandlerError::FrameFeeBudgetTooLow { required, got: tx.fees.max_fee },
+            );
+            tx.fees.max_fee = required;
+            for entry in ["validate", "execute", "prefix"] {
+                let (mut evm, reads) = evm(version, block.clone());
+                let tx = recovered(tx.clone());
+                let error = match entry {
+                    "validate" => evm.validate_tx(&tx).unwrap_err(),
+                    "execute" => evm.transact(&tx).unwrap_err(),
+                    _ => evm.validate_frame_prefix(&tx, 1).unwrap_err(),
+                };
+                assert!(
+                    matches!(error, HandlerError::Database(_)),
+                    "keyed={keyed}, blobs={blobs}, entry={entry}: {error}"
+                );
+                assert_eq!(reads.load(Ordering::Relaxed), 1);
+            }
+        }
+    }
 }

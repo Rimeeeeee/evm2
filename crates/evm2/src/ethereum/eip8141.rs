@@ -240,21 +240,51 @@ fn prepare_payload<T: EvmTypes>(
     host: &mut Evm<'_, T>,
     tx: &TxEip8141,
 ) -> HandlerResult<PreparedFrameTx> {
+    validate_chain_id(host.version(), Some(tx.chain_id), false)?;
     if !host.feature(EvmFeatures::EIP8141) {
         return Err(HandlerError::UnsupportedTransactionType(6));
     }
-    let placeholders = host.feature(EvmFeatures::FRAME_SIGNATURE_PLACEHOLDERS);
-    validate_structure(tx, placeholders)?;
+    // Match Revm's environment validation before frame structure and signatures.
+    let gas = FrameGas::calculate(tx, host.version())
+        .map_err(|_| invalid("overflow payment in transaction"))?;
+    let blob_charge = U256::from(tx.blob_versioned_hashes.len())
+        .checked_mul(U256::from(DATA_GAS_PER_BLOB))
+        .and_then(|v| v.checked_mul(host.block.blob_basefee))
+        .ok_or(invalid("gas price is less than basefee"))?;
+    let max_gas = U256::from(gas.maximum);
+    let base_fee =
+        if host.feature(EvmFeatures::BASE_FEE_CHECK) { host.block.basefee } else { U256::ZERO };
+    let required_max_fee = max_gas
+        .checked_mul(base_fee)
+        .and_then(|v| v.checked_add(blob_charge))
+        .ok_or(invalid("gas price is less than basefee"))?;
+    let budget_left = tx.fees.max_fee.checked_sub(required_max_fee).ok_or(
+        HandlerError::FrameFeeBudgetTooLow { required: required_max_fee, got: tx.fees.max_fee },
+    )?;
+    if tx.blob_versioned_hashes.iter().any(|h| h[0] != VERSIONED_HASH_VERSION_KZG) {
+        return Err(HandlerError::BlobVersionNotSupported);
+    }
+    if tx.blob_versioned_hashes.len() > host.version().max_blobs_per_tx {
+        return Err(HandlerError::TooManyBlobs {
+            have: tx.blob_versioned_hashes.len(),
+            max: host.version().max_blobs_per_tx,
+        });
+    }
+    if tx.nonce == u64::MAX
+        && !(host.feature(EvmFeatures::EIP8250)
+            && tx.nonce_keys.as_ref().is_some_and(|keys| !keys.is_empty()))
+    {
+        return Err(HandlerError::NonceOverflow);
+    }
     if tx.nonce_keys.is_some() != host.feature(EvmFeatures::EIP8250) {
         return Err(invalid("frame nonce payload does not match EIP-8250 activation"));
     }
     if let Some(keys) = &tx.nonce_keys {
         validate_nonce_keys(keys).map_err(invalid)?;
     }
-    if tx.nonce == u64::MAX && tx.nonce_keys.as_ref().is_none_or(Vec::is_empty) {
-        return Err(HandlerError::NonceOverflow);
+    if tx.frames.is_empty() || tx.frames.len() > 64 {
+        return Err(invalid("EIP-8141 frame count must be in 1..=64"));
     }
-    let gas = FrameGas::calculate(tx, host.version())?;
     if gas.execution > host.version().tx_gas_limit_cap {
         return Err(HandlerError::TxGasLimitGreaterThanCap {
             gas_limit: gas.execution,
@@ -262,30 +292,8 @@ fn prepare_payload<T: EvmTypes>(
         });
     }
     validate_block_gas_limit(host.version(), gas.execution.max(gas.state), host.block.gas_limit)?;
-    validate_chain_id(host.version(), Some(tx.chain_id), false)?;
-    if tx.blob_versioned_hashes.len() > host.version().max_blobs_per_tx {
-        return Err(HandlerError::TooManyBlobs {
-            have: tx.blob_versioned_hashes.len(),
-            max: host.version().max_blobs_per_tx,
-        });
-    }
-    if tx.blob_versioned_hashes.iter().any(|h| h[0] != VERSIONED_HASH_VERSION_KZG) {
-        return Err(HandlerError::BlobVersionNotSupported);
-    }
-    let blob_charge = U256::from(tx.blob_versioned_hashes.len())
-        .checked_mul(U256::from(DATA_GAS_PER_BLOB))
-        .and_then(|v| v.checked_mul(host.block.blob_basefee))
-        .ok_or(invalid("overflow payment in transaction"))?;
-    let max_gas = U256::from(gas.maximum);
-    let base_fee =
-        if host.feature(EvmFeatures::BASE_FEE_CHECK) { host.block.basefee } else { U256::ZERO };
-    let required_max_fee = max_gas
-        .checked_mul(base_fee)
-        .and_then(|v| v.checked_add(blob_charge))
-        .ok_or(invalid("overflow payment in transaction"))?;
-    let budget_left = tx.fees.max_fee.checked_sub(required_max_fee).ok_or(
-        HandlerError::FrameFeeBudgetTooLow { required: required_max_fee, got: tx.fees.max_fee },
-    )?;
+    let placeholders = host.feature(EvmFeatures::FRAME_SIGNATURE_PLACEHOLDERS);
+    validate_structure(tx, placeholders)?;
     // The requested tip product can exceed U256 even when the signed budget is valid.
     // Saturating before the minimum preserves the arbitrary-precision result.
     let max_priority_fee =
@@ -390,8 +398,8 @@ fn validate_signatures(tx: &TxEip8141, hash: B256, placeholders: bool) -> Handle
 fn validate_structure(tx: &TxEip8141, placeholders: bool) -> HandlerResult<()> {
     // Shared wire validation also applies a fixed gas schedule. Native execution must use
     // the selected Version, so validate structure here and calculate reservations separately.
-    if tx.frames.is_empty() || tx.frames.len() > 64 {
-        return Err(invalid("EIP-8141 frame count must be in 1..=64"));
+    if tx.frames.iter().any(Frame::has_reserved_flags) {
+        return Err(invalid("EIP-8141 reserved frame flag is set"));
     }
     if !alloy_eips::eip8141::has_valid_assertion_suffix(&tx.frames) {
         return Err(invalid("EIP-7906 ASSERT frames must form a trailing suffix"));
@@ -399,17 +407,14 @@ fn validate_structure(tx: &TxEip8141, placeholders: bool) -> HandlerResult<()> {
     let mut expiry = false;
     for (index, frame) in tx.frames.iter().enumerate() {
         let previous_atomic = index > 0 && tx.frames[index - 1].is_atomic_batch();
-        if frame.has_reserved_flags() {
-            return Err(invalid("EIP-8141 reserved frame flag is set"));
+        if frame.mode != FrameMode::Sender && !frame.value.is_zero() {
+            return Err(invalid("only EIP-8141 SENDER frames may transfer value"));
         }
         if frame.is_assertion() && frame.is_atomic_batch() {
             return Err(invalid("EIP-7906 atomic flag is invalid on ASSERT frames"));
         }
         if frame.is_assertion() && previous_atomic {
             return Err(invalid("EIP-7906 atomic batch cannot end on a ASSERT frame"));
-        }
-        if frame.mode != FrameMode::Sender && !frame.value.is_zero() {
-            return Err(invalid("only EIP-8141 SENDER frames may transfer value"));
         }
         if frame.flags & 2 != 0 && frame.resolved_target(tx.sender) != tx.sender {
             return Err(invalid("EIP-8141 execution approval target must be the sender"));
