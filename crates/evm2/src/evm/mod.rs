@@ -2002,7 +2002,7 @@ impl<'a, T: EvmTypes> Host<T> for Evm<'a, T> {
                 | BUILDER_DEPOSIT_REQUEST_ADDRESS
                 | BUILDER_EXIT_REQUEST_ADDRESS
         ) {
-            return Err(InstrStop::OpcodeNotFound.into());
+            return Err(InstrStop::SystemContractCodeChange.into());
         }
         let params = &self.version().gas_params;
         let warm = params.get(GasId::WarmStorageReadCost);
@@ -2403,7 +2403,7 @@ mod tests {
                 let mut gas = Gas::new(available_gas);
                 assert_eq!(
                     evm.set_code_from(&destination, &source, &mut gas),
-                    Err(HostError::Halt(InstrStop::OpcodeNotFound))
+                    Err(HostError::Halt(InstrStop::SystemContractCodeChange))
                 );
                 assert_eq!(gas.spent(), 0);
                 assert!(!evm.state.is_account_warm(&source));
