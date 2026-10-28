@@ -834,12 +834,12 @@ fn payment_approval_honors_balance_top_up_independently_of_fee_and_balance_check
                     if balance_check && initial_balance < escrow {
                         assert_eq!(
                             prefix.unwrap_err(),
-                            HandlerError::InvalidFrameTransaction("VERIFY frame failed"),
+                            HandlerError::InvalidFrameTransaction("EIP-8141 VERIFY frame failed"),
                             "{label}"
                         );
                         assert_eq!(
                             evm.transact(&tx).unwrap_err(),
-                            HandlerError::InvalidFrameTransaction("VERIFY frame failed"),
+                            HandlerError::InvalidFrameTransaction("EIP-8141 VERIFY frame failed"),
                             "{label}"
                         );
                         assert_eq!(
@@ -943,4 +943,18 @@ fn native_frame_prefix_dispatches_for_custom_transaction_envelopes() {
     assert_eq!(inspector.starts, vec![0, 0, 1]);
     assert!(evm.inspector().is_none());
     assert_eq!(evm.state_mut().account(&SENDER).unwrap().nonce(), 0);
+}
+
+#[test]
+fn unsuccessful_prefix_frames_report_the_revm_validation_error() {
+    for body in [&[0x5f, 0x5f, 0xfd][..], &[0xfe][..]] {
+        let mut evm = evm(body, &[]);
+        let tx = recovered(payload(vec![
+            frame(FrameMode::Verify, SENDER),
+            frame(FrameMode::Default, BODY),
+        ]));
+        let error = evm.validate_frame_prefix(&tx, 2).unwrap_err();
+        assert_eq!(error.to_string(), "EIP-8141 validation prefix contains an unsuccessful frame");
+        assert_eq!(evm.state_mut().account(&SENDER).unwrap().nonce(), 0);
+    }
 }

@@ -18,8 +18,9 @@ use alloy_consensus::TxEip8141;
 use alloy_eips::{
     eip4844::{DATA_GAS_PER_BLOB, VERSIONED_HASH_VERSION_KZG},
     eip8141::{
-        ENTRY_POINT, Frame, FrameGasUsed, FrameMode, FrameReceipt, FrameStatus, NONCE_MANAGER,
-        SECP256K1N, SECP256R1N, SignatureScheme, nonce_calldata, nonce_slot, validate_nonce_keys,
+        ENTRY_POINT, Eip8141Error, Frame, FrameGasUsed, FrameMode, FrameReceipt, FrameStatus,
+        NONCE_MANAGER, SECP256K1N, SECP256R1N, SignatureScheme, nonce_calldata, nonce_slot,
+        validate_nonce_keys,
     },
 };
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
@@ -96,8 +97,10 @@ impl FrameGas {
         let gp = &version.gas_params;
         let nonce_data =
             tx.nonce_keys.as_deref().map(|keys| nonce_calldata(keys, tx.nonce)).unwrap_or_default();
-        let sum = |a: u64, b: u64| a.checked_add(b).ok_or(invalid("gas arithmetic overflow"));
-        let mul = |a: u64, b: u64| a.checked_mul(b).ok_or(invalid("gas arithmetic overflow"));
+        let sum =
+            |a: u64, b: u64| a.checked_add(b).ok_or(invalid("EIP-8141 derived gas limit overflow"));
+        let mul =
+            |a: u64, b: u64| a.checked_mul(b).ok_or(invalid("EIP-8141 derived gas limit overflow"));
         let count = tx.nonce_keys.as_deref().map_or(0, |keys| keys.len() as u64);
         let access = mul(
             count,
@@ -214,13 +217,13 @@ pub(crate) fn validate_prefix<T: EvmTypes>(
     prefix_end: usize,
 ) -> HandlerResult<FrameValidationResult> {
     if prefix_end == 0 || prefix_end > payload.frames.len() {
-        return Err(invalid("prefix outside frame bounds"));
+        return Err(invalid("EIP-8141 validation prefix is outside frame bounds"));
     }
     let prepared = prepare_payload(host, payload)?;
     let result = run(host, &prepared, Some(prefix_end))?;
     let frame = result.frame.as_ref().unwrap();
     if frame.receipts.len() != prefix_end {
-        return Err(invalid("validation prefix boundary mismatch"));
+        return Err(invalid("EIP-8141 validation prefix boundary mismatch"));
     }
     Ok(FrameValidationResult {
         payer: frame.payer,
@@ -243,7 +246,7 @@ fn prepare_payload<T: EvmTypes>(
     let placeholders = host.feature(EvmFeatures::FRAME_SIGNATURE_PLACEHOLDERS);
     validate_structure(tx, placeholders)?;
     if tx.nonce_keys.is_some() != host.feature(EvmFeatures::EIP8250) {
-        return Err(invalid("nonce payload does not match activation"));
+        return Err(invalid("frame nonce payload does not match EIP-8250 activation"));
     }
     if let Some(keys) = &tx.nonce_keys {
         validate_nonce_keys(keys).map_err(invalid)?;
@@ -272,14 +275,14 @@ fn prepare_payload<T: EvmTypes>(
     let blob_charge = U256::from(tx.blob_versioned_hashes.len())
         .checked_mul(U256::from(DATA_GAS_PER_BLOB))
         .and_then(|v| v.checked_mul(host.block.blob_basefee))
-        .ok_or(invalid("payment overflow"))?;
+        .ok_or(invalid("overflow payment in transaction"))?;
     let max_gas = U256::from(gas.maximum);
     let base_fee =
         if host.feature(EvmFeatures::BASE_FEE_CHECK) { host.block.basefee } else { U256::ZERO };
     let required_max_fee = max_gas
         .checked_mul(base_fee)
         .and_then(|v| v.checked_add(blob_charge))
-        .ok_or(invalid("payment overflow"))?;
+        .ok_or(invalid("overflow payment in transaction"))?;
     let budget_left = tx.fees.max_fee.checked_sub(required_max_fee).ok_or(
         HandlerError::FrameFeeBudgetTooLow { required: required_max_fee, got: tx.fees.max_fee },
     )?;
@@ -298,7 +301,7 @@ fn prepare_payload<T: EvmTypes>(
             if host.state.storage(&NONCE_MANAGER)?.into_slot(nonce_slot(tx.sender, *key))?.current()
                 != U256::from(if tx.nonce == u64::MAX { 0 } else { tx.nonce })
             {
-                return Err(invalid("nonce sequence mismatch"));
+                return Err(invalid("EIP-8250 nonce sequence mismatch"));
             }
         }
     } else if host.feature(EvmFeatures::NONCE_CHECK) {
@@ -328,7 +331,11 @@ fn validate_signatures(tx: &TxEip8141, hash: B256, placeholders: bool) -> Handle
         let msg = if sig.signs_transaction_hash() {
             hash.0
         } else {
-            sig.explicit_message().ok_or(invalid("invalid signature message"))?.0
+            sig.explicit_message()
+                .ok_or(invalid(
+                    "EIP-8141 explicit signature message must be a non-zero 32-byte digest",
+                ))?
+                .0
         };
         let expected = if sig.signer.is_empty() {
             tx.sender
@@ -340,19 +347,22 @@ fn validate_signatures(tx: &TxEip8141, hash: B256, placeholders: bool) -> Handle
             SignatureScheme::Secp256k1 if sig.signature.len() == 65 && sig.signature[0] <= 1 => {
                 let r = U256::from_be_slice(&sig.signature[1..33]);
                 let s = U256::from_be_slice(&sig.signature[33..]);
-                !r.is_zero()
-                    && r < SECP256K1N
-                    && !s.is_zero()
-                    && s <= (SECP256K1N >> 1)
-                    && precompiles::crypto()
+                if r.is_zero() || r >= SECP256K1N || s.is_zero() || s > (SECP256K1N >> 1) {
+                    false
+                } else {
+                    let recovered = precompiles::crypto()
                         .secp256k1_ecrecover(
                             sig.signature[1..].try_into().unwrap(),
                             sig.signature[0],
                             &msg,
                         )
                         .ok()
-                        .map(|v| Address::from_slice(&v[12..]))
-                        == Some(expected)
+                        .map(|v| Address::from_slice(&v[12..]));
+                    if recovered.is_some_and(|address| address != expected) {
+                        return Err(invalid("EIP-8141 signature signer does not match"));
+                    }
+                    recovered == Some(expected)
+                }
             }
             SignatureScheme::P256 if sig.signature.len() == 128 => {
                 let r = U256::from_be_slice(&sig.signature[..32]);
@@ -371,7 +381,7 @@ fn validate_signatures(tx: &TxEip8141, hash: B256, placeholders: bool) -> Handle
             _ => false,
         };
         if !valid {
-            return Err(invalid("signature validation failed"));
+            return Err(invalid("EIP-8141 signature validation failed"));
         }
     }
     Ok(())
@@ -390,30 +400,37 @@ fn validate_structure(tx: &TxEip8141, placeholders: bool) -> HandlerResult<()> {
     for (index, frame) in tx.frames.iter().enumerate() {
         let previous_atomic = index > 0 && tx.frames[index - 1].is_atomic_batch();
         if frame.has_reserved_flags() {
-            return Err(invalid("reserved EIP-8141 frame flag is set"));
+            return Err(invalid("EIP-8141 reserved frame flag is set"));
         }
-        if frame.is_assertion() && (frame.is_atomic_batch() || previous_atomic) {
-            return Err(invalid("EIP-7906 atomic batch cannot contain an ASSERT frame"));
+        if frame.is_assertion() && frame.is_atomic_batch() {
+            return Err(invalid("EIP-7906 atomic flag is invalid on ASSERT frames"));
+        }
+        if frame.is_assertion() && previous_atomic {
+            return Err(invalid("EIP-7906 atomic batch cannot end on a ASSERT frame"));
         }
         if frame.mode != FrameMode::Sender && !frame.value.is_zero() {
-            return Err(invalid("frame value is only valid in sender mode"));
+            return Err(invalid("only EIP-8141 SENDER frames may transfer value"));
         }
         if frame.flags & 2 != 0 && frame.resolved_target(tx.sender) != tx.sender {
-            return Err(invalid("execution approval target must resolve to the sender"));
+            return Err(invalid("EIP-8141 execution approval target must be the sender"));
+        }
+        if frame.is_atomic_batch() && frame.mode == FrameMode::Verify {
+            return Err(invalid("EIP-8141 atomic flag is invalid on VERIFY frames"));
         }
         if frame.is_atomic_batch()
-            && (frame.mode == FrameMode::Verify
-                || index + 1 == tx.frames.len()
-                || tx.frames[index + 1].mode == FrameMode::Verify)
+            && (index + 1 == tx.frames.len() || tx.frames[index + 1].mode == FrameMode::Verify)
         {
-            return Err(invalid("invalid atomic EIP-8141 frame"));
+            return Err(invalid("EIP-8141 atomic batch must be followed by a non-VERIFY frame"));
         }
         if (frame.is_atomic_batch() || previous_atomic) && frame.flags & 3 != 0 {
-            return Err(invalid("atomic batch frames must not approve payment or execution"));
+            return Err(invalid("EIP-8141 atomic batch frames cannot carry approval scope"));
         }
         if frame.is_expiry_verifier() {
-            if expiry || !frame.has_valid_expiry_verifier_fields() {
-                return Err(invalid("invalid or repeated expiry verifier frame"));
+            if !frame.has_valid_expiry_verifier_fields() {
+                return Err(invalid("malformed EIP-8141 expiry verifier frame"));
+            }
+            if expiry {
+                return Err(invalid("multiple EIP-8141 expiry verifier frames"));
             }
             expiry = true;
         }
@@ -425,7 +442,9 @@ fn validate_structure(tx: &TxEip8141, placeholders: bool) -> HandlerResult<()> {
         if !signature.signs_transaction_hash()
             && signature.explicit_message().is_none_or(|message| message.is_zero())
         {
-            return Err(invalid("explicit signature message must be a non-zero digest"));
+            return Err(invalid(
+                "EIP-8141 explicit signature message must be a non-zero 32-byte digest",
+            ));
         }
         if placeholders
             && signature.scheme != SignatureScheme::Arbitrary
@@ -433,9 +452,17 @@ fn validate_structure(tx: &TxEip8141, placeholders: bool) -> HandlerResult<()> {
         {
             continue;
         }
-        signature
-            .validate_structure_with_sender(tx.sender)
-            .map_err(|_| invalid("invalid frame signature structure"))?;
+        signature.validate_structure_with_sender(tx.sender).map_err(|error| {
+            invalid(match error {
+                Eip8141Error::UnexpectedSigner => {
+                    "EIP-8141 arbitrary signature signer must be empty"
+                }
+                Eip8141Error::P256SignerMismatch { .. } => {
+                    "EIP-8141 signature signer does not match"
+                }
+                _ => "EIP-8141 signature validation failed",
+            })
+        })?;
     }
     Ok(())
 }
@@ -487,7 +514,7 @@ fn run<T: EvmTypes>(
         if frame.mode == FrameMode::Sender
             && !host.frame_tx.as_ref().unwrap().approval.sender_approved
         {
-            return Err(invalid("SENDER before execution approval"));
+            return Err(invalid("EIP-8141 SENDER frame executed before execution approval"));
         }
         if batch.is_none() && frame.is_atomic_batch() {
             batch = Some(checkpoint(host, receipts.len(), true));
@@ -520,7 +547,7 @@ fn run<T: EvmTypes>(
             inspector.frame_end(i, receipts.last().unwrap(), &output, stop, host)
         });
         if frame.mode == FrameMode::Verify && !stop.is_success() {
-            return Err(invalid("VERIFY frame failed"));
+            return Err(invalid("EIP-8141 VERIFY frame failed"));
         }
         outputs.push(output);
         refunds.push(refund);
@@ -564,14 +591,14 @@ fn run<T: EvmTypes>(
             if receipts.len() != prefix_end
                 || receipts.iter().any(|r| r.status != FrameStatus::Success)
             {
-                return Err(invalid("validation prefix boundary mismatch"));
+                return Err(invalid("EIP-8141 validation prefix contains an unsuccessful frame"));
             }
             break;
         }
         i += 1;
     }
     let rt = host.frame_tx.as_ref().unwrap();
-    let payer = rt.approval.payer.ok_or(invalid("missing payer"))?;
+    let payer = rt.approval.payer.ok_or(invalid("EIP-8141 transaction did not approve a payer"))?;
     let precharge = rt.approval.gas_pre_charge;
     for (r, state) in receipts.iter_mut().zip(&rt.state_gas_used) {
         r.gas_used.state = *state;
@@ -620,9 +647,11 @@ fn settle_fees<T: EvmTypes>(
     let base_fee_paid = used
         .checked_mul(prepared.base_fee)
         .and_then(|value| value.checked_add(prepared.blob_charge))
-        .ok_or(invalid("settlement overflow"))?;
-    let available_tip =
-        prepared.max_cost.checked_sub(base_fee_paid).ok_or(invalid("settlement overflow"))?;
+        .ok_or(invalid("overflow payment in transaction"))?;
+    let available_tip = prepared
+        .max_cost
+        .checked_sub(base_fee_paid)
+        .ok_or(invalid("overflow payment in transaction"))?;
     let priority_fee_paid =
         prepared.payload.fees.max_priority_fee_per_gas.saturating_mul(used).min(available_tip);
     let actual = base_fee_paid + priority_fee_paid;

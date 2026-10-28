@@ -66,19 +66,19 @@ fn reserved_zero_signature_message_is_rejected_even_with_placeholders() {
             assert!(matches!(
                 evm.validate_tx(&tx),
                 Err(HandlerError::InvalidFrameTransaction(
-                    "explicit signature message must be a non-zero digest"
+                    "EIP-8141 explicit signature message must be a non-zero 32-byte digest"
                 ))
             ));
             assert!(matches!(
                 evm.validate_frame_prefix(&tx, 1),
                 Err(HandlerError::InvalidFrameTransaction(
-                    "explicit signature message must be a non-zero digest"
+                    "EIP-8141 explicit signature message must be a non-zero 32-byte digest"
                 ))
             ));
             assert!(matches!(
                 evm.transact(&tx),
                 Err(HandlerError::InvalidFrameTransaction(
-                    "explicit signature message must be a non-zero digest"
+                    "EIP-8141 explicit signature message must be a non-zero 32-byte digest"
                 ))
             ));
             assert_eq!(nonce(&mut evm, U256::ZERO), U256::ZERO);
@@ -212,7 +212,7 @@ fn mismatched_lane_invalidates_before_any_key_is_consumed() {
     let tx = recovered(payload(vec![frame(FrameMode::Verify, SENDER, 3)], keys.clone()));
     assert!(matches!(
         evm.transact(&tx),
-        Err(HandlerError::InvalidFrameTransaction("nonce sequence mismatch"))
+        Err(HandlerError::InvalidFrameTransaction("EIP-8250 nonce sequence mismatch"))
     ));
     assert_eq!(nonce(&mut evm, keys[0]), U256::ZERO);
     assert_eq!(nonce(&mut evm, keys[1]), U256::from(9));
@@ -333,7 +333,7 @@ fn overlapping_and_disjoint_domains_advance_independently_between_transactions()
     stale_overlap.nonce = 1;
     assert!(matches!(
         evm.transact(&recovered(stale_overlap)),
-        Err(HandlerError::InvalidFrameTransaction("nonce sequence mismatch"))
+        Err(HandlerError::InvalidFrameTransaction("EIP-8250 nonce sequence mismatch"))
     ));
     for (key, expected) in [(0, 0), (7, 1), (9, 2), (11, 1)] {
         assert_eq!(nonce(&mut evm, U256::from(key)), U256::from(expected));

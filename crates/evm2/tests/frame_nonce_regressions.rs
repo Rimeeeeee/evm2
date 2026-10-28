@@ -82,15 +82,15 @@ const fn first_use_cost(evm: &Evm<'_, BaseEvmTypes>) -> u64 {
 fn assert_nonce_mismatch(evm: &mut Evm<'_, BaseEvmTypes>, tx: &Recovered<TxEnvelope>) {
     assert!(matches!(
         evm.validate_tx(tx),
-        Err(HandlerError::InvalidFrameTransaction("nonce sequence mismatch"))
+        Err(HandlerError::InvalidFrameTransaction("EIP-8250 nonce sequence mismatch"))
     ));
     assert!(matches!(
         evm.validate_frame_prefix(tx, 1),
-        Err(HandlerError::InvalidFrameTransaction("nonce sequence mismatch"))
+        Err(HandlerError::InvalidFrameTransaction("EIP-8250 nonce sequence mismatch"))
     ));
     assert!(matches!(
         evm.transact(tx),
-        Err(HandlerError::InvalidFrameTransaction("nonce sequence mismatch"))
+        Err(HandlerError::InvalidFrameTransaction("EIP-8250 nonce sequence mismatch"))
     ));
 }
 
@@ -226,7 +226,7 @@ fn single_use_first_use_budget_is_checked_before_writing_any_key() {
         let tx = payload(keys.clone(), u64::MAX, vec![insufficient]);
         assert!(matches!(
             evm.transact(&tx),
-            Err(HandlerError::InvalidFrameTransaction("VERIFY frame failed"))
+            Err(HandlerError::InvalidFrameTransaction("EIP-8141 VERIFY frame failed"))
         ));
         for &key in &keys {
             assert_eq!(keyed_nonce(&mut evm, key), U256::ZERO);

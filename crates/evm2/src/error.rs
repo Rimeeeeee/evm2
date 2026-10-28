@@ -124,7 +124,7 @@ pub enum ExecutionError {
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum HostError {
     /// A normal EVM stop, such as out of gas.
-    #[error("{0:?}")]
+    #[error("{0}")]
     Halt(crate::interpreter::InstrStop),
     /// An error that must escape the EVM call stack.
     #[error(transparent)]

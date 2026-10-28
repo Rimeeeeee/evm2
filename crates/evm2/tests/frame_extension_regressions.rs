@@ -432,7 +432,9 @@ fn reverted_nested_approval_cannot_authorize_the_next_sender_frame() {
         } else {
             assert_eq!(
                 evm.transact(&tx(frames)).unwrap_err(),
-                HandlerError::InvalidFrameTransaction("SENDER before execution approval")
+                HandlerError::InvalidFrameTransaction(
+                    "EIP-8141 SENDER frame executed before execution approval"
+                )
             );
             assert_eq!(evm.state_mut().account(&SENDER).unwrap().nonce(), 0);
             assert_eq!(evm.ext().calls.len(), 2);

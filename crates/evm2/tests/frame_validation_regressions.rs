@@ -86,11 +86,11 @@ fn malformed_frame_structure_and_nonce_schemas_are_rejected_without_reads() {
             |tx| tx.frames[0].mode = FrameMode::Assert,
             "EIP-7906 ASSERT frames must form a trailing suffix",
         ),
-        ("reserved flags", |tx| tx.frames[1].flags = 0x80, "reserved EIP-8141 frame flag is set"),
+        ("reserved flags", |tx| tx.frames[1].flags = 0x80, "EIP-8141 reserved frame flag is set"),
         (
             "verify value",
             |tx| tx.frames[0].value = U256::from(1),
-            "frame value is only valid in sender mode",
+            "only EIP-8141 SENDER frames may transfer value",
         ),
         (
             "default value",
@@ -98,22 +98,30 @@ fn malformed_frame_structure_and_nonce_schemas_are_rejected_without_reads() {
                 tx.frames[1].mode = FrameMode::Default;
                 tx.frames[1].value = U256::from(1);
             },
-            "frame value is only valid in sender mode",
+            "only EIP-8141 SENDER frames may transfer value",
         ),
         (
             "approval target",
             |tx| tx.frames[1].flags = 2,
-            "execution approval target must resolve to the sender",
+            "EIP-8141 execution approval target must be the sender",
         ),
-        ("verify atomic", |tx| tx.frames[0].flags |= 4, "invalid atomic EIP-8141 frame"),
-        ("atomic end", |tx| tx.frames[1].flags = 4, "invalid atomic EIP-8141 frame"),
+        (
+            "verify atomic",
+            |tx| tx.frames[0].flags |= 4,
+            "EIP-8141 atomic flag is invalid on VERIFY frames",
+        ),
+        (
+            "atomic end",
+            |tx| tx.frames[1].flags = 4,
+            "EIP-8141 atomic batch must be followed by a non-VERIFY frame",
+        ),
         (
             "atomic before verify",
             |tx| {
                 tx.frames[1].flags = 4;
                 tx.frames.push(frame(FrameMode::Verify, SENDER, 0));
             },
-            "invalid atomic EIP-8141 frame",
+            "EIP-8141 atomic batch must be followed by a non-VERIFY frame",
         ),
         (
             "atomic approval",
@@ -121,7 +129,7 @@ fn malformed_frame_structure_and_nonce_schemas_are_rejected_without_reads() {
                 tx.frames[1].flags = 5;
                 tx.frames.push(frame(FrameMode::Sender, BODY, 0));
             },
-            "atomic batch frames must not approve payment or execution",
+            "EIP-8141 atomic batch frames cannot carry approval scope",
         ),
         (
             "atomic successor approval",
@@ -129,7 +137,7 @@ fn malformed_frame_structure_and_nonce_schemas_are_rejected_without_reads() {
                 tx.frames[1].flags = 4;
                 tx.frames.push(frame(FrameMode::Default, BODY, 1));
             },
-            "atomic batch frames must not approve payment or execution",
+            "EIP-8141 atomic batch frames cannot carry approval scope",
         ),
         (
             "atomic assert successor",
@@ -137,7 +145,7 @@ fn malformed_frame_structure_and_nonce_schemas_are_rejected_without_reads() {
                 tx.frames[1].flags = 4;
                 tx.frames.push(frame(FrameMode::Assert, BODY, 0));
             },
-            "EIP-7906 atomic batch cannot contain an ASSERT frame",
+            "EIP-7906 atomic batch cannot end on a ASSERT frame",
         ),
         (
             "assert atomic",
@@ -145,12 +153,12 @@ fn malformed_frame_structure_and_nonce_schemas_are_rejected_without_reads() {
                 tx.frames[1].mode = FrameMode::Assert;
                 tx.frames[1].flags = 4;
             },
-            "EIP-7906 atomic batch cannot contain an ASSERT frame",
+            "EIP-7906 atomic flag is invalid on ASSERT frames",
         ),
         (
             "expiry fields",
             |tx| tx.frames.push(frame(FrameMode::Verify, EXPIRY_VERIFIER, 0)),
-            "invalid or repeated expiry verifier frame",
+            "malformed EIP-8141 expiry verifier frame",
         ),
         (
             "expiry repeated",
@@ -158,7 +166,7 @@ fn malformed_frame_structure_and_nonce_schemas_are_rejected_without_reads() {
                 let expiry = valid_expiry();
                 tx.frames.extend([expiry.clone(), expiry]);
             },
-            "invalid or repeated expiry verifier frame",
+            "multiple EIP-8141 expiry verifier frames",
         ),
         (
             "expiry approval flags",
@@ -167,7 +175,7 @@ fn malformed_frame_structure_and_nonce_schemas_are_rejected_without_reads() {
                 expiry.flags = 1;
                 tx.frames.push(expiry);
             },
-            "invalid or repeated expiry verifier frame",
+            "malformed EIP-8141 expiry verifier frame",
         ),
         (
             "expiry short data",
@@ -176,7 +184,7 @@ fn malformed_frame_structure_and_nonce_schemas_are_rejected_without_reads() {
                 expiry.data = vec![0; EXPIRY_DATA_LENGTH - 1].into();
                 tx.frames.push(expiry);
             },
-            "invalid or repeated expiry verifier frame",
+            "malformed EIP-8141 expiry verifier frame",
         ),
         (
             "expiry long data",
@@ -185,7 +193,7 @@ fn malformed_frame_structure_and_nonce_schemas_are_rejected_without_reads() {
                 expiry.data = vec![0; EXPIRY_DATA_LENGTH + 1].into();
                 tx.frames.push(expiry);
             },
-            "invalid or repeated expiry verifier frame",
+            "malformed EIP-8141 expiry verifier frame",
         ),
         (
             "expiry state budget",
@@ -194,7 +202,7 @@ fn malformed_frame_structure_and_nonce_schemas_are_rejected_without_reads() {
                 expiry.limits.state = 1;
                 tx.frames.push(expiry);
             },
-            "invalid or repeated expiry verifier frame",
+            "malformed EIP-8141 expiry verifier frame",
         ),
         (
             "assert value",
@@ -202,12 +210,12 @@ fn malformed_frame_structure_and_nonce_schemas_are_rejected_without_reads() {
                 tx.frames[1].mode = FrameMode::Assert;
                 tx.frames[1].value = U256::from(1);
             },
-            "frame value is only valid in sender mode",
+            "only EIP-8141 SENDER frames may transfer value",
         ),
         (
             "keyed schema absent",
             |tx| tx.nonce_keys = None,
-            "nonce payload does not match activation",
+            "frame nonce payload does not match EIP-8250 activation",
         ),
         (
             "17 nonce keys",
@@ -235,14 +243,22 @@ fn malformed_frame_structure_and_nonce_schemas_are_rejected_without_reads() {
     assert_static_error("sequence overflow", tx, HandlerError::NonceOverflow);
     let mut tx = payload();
     tx.frames[1].limits.execution = u64::MAX;
-    assert_static_error("execution sum overflow", tx, invalid("gas arithmetic overflow"));
+    assert_static_error(
+        "execution sum overflow",
+        tx,
+        invalid("EIP-8141 derived gas limit overflow"),
+    );
     let mut tx = payload();
     tx.frames[1].limits.state = u64::MAX;
-    assert_static_error("state sum overflow", tx, invalid("gas arithmetic overflow"));
+    assert_static_error("state sum overflow", tx, invalid("EIP-8141 derived gas limit overflow"));
     let mut tx = payload();
     tx.frames[0].limits.state = 0;
     tx.frames[1].limits.state = u64::MAX - 100_000;
-    assert_static_error("combined reservation overflow", tx, invalid("gas arithmetic overflow"));
+    assert_static_error(
+        "combined reservation overflow",
+        tx,
+        invalid("EIP-8141 derived gas limit overflow"),
+    );
 }
 
 #[test]
@@ -326,10 +342,13 @@ fn every_signature_is_validated_before_account_or_nonce_reads() {
     for (name, signature) in signatures {
         let mut tx = payload();
         tx.signatures = vec![FrameSignature::default(), signature];
-        let reason = if name == "zero explicit message" {
-            "explicit signature message must be a non-zero digest"
-        } else {
-            "invalid frame signature structure"
+        let reason = match name {
+            "zero explicit message" => {
+                "EIP-8141 explicit signature message must be a non-zero 32-byte digest"
+            }
+            "arbitrary signer" => "EIP-8141 arbitrary signature signer must be empty",
+            "p256 public key signer mismatch" => "EIP-8141 signature signer does not match",
+            _ => "EIP-8141 signature validation failed",
         };
         assert_static_error(name, tx, invalid(reason));
     }
@@ -346,7 +365,11 @@ fn every_signature_is_validated_before_account_or_nonce_reads() {
         signature: bytes.into(),
         ..Default::default()
     });
-    assert_static_error("wrong recovered signer", tx, invalid("signature validation failed"));
+    assert_static_error(
+        "wrong recovered signer",
+        tx,
+        invalid("EIP-8141 signature signer does not match"),
+    );
 }
 
 #[test]
@@ -410,12 +433,12 @@ fn resource_fee_and_blob_validation_precedes_database_reads() {
             },
         ),
         (
-            "payment overflow",
+            "overflow payment in transaction",
             |tx, _, block| {
                 tx.fees.max_fee = U256::MAX;
                 block.basefee = U256::MAX;
             },
-            invalid("payment overflow"),
+            invalid("overflow payment in transaction"),
         ),
         (
             "blob charge overflow",
@@ -424,7 +447,7 @@ fn resource_fee_and_blob_validation_precedes_database_reads() {
                 tx.fees.max_fee = U256::MAX;
                 block.blob_basefee = U256::MAX;
             },
-            invalid("payment overflow"),
+            invalid("overflow payment in transaction"),
         ),
     ];
     for (name, prepare, expected) in cases {
@@ -454,7 +477,7 @@ fn competing_errors_follow_static_preparation_order_and_valid_payload_reaches_db
     assert_static_error(
         "structure before nonce keys",
         tx,
-        invalid("reserved EIP-8141 frame flag is set"),
+        invalid("EIP-8141 reserved frame flag is set"),
     );
     let mut tx = payload();
     tx.nonce_keys = Some((1..=17).map(U256::from).collect());
@@ -482,7 +505,7 @@ fn competing_errors_follow_static_preparation_order_and_valid_payload_reaches_db
     assert_static_error(
         "signature shape before chain",
         tx,
-        invalid("invalid frame signature structure"),
+        invalid("EIP-8141 signature validation failed"),
     );
     let (mut evm, reads) = evm(Version::new(SpecId::BOGOTA), BlockEnvExt::default());
     assert!(
@@ -506,7 +529,7 @@ fn activation_and_signature_placeholder_controls_do_not_relax_static_shape() {
     let (mut inactive, reads) = evm(version, BlockEnvExt::default());
     assert_eq!(
         inactive.validate_tx(&recovered(payload())).unwrap_err(),
-        invalid("nonce payload does not match activation")
+        invalid("frame nonce payload does not match EIP-8250 activation")
     );
     assert_eq!(reads.load(Ordering::Relaxed), 0);
     let mut version = Version::new(SpecId::BOGOTA);
@@ -519,7 +542,7 @@ fn activation_and_signature_placeholder_controls_do_not_relax_static_shape() {
     tx.signatures[0].msg = SignatureMessage::Explicit(B256::ZERO);
     assert_eq!(
         evm.validate_tx(&recovered(tx)).unwrap_err(),
-        invalid("explicit signature message must be a non-zero digest")
+        invalid("EIP-8141 explicit signature message must be a non-zero 32-byte digest")
     );
     assert_eq!(reads.load(Ordering::Relaxed), 1);
 }
@@ -595,7 +618,7 @@ fn native_p256_verification_accepts_a_valid_signature_and_rejects_invalid_crypto
     invalid_bytes[..32].fill(0);
     invalid_bytes[31] = 1;
     tx.signatures[1].signature = invalid_bytes.into();
-    assert_static_error("p256 invalid crypto", tx, invalid("signature validation failed"));
+    assert_static_error("p256 invalid crypto", tx, invalid("EIP-8141 signature validation failed"));
 }
 
 #[test]
@@ -615,7 +638,7 @@ fn prefix_bounds_are_checked_before_payload_preparation_or_database_access() {
         let (mut evm, reads) = evm(Version::new(SpecId::BOGOTA), BlockEnvExt::default());
         assert_eq!(
             evm.validate_frame_prefix(&recovered(tx), boundary).unwrap_err(),
-            invalid("prefix outside frame bounds")
+            invalid("EIP-8141 validation prefix is outside frame bounds")
         );
         assert_eq!(reads.load(Ordering::Relaxed), 0);
     }
