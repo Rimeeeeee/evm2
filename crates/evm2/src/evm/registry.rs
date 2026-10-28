@@ -10,7 +10,7 @@
 use crate::{
     AnyError, DatabaseError, EvmTypesHost, ExecutionError, ethereum::eip8141::FrameValidationResult,
 };
-use alloc::{borrow::Cow, format, sync::Arc};
+use alloc::sync::Arc;
 use alloy_consensus::transaction::Recovered;
 use alloy_primitives::{U256, map::HashMap};
 use core::{error::Error, fmt, marker::PhantomData};
@@ -26,13 +26,13 @@ pub enum HandlerError {
     #[error("database error: {0}")]
     Database(#[source] DatabaseError),
     /// Unrecoverable execution error.
-    #[error("{0}")]
+    #[error("fatal error: {0}")]
     Fatal(#[source] AnyError),
     /// Typed error supplied by a custom transaction handler.
     #[error(transparent)]
     External(AnyError),
     /// No handler is registered for the transaction type byte.
-    #[error("{}", unsupported_transaction_type(*.0))]
+    #[error("unsupported transaction type 0x{0:02x}")]
     UnsupportedTransactionType(u8),
     /// A registered handler's extractor did not match the provided envelope.
     #[error("envelope did not contain expected transaction type 0x{expected:02x}")]
@@ -41,7 +41,7 @@ pub enum HandlerError {
         expected: u8,
     },
     /// Sender account does not have the expected nonce.
-    #[error("nonce {got} too {}, expected {expected}", if .got > .expected { "high" } else { "low" })]
+    #[error("invalid nonce: expected {expected}, got {got}")]
     InvalidNonce {
         /// Expected nonce.
         expected: u64,
@@ -49,7 +49,7 @@ pub enum HandlerError {
         got: u64,
     },
     /// Transaction chain ID does not match the active chain.
-    #[error("invalid chain ID")]
+    #[error("invalid chain id: expected {expected}, got {got}")]
     InvalidChainId {
         /// Active chain ID.
         expected: u64,
@@ -57,20 +57,12 @@ pub enum HandlerError {
         got: u64,
     },
     /// Transaction chain ID is required.
-    #[error("missing chain ID")]
+    #[error("missing chain id")]
     MissingChainId,
     /// Transaction gas limit is lower than intrinsic gas.
-    #[error("call gas cost ({required}) exceeds the gas limit ({got})")]
+    #[error("intrinsic gas too low: required {required}, got {got}")]
     IntrinsicGasTooLow {
         /// Required intrinsic gas.
-        required: u64,
-        /// Transaction gas limit.
-        got: u64,
-    },
-    /// Transaction gas limit is lower than the calldata floor gas.
-    #[error("gas floor ({required}) exceeds the gas limit ({got})")]
-    GasFloorTooLow {
-        /// Required calldata floor gas.
         required: u64,
         /// Transaction gas limit.
         got: u64,
@@ -84,13 +76,13 @@ pub enum HandlerError {
         balance: U256,
     },
     /// Sender account has deployed code.
-    #[error("reject transactions from senders with deployed code")]
+    #[error("caller has code")]
     RejectCallerWithCode,
     /// Transaction nonce cannot be incremented.
     #[error("nonce overflow in transaction")]
     NonceOverflow,
     /// Transaction gas limit exceeds the block gas limit.
-    #[error("caller gas limit exceeds the block gas limit")]
+    #[error("transaction gas limit {gas_limit} exceeds block gas limit {block_gas_limit}")]
     GasLimitMoreThanBlock {
         /// Transaction gas limit.
         gas_limit: u64,
@@ -98,7 +90,7 @@ pub enum HandlerError {
         block_gas_limit: U256,
     },
     /// Transaction gas limit exceeds the active per-transaction gas cap.
-    #[error("transaction gas limit ({gas_limit}) is greater than the cap ({cap})")]
+    #[error("transaction gas limit {gas_limit} exceeds cap {cap}")]
     TxGasLimitGreaterThanCap {
         /// Transaction gas limit.
         gas_limit: u64,
@@ -106,7 +98,7 @@ pub enum HandlerError {
         cap: u64,
     },
     /// Create transaction initcode exceeds the active size limit.
-    #[error("create initcode size limit")]
+    #[error("create initcode size limit exceeded: limit {limit}, got {got}")]
     CreateInitCodeSizeLimit {
         /// Maximum initcode size.
         limit: usize,
@@ -114,7 +106,7 @@ pub enum HandlerError {
         got: usize,
     },
     /// Fee cap is lower than the block base fee.
-    #[error("gas price is less than basefee")]
+    #[error("fee cap less than base fee: max_fee_per_gas {max_fee_per_gas}, base_fee {base_fee}")]
     FeeCapLessThanBaseFee {
         /// Maximum fee per gas.
         max_fee_per_gas: U256,
@@ -122,11 +114,11 @@ pub enum HandlerError {
         base_fee: U256,
     },
     /// EIP-7702 authorization list is empty.
-    #[error("empty authorization list")]
+    #[error("EIP-7702 authorization list is empty")]
     EmptyAuthorizationList,
     /// EIP-4844 blob fee cap is lower than the block blob base fee.
     #[error(
-        "blob gas price ({blob_base_fee}) is greater than max fee per blob gas ({max_fee_per_blob_gas})"
+        "blob fee cap less than blob base fee: max_fee_per_blob_gas {max_fee_per_blob_gas}, blob_base_fee {blob_base_fee}"
     )]
     BlobFeeCapLessThanBlobBaseFee {
         /// Maximum fee per blob gas.
@@ -138,7 +130,7 @@ pub enum HandlerError {
     #[error("empty blobs")]
     EmptyBlobs,
     /// EIP-4844 blob transaction contains too many blob hashes.
-    #[error("too many blobs, have {have}, max {max}")]
+    #[error("too many blobs: have {have}, max {max}")]
     TooManyBlobs {
         /// Blob count in the transaction.
         have: usize,
@@ -149,7 +141,7 @@ pub enum HandlerError {
     #[error("blob version not supported")]
     BlobVersionNotSupported,
     /// Priority fee is greater than max fee.
-    #[error("priority fee is greater than max fee")]
+    #[error("priority fee greater than max fee")]
     PriorityFeeGreaterThanMaxFee,
     /// Invalid frame transaction.
     #[error("{0}")]
@@ -491,18 +483,6 @@ impl<T: EvmTypesHost, Output> TxRegistry<T, Output> {
     }
 }
 
-fn unsupported_transaction_type(ty: u8) -> Cow<'static, str> {
-    Cow::Borrowed(match ty {
-        1 => "Eip2930 is not supported",
-        2 => "Eip1559 is not supported",
-        3 => "Eip4844 is not supported",
-        4 => "Eip7702 is not supported",
-        5 => "Eip7873 is not supported",
-        6 => "Eip8141 is not supported",
-        _ => return Cow::Owned(format!("unsupported transaction type 0x{ty:02x}")),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,10 +492,9 @@ mod tests {
         evm::{AccountLoad, SLoad, SStore, SelfDestructResult},
         interpreter::{Host, Message, MessageResult, Word},
     };
-    use alloc::{borrow::Cow, boxed::Box, rc::Rc, string::ToString, vec::Vec};
+    use alloc::{borrow::Cow, rc::Rc, string::ToString, vec::Vec};
     use alloy_primitives::{Address, B256};
     use core::sync::atomic::{AtomicUsize, Ordering};
-    use revm::context_interface::result::InvalidTransaction;
 
     #[derive(Debug, thiserror::Error)]
     #[error("typed handler error")]
@@ -870,97 +849,8 @@ mod tests {
     }
 
     #[test]
-    fn transaction_error_messages_match_revm() {
-        for (native, reference) in [
-            (
-                HandlerError::InvalidNonce { expected: 7, got: 8 },
-                InvalidTransaction::NonceTooHigh { tx: 8, state: 7 },
-            ),
-            (
-                HandlerError::InvalidNonce { expected: 7, got: 6 },
-                InvalidTransaction::NonceTooLow { tx: 6, state: 7 },
-            ),
-            (
-                HandlerError::InvalidChainId { expected: 1, got: 2 },
-                InvalidTransaction::InvalidChainId,
-            ),
-            (HandlerError::MissingChainId, InvalidTransaction::MissingChainId),
-            (
-                HandlerError::IntrinsicGasTooLow { required: 21_000, got: 20_999 },
-                InvalidTransaction::CallGasCostMoreThanGasLimit {
-                    initial_gas: 21_000,
-                    gas_limit: 20_999,
-                },
-            ),
-            (
-                HandlerError::GasFloorTooLow { required: 66_200, got: 60_000 },
-                InvalidTransaction::GasFloorMoreThanGasLimit {
-                    gas_floor: 66_200,
-                    gas_limit: 60_000,
-                },
-            ),
-            (
-                HandlerError::InsufficientFunds { fee: U256::from(10), balance: U256::ONE },
-                InvalidTransaction::LackOfFundForMaxFee {
-                    fee: Box::new(U256::from(10)),
-                    balance: Box::new(U256::ONE),
-                },
-            ),
-            (HandlerError::RejectCallerWithCode, InvalidTransaction::RejectCallerWithCode),
-            (HandlerError::NonceOverflow, InvalidTransaction::NonceOverflowInTransaction),
-            (
-                HandlerError::GasLimitMoreThanBlock {
-                    gas_limit: 31,
-                    block_gas_limit: U256::from(30),
-                },
-                InvalidTransaction::CallerGasLimitMoreThanBlock,
-            ),
-            (
-                HandlerError::TxGasLimitGreaterThanCap { gas_limit: 31, cap: 30 },
-                InvalidTransaction::TxGasLimitGreaterThanCap { gas_limit: 31, cap: 30 },
-            ),
-            (
-                HandlerError::CreateInitCodeSizeLimit { limit: 32, got: 33 },
-                InvalidTransaction::CreateInitCodeSizeLimit,
-            ),
-            (
-                HandlerError::FeeCapLessThanBaseFee {
-                    max_fee_per_gas: U256::ONE,
-                    base_fee: U256::from(2),
-                },
-                InvalidTransaction::GasPriceLessThanBasefee,
-            ),
-            (HandlerError::EmptyAuthorizationList, InvalidTransaction::EmptyAuthorizationList),
-            (
-                HandlerError::BlobFeeCapLessThanBlobBaseFee {
-                    max_fee_per_blob_gas: U256::ONE,
-                    blob_base_fee: U256::from(2),
-                },
-                InvalidTransaction::BlobGasPriceGreaterThanMax {
-                    block_blob_gas_price: 2,
-                    tx_max_fee_per_blob_gas: 1,
-                },
-            ),
-            (HandlerError::EmptyBlobs, InvalidTransaction::EmptyBlobs),
-            (
-                HandlerError::TooManyBlobs { have: 7, max: 6 },
-                InvalidTransaction::TooManyBlobs { have: 7, max: 6 },
-            ),
-            (HandlerError::BlobVersionNotSupported, InvalidTransaction::BlobVersionNotSupported),
-            (
-                HandlerError::PriorityFeeGreaterThanMaxFee,
-                InvalidTransaction::PriorityFeeGreaterThanMaxFee,
-            ),
-            (HandlerError::UnsupportedTransactionType(1), InvalidTransaction::Eip2930NotSupported),
-            (HandlerError::UnsupportedTransactionType(2), InvalidTransaction::Eip1559NotSupported),
-            (HandlerError::UnsupportedTransactionType(3), InvalidTransaction::Eip4844NotSupported),
-            (HandlerError::UnsupportedTransactionType(4), InvalidTransaction::Eip7702NotSupported),
-        ] {
-            assert_eq!(native.to_string(), reference.to_string(), "{native:?}");
-        }
+    fn frame_error_messages_do_not_change_other_handler_errors() {
         for (error, message) in [
-            (HandlerError::UnsupportedTransactionType(6), "Eip8141 is not supported"),
-            (HandlerError::UnsupportedTransactionType(0xff), "unsupported transaction type 0xff"),
             (
                 HandlerError::FrameFeeBudgetTooLow { required: U256::from(2), got: U256::ONE },
                 "EIP-8141 max fee does not cover the required base fees",
@@ -968,6 +858,10 @@ mod tests {
             (
                 HandlerError::InvalidFrameTransaction("EIP-8141 VERIFY frame failed"),
                 "EIP-8141 VERIFY frame failed",
+            ),
+            (
+                HandlerError::Fatal(AnyError::from("JavaScript tracing interrupted")),
+                "fatal error: JavaScript tracing interrupted",
             ),
         ] {
             assert_eq!(error.to_string(), message);

@@ -151,9 +151,7 @@ impl fmt::Display for FuzzError {
 impl From<HandlerError> for FuzzError {
     fn from(error: HandlerError) -> Self {
         match error {
-            HandlerError::IntrinsicGasTooLow { .. } | HandlerError::GasFloorTooLow { .. } => {
-                Self::IntrinsicGasTooLow
-            }
+            HandlerError::IntrinsicGasTooLow { .. } => Self::IntrinsicGasTooLow,
             HandlerError::InsufficientFunds { .. } => Self::InsufficientFunds,
             HandlerError::InvalidNonce { .. } => Self::InvalidNonce,
             HandlerError::NonceOverflow => Self::NonceOverflow,
@@ -349,7 +347,7 @@ mod tests {
                 },
             ),
             (
-                HandlerError::GasFloorTooLow { required: 66_200, got: 60_000 },
+                HandlerError::IntrinsicGasTooLow { required: 66_200, got: 60_000 },
                 InvalidTransaction::GasFloorMoreThanGasLimit {
                     gas_floor: 66_200,
                     gas_limit: 60_000,
