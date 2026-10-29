@@ -14,17 +14,8 @@ pub unsafe extern "C" fn __revmc_builtin_approve(
         return Err(InstrStop::StateChangeDuringStaticCall.into());
     }
     let len = word_to_usize(len.to_u256())?;
-    let output = if len == 0 {
-        0..0
-    } else {
-        let offset = word_to_usize(offset.to_u256())?;
-        let end = offset.checked_add(len).ok_or(InstrStop::MemoryOOG)?;
-        if end > u32::MAX as usize {
-            return Err(InstrStop::MemoryLimitOOG.into());
-        }
-        ensure_memory(ecx, offset, len)?;
-        offset as u32..end as u32
-    };
+    let offset = if len == 0 { 0 } else { word_to_usize(offset.to_u256())? };
+    let output = output_memory_range(ecx, offset, len)?;
     let address = ecx.message().destination;
     let left = ecx.gas.reservoir();
     let charge = ecx

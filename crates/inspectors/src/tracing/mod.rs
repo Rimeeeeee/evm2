@@ -11,7 +11,7 @@ use crate::{
         utils::gas_used,
     },
 };
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use alloy_consensus::{Transaction, TxEip8141, transaction::Recovered};
 use alloy_eips::eip8141::{ENTRY_POINT, Frame, FrameMode, FrameReceipt, FrameStatus};
 use alloy_primitives::{Address, B256, Bytes, Log, TxKind, U256};
@@ -19,6 +19,7 @@ use alloy_rpc_types_trace::parity::StorageDelta;
 use core::{mem, ops::Range};
 use evm2::{
     Evm, EvmFeatures, EvmTypes, Inspector, SpecId, TxResultExt,
+    ethereum::eip8141::FrameGas,
     evm::JournalEntry,
     interpreter::{
         InstrStop, Interpreter, Message, MessageKind, MessageResult, MessageResultExt,
@@ -124,7 +125,7 @@ pub struct TracingInspector {
 
 #[derive(Clone, Debug)]
 struct FrameTracing {
-    payload: TxEip8141,
+    payload: Arc<TxEip8141>,
     active: usize,
     nodes: Vec<Option<usize>>,
     log_start: usize,
@@ -758,9 +759,14 @@ impl TracingInspector {
 }
 
 impl<T: EvmTypes> Inspector<T> for TracingInspector {
-    fn frame_transaction_start(&mut self, tx: &TxEip8141, host: &mut T::Host<'_>) {
+    fn frame_transaction_start(
+        &mut self,
+        tx: &Arc<TxEip8141>,
+        gas: &FrameGas,
+        host: &mut T::Host<'_>,
+    ) {
         self.frame_transaction = Some(FrameTracing {
-            payload: tx.clone(),
+            payload: Arc::clone(tx),
             active: 0,
             nodes: alloc::vec![None; tx.frames.len()],
             log_start: self.log_count,
@@ -771,9 +777,7 @@ impl<T: EvmTypes> Inspector<T> for TracingInspector {
             frame_transaction_root: true,
             address: ENTRY_POINT,
             caller: tx.sender,
-            gas_limit: evm2::ethereum::eip8141::FrameGas::calculate(tx, host.version())
-                .expect("prepared frame gas")
-                .maximum,
+            gas_limit: gas.maximum,
             ..Default::default()
         };
     }

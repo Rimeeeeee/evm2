@@ -2,7 +2,7 @@ use crate::tracing::{
     FourByteInspector, MuxInspector, TracingInspector, TracingInspectorConfig, TransactionContext,
     final_refunded,
 };
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
 use alloy_consensus::{Transaction, transaction::Recovered};
 use alloy_primitives::{Address, Log, U256};
 use alloy_rpc_types_eth::TransactionInfo;
@@ -14,6 +14,7 @@ use alloy_rpc_types_trace::geth::{
 use evm2::{
     DatabaseError, EvmTypes, EvmTypesHost, Inspector, NoopInspector, TxResultWithState,
     env::BlockEnv,
+    ethereum::eip8141::FrameGas,
     evm::DynDatabase,
     interpreter::{Interpreter, Message, MessageResult},
 };
@@ -362,8 +363,13 @@ macro_rules! delegate {
 }
 
 impl<T: EvmTypes> Inspector<T> for DebugInspector {
-    fn frame_transaction_start(&mut self, tx: &alloy_consensus::TxEip8141, host: &mut T::Host<'_>) {
-        delegate!(self => inspector.frame_transaction_start(tx, host))
+    fn frame_transaction_start(
+        &mut self,
+        tx: &Arc<alloy_consensus::TxEip8141>,
+        gas: &FrameGas,
+        host: &mut T::Host<'_>,
+    ) {
+        delegate!(self => inspector.frame_transaction_start(tx, gas, host))
     }
 
     fn frame_start(

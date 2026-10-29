@@ -36,6 +36,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use evm2::{
     Evm, EvmTypes, EvmTypesHost, ExecutionError, Inspector, TxResultWithState,
     env::BlockEnv,
+    ethereum::eip8141::FrameGas,
     evm::DynDatabase,
     interpreter::{InstrStop, Interpreter, Message, MessageKind, MessageResult, opcode::op},
 };
@@ -75,8 +76,8 @@ struct PendingStep {
 
 #[derive(Debug)]
 struct FrameTransactionContext {
-    payload: TxEip8141,
-    gas: evm2::ethereum::eip8141::FrameGas,
+    payload: Arc<TxEip8141>,
+    gas: FrameGas,
     active: usize,
     observed: bool,
 }
@@ -723,14 +724,21 @@ impl JsInspector {
 }
 
 impl<T: EvmTypes> Inspector<T> for JsInspector {
-    fn frame_transaction_start(&mut self, tx: &TxEip8141, host: &mut T::Host<'_>) {
+    fn frame_transaction_start(
+        &mut self,
+        tx: &Arc<TxEip8141>,
+        gas: &FrameGas,
+        host: &mut T::Host<'_>,
+    ) {
         self.call_stack.clear();
         self.pending_steps.clear();
         self.register_precompiles(host);
-        let gas = evm2::ethereum::eip8141::FrameGas::calculate(tx, host.version())
-            .expect("prepared frame gas");
-        self.frame_transaction =
-            Some(FrameTransactionContext { payload: tx.clone(), gas, active: 0, observed: false });
+        self.frame_transaction = Some(FrameTransactionContext {
+            payload: Arc::clone(tx),
+            gas: *gas,
+            active: 0,
+            observed: false,
+        });
         self.push_call(
             Contract {
                 caller: tx.sender,
@@ -2170,6 +2178,36 @@ mod tests {
             let native = error.as_native().unwrap();
             assert_eq!(format!("{}: {}", native.kind(), native.message()), expected);
         }
+    }
+
+    #[test]
+    fn frame_start_shares_prepared_payload_and_gas() {
+        let tx = Arc::new(TxEip8141::default());
+        let mut evm = Evm::<BaseEvmTypes>::new(
+            SpecId::BOGOTA,
+            evm2::env::BlockEnvExt::default(),
+            ethereum_tx_registry(SpecId::BOGOTA),
+            CacheDB::new(EmptyDB::default()),
+            Precompiles::base(SpecId::BOGOTA),
+        );
+        let mut gas = FrameGas::calculate(&tx, evm.version()).unwrap();
+        gas.maximum += 1;
+        let mut inspector = JsInspector::new(
+            "{ fault: function() {}, result: function() {} }".into(),
+            serde_json::Value::Null,
+        )
+        .unwrap();
+        <JsInspector as Inspector<BaseEvmTypes>>::frame_transaction_start(
+            &mut inspector,
+            &tx,
+            &gas,
+            &mut evm,
+        );
+        let retained = inspector.frame_transaction.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&retained.payload, &tx));
+        assert_eq!(retained.gas, gas);
+        inspector.fuse().unwrap();
+        assert_eq!(Arc::strong_count(&tx), 1);
     }
 
     #[test]

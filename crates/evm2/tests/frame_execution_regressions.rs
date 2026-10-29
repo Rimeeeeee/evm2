@@ -13,7 +13,7 @@ use evm2::{
     constants::EIP7708_TRANSFER_TOPIC,
     env::BlockEnvExt,
     ethereum::{eip8141::FrameGas, ethereum_tx_registry},
-    evm::{AccountInfo, SYSTEM_ADDRESS},
+    evm::SYSTEM_ADDRESS,
     version::GasId,
 };
 use std::collections::BTreeMap;
@@ -102,12 +102,11 @@ fn prestate(case: &Case) -> BTreeMap<Address, Account> {
 }
 
 fn native(case: &Case) -> Result<Outcome, String> {
-    let mut db = common::database([
+    let mut db = common::database_with_nonce_manager([
         (SENDER, case.sender_code.as_ref()),
         (BODY, case.body.as_ref()),
         (OTHER, case.other.as_ref()),
     ]);
-    db.insert_account_info(&NONCE_MANAGER, AccountInfo::default().with_nonce(1));
     for &(address, key, value) in &case.storage {
         db.insert_account_storage(&address, &key, &value);
     }

@@ -4,7 +4,7 @@ mod common;
 
 use alloy_consensus::{TxLegacy, transaction::Recovered};
 use alloy_eips::{
-    eip8141::{Frame, FrameLimits, FrameMode, FrameStatus, NONCE_MANAGER},
+    eip8141::{Frame, FrameLimits, FrameMode, FrameStatus},
     eip8272::{RECENT_ROOT_ADDRESS, RECENT_ROOT_CODE},
 };
 use alloy_primitives::{Address, Bytes, KECCAK256_EMPTY, TxKind, U256, keccak256};
@@ -35,13 +35,12 @@ fn frame(mode: FrameMode, target: Address) -> Frame {
 }
 
 fn evm(body: &[u8], other: &[u8], assertion: &[u8]) -> Evm<'static, BaseEvmTypes> {
-    let mut db = common::database([
+    let mut db = common::database_with_nonce_manager([
         (SENDER, APPROVE_BOTH),
         (BODY, body),
         (OTHER, other),
         (ASSERTION, assertion),
     ]);
-    db.insert_account_info(&NONCE_MANAGER, AccountInfo::default().with_nonce(1));
     db.insert_account_info(&RECEIVER, AccountInfo::default().with_balance(U256::from(100)));
     db.insert_account_info(&WRITER, AccountInfo::default().with_balance(U256::from(BALANCE)));
     common::evm(db)

@@ -2,10 +2,11 @@
 
 use crate::{
     EvmTypesHost,
+    ethereum::eip8141::FrameGas,
     evm::NonStaticAny,
     interpreter::{Interpreter, Message, MessageResult},
 };
-use alloc::boxed::Box;
+use alloc::{boxed::Box, sync::Arc};
 use alloy_consensus::TxEip8141;
 use alloy_eips::eip8141::{Frame, FrameReceipt};
 use alloy_primitives::{Address, Log, U256};
@@ -110,9 +111,14 @@ pub trait Inspector<T: EvmTypesHost>: NonStaticAny {
         let _ = host;
     }
 
-    /// Starts a frame transaction, before any frame entry access.
-    fn frame_transaction_start(&mut self, tx: &TxEip8141, host: &mut T::Host<'_>) {
-        let _ = (tx, host);
+    /// Starts a frame transaction with its shared payload and prepared gas before frame entry.
+    fn frame_transaction_start(
+        &mut self,
+        tx: &Arc<TxEip8141>,
+        gas: &FrameGas,
+        host: &mut T::Host<'_>,
+    ) {
+        let _ = (tx, gas, host);
     }
 
     /// Starts an ordered top-level frame, including entries that fail before dispatch.

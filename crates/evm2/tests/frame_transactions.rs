@@ -25,7 +25,10 @@ use evm2::{
         TxEnvelope,
         eip8141::{FrameGas, FrameHandler},
     },
-    evm::{AccountInfo, Bal, BalError, BlockAccessIndex, Db, InMemoryDB},
+    evm::{
+        AccountInfo, Bal, BalError, BlockAccessIndex, Db, InMemoryDB,
+        handler::DefaultTxHandlerHooks,
+    },
     interpreter::{GasTracker, InstrStop},
     registry::{HandlerError, TxRegistry},
     version::GasId,
@@ -39,8 +42,11 @@ use std::sync::{
 const ASSERTION: Address = Address::with_last_byte(0xc0);
 
 fn evm(body: &[u8], assertion: &[u8]) -> Evm<'static, BaseEvmTypes> {
-    let mut db = common::database([(SENDER, APPROVE_BOTH), (BODY, body), (ASSERTION, assertion)]);
-    db.insert_account_info(&NONCE_MANAGER, AccountInfo::default().with_nonce(1));
+    let db = common::database_with_nonce_manager([
+        (SENDER, APPROVE_BOTH),
+        (BODY, body),
+        (ASSERTION, assertion),
+    ]);
     common::evm(db)
 }
 
@@ -912,7 +918,7 @@ fn native_frame_prefix_dispatches_for_custom_transaction_envelopes() {
     let registry = TxRegistry::<FrameTypes, _>::new().with_handler(
         6,
         |tx: &FrameEnvelope| Some(&tx.0),
-        FrameHandler,
+        FrameHandler::<DefaultTxHandlerHooks>::new(),
     );
     let mut evm = Evm::new(
         SpecId::BOGOTA,
@@ -956,5 +962,199 @@ fn unsuccessful_prefix_frames_report_the_revm_validation_error() {
         let error = evm.validate_frame_prefix(&tx, 2).unwrap_err();
         assert_eq!(error.to_string(), "EIP-8141 validation prefix contains an unsuccessful frame");
         assert_eq!(evm.state_mut().account(&SENDER).unwrap().nonce(), 0);
+    }
+}
+
+mod handler_hooks {
+    use super::*;
+    use evm2::{
+        ExecutionConfig, TxResult, ethereum::eip8141::PreparedFrameTx,
+        evm::handler::TxHandlerHooks, registry::HandlerResult,
+    };
+    use std::cell::RefCell;
+
+    thread_local! {
+        static CALLS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+    }
+
+    struct Hooks<const FAIL: u8>;
+
+    impl<const FAIL: u8> TxHandlerHooks<BaseEvmTypes> for Hooks<FAIL> {
+        fn before_frame_execution(
+            host: &mut Evm<'_, BaseEvmTypes>,
+            _envelope: &TxEnvelope,
+            _prepared: &PreparedFrameTx,
+        ) -> HandlerResult<()> {
+            CALLS.with_borrow_mut(|calls| calls.push("prepare"));
+            let sender = host.state_mut().account(&SENDER)?;
+            assert_eq!(sender.nonce(), 0);
+            assert_eq!(sender.balance(), U256::from(1_000_000_000));
+            if FAIL == 1 {
+                return Err(HandlerError::InvalidFrameTransaction("preparation hook failed"));
+            }
+            Ok(())
+        }
+
+        fn settle_frame_transaction(
+            host: &mut Evm<'_, BaseEvmTypes>,
+            envelope: &TxEnvelope,
+            prepared: &PreparedFrameTx,
+            result: TxResult,
+        ) -> HandlerResult<TxResult> {
+            CALLS.with_borrow_mut(|calls| calls.push("settle"));
+            assert_eq!(host.state_mut().account(&SENDER)?.nonce(), 1);
+            if FAIL == 2 {
+                return Err(HandlerError::InvalidFrameTransaction("settlement hook failed"));
+            }
+            DefaultTxHandlerHooks::settle_frame_transaction(host, envelope, prepared, result)
+        }
+    }
+
+    fn evm<const FAIL: u8>() -> Evm<'static, BaseEvmTypes> {
+        let mut evm = super::evm(&[], &[]);
+        let registry = TxRegistry::new().with_handler(
+            6,
+            TxEnvelope::as_eip8141,
+            FrameHandler::<Hooks<FAIL>>::new(),
+        );
+        evm.set_execution_config(
+            ExecutionConfig::for_spec_and_version(SpecId::BOGOTA, *evm.version()),
+            SpecId::BOGOTA,
+            registry,
+            Precompiles::base(SpecId::BOGOTA),
+        );
+        evm.set_block(BlockEnvExt { basefee: U256::ONE, ..Default::default() });
+        evm
+    }
+
+    fn transaction() -> Recovered<TxEnvelope> {
+        let mut tx =
+            payload(vec![frame(FrameMode::Verify, SENDER), frame(FrameMode::Sender, BODY)]);
+        tx.fees.max_fee = U256::from(10_000_000);
+        tx.fees.max_priority_fee_per_gas = U256::from(2);
+        recovered(tx)
+    }
+
+    #[test]
+    fn validation_and_prefix_share_preparation_without_settlement() {
+        let mut evm = evm::<0>();
+        let tx = transaction();
+        CALLS.with_borrow_mut(Vec::clear);
+        evm.validate_tx(&tx).unwrap();
+        assert_eq!(CALLS.with_borrow(Clone::clone), ["prepare"]);
+        assert_eq!(evm.validate_frame_prefix(&tx, 1).unwrap().payer, SENDER);
+        assert_eq!(CALLS.with_borrow(Clone::clone), ["prepare", "prepare"]);
+        assert_eq!(evm.state_mut().account(&SENDER).unwrap().nonce(), 0);
+        assert_eq!(evm.state_mut().account(&SENDER).unwrap().balance(), U256::from(1_000_000_000));
+
+        let result = evm.transact(&tx).unwrap().commit();
+        assert_eq!(CALLS.with_borrow(Clone::clone), ["prepare", "prepare", "prepare", "settle"]);
+        let mut standard = super::evm(&[], &[]);
+        standard.set_block(BlockEnvExt { basefee: U256::ONE, ..Default::default() });
+        let expected = standard.transact(&tx).unwrap().commit();
+        assert_eq!(result.tx_gas_used(), expected.tx_gas_used());
+        assert_eq!(result.frame, expected.frame);
+        assert_eq!(evm.state_mut().account(&SENDER).unwrap().nonce(), 1);
+        assert_eq!(
+            evm.state_mut().account(&SENDER).unwrap().balance(),
+            standard.state_mut().account(&SENDER).unwrap().balance(),
+        );
+    }
+
+    #[rstest::rstest]
+    #[case(1, "preparation hook failed", vec!["prepare"])]
+    #[case(2, "settlement hook failed", vec!["prepare", "settle"])]
+    fn hook_errors_discard_approval_and_fees(
+        #[case] stage: u8,
+        #[case] message: &'static str,
+        #[case] calls: Vec<&'static str>,
+    ) {
+        let mut evm = if stage == 1 { evm::<1>() } else { evm::<2>() };
+        let tx = transaction();
+        CALLS.with_borrow_mut(Vec::clear);
+        assert_eq!(evm.transact(&tx).unwrap_err(), HandlerError::InvalidFrameTransaction(message));
+        assert_eq!(CALLS.with_borrow(Clone::clone), calls);
+        assert_eq!(evm.state_mut().account(&SENDER).unwrap().nonce(), 0);
+        assert_eq!(evm.state_mut().account(&SENDER).unwrap().balance(), U256::from(1_000_000_000));
+    }
+}
+
+#[test]
+fn gas_reservations_accept_the_u64_boundary_and_reject_one_more() {
+    let mut version = Version::new(SpecId::BOGOTA);
+    version.gas_params.set(GasId::TxTokenCost, 0);
+    version.gas_params.set(GasId::TxFloorCostPerToken, 0);
+    for execution in [0, 7, u64::MAX - 12_475] {
+        let mut tx = payload(vec![frame(FrameMode::Verify, SENDER)]);
+        tx.frames[0].limits.execution = execution;
+        tx.frames[0].limits.state = u64::MAX - 12_475 - execution;
+        let gas = FrameGas::calculate(&tx, &version).unwrap();
+        assert_eq!(gas.intrinsic, 12_475);
+        assert_eq!(gas.execution, 12_475 + execution);
+        assert_eq!(gas.maximum, u64::MAX);
+        for state in [false, true] {
+            let mut overflow = tx.clone();
+            if state {
+                overflow.frames[0].limits.state += 1;
+            } else {
+                overflow.frames[0].limits.execution += 1;
+            }
+            assert_eq!(
+                FrameGas::calculate(&overflow, &version),
+                Err(HandlerError::InvalidFrameTransaction("EIP-8141 derived gas limit overflow")),
+            );
+        }
+    }
+}
+
+#[test]
+fn saturated_frame_budget_sums_are_rejected_even_with_zero_data_prices() {
+    let mut version = Version::new(SpecId::BOGOTA);
+    version.gas_params.set(GasId::TxTokenCost, 0);
+    version.gas_params.set(GasId::TxFloorCostPerToken, 0);
+    for state in [false, true] {
+        let mut tx = payload(vec![frame(FrameMode::Verify, SENDER); 2]);
+        for (frame, limit) in tx.frames.iter_mut().zip([u64::MAX, 1]) {
+            frame.limits = Default::default();
+            if state {
+                frame.limits.state = limit;
+            } else {
+                frame.limits.execution = limit;
+            }
+        }
+        assert_eq!(
+            FrameGas::calculate(&tx, &version),
+            Err(HandlerError::InvalidFrameTransaction("EIP-8141 derived gas limit overflow")),
+        );
+    }
+}
+
+#[test]
+fn custom_data_weights_price_zero_bytes_and_reject_cost_overflow() {
+    let mut version = Version::new(SpecId::BOGOTA);
+    version.gas_params.set(GasId::TxTokenCost, 3);
+    version.gas_params.set(GasId::TxFloorCostPerToken, 11);
+    version.gas_params.set(GasId::TxTokenNonZeroByteMultiplier, 7);
+    version.gas_params.set(GasId::TxFloorZeroByteMultiplier, 5);
+    let mut tx = payload(vec![frame(FrameMode::Verify, SENDER)]);
+    tx.frames[0].data = vec![0, 1, 2, 0].into();
+    tx.frames[0].limits = Default::default();
+    let gas = FrameGas::calculate(&tx, &version).unwrap();
+    // The two nonce bytes and frame data contain four nonzero bytes and two zero bytes.
+    assert_eq!(gas.intrinsic, 12_565);
+    assert_eq!(gas.floor, 12_893);
+    assert_eq!(gas.maximum, 12_893);
+    for multiplier in [GasId::TxTokenNonZeroByteMultiplier, GasId::TxFloorZeroByteMultiplier] {
+        let mut overflow = version;
+        overflow.gas_params.set(multiplier, u32::MAX);
+        overflow.gas_params.set(GasId::TxTokenCost, u32::MAX);
+        overflow.gas_params.set(GasId::TxFloorCostPerToken, u32::MAX);
+        assert_eq!(
+            FrameGas::calculate(&tx, &overflow),
+            Err(HandlerError::InvalidFrameTransaction("EIP-8141 derived gas limit overflow")),
+        );
+        overflow.gas_params.set(GasId::TxTokenCost, 0);
+        overflow.gas_params.set(GasId::TxFloorCostPerToken, 0);
+        assert_eq!(FrameGas::calculate(&tx, &overflow).unwrap().maximum, 12_475);
     }
 }

@@ -2,7 +2,7 @@
 
 use alloy_consensus::{TxEip8141, transaction::Recovered};
 use alloy_eips::{
-    eip8141::{Frame, FrameLimits, FrameMode},
+    eip8141::{Frame, FrameLimits, FrameMode, NONCE_MANAGER},
     eip8272::{
         RECENT_ROOT_ADDRESS, RECENT_ROOT_CODE, RECENT_ROOT_ENTRY_DOMAIN, RECENT_ROOT_STORAGE_DOMAIN,
     },
@@ -15,6 +15,7 @@ use evm2::{
     ethereum::{TxEnvelope, ethereum_tx_registry},
     evm::{AccountInfo, Database, InMemoryDB},
     interpreter::{InstrStop, Interpreter},
+    registry::HandlerError,
 };
 use std::sync::{
     Arc,
@@ -60,6 +61,15 @@ pub(crate) fn database<'a>(accounts: impl IntoIterator<Item = (Address, &'a [u8]
     for (address, code) in accounts {
         db.insert_account_info(&address, account(code));
     }
+    db
+}
+
+/// Builds funded test accounts with the nonce manager already present.
+pub(crate) fn database_with_nonce_manager<'a>(
+    accounts: impl IntoIterator<Item = (Address, &'a [u8])>,
+) -> InMemoryDB {
+    let mut db = database(accounts);
+    db.insert_account_info(&NONCE_MANAGER, AccountInfo::default().with_nonce(1));
     db
 }
 
@@ -166,4 +176,15 @@ impl Database for FailingDatabase {
     fn get_block_hash(&mut self, _: &U256) -> Result<B256, Self::Error> {
         self.fail()
     }
+}
+
+/// Checks that preparation, prefix validation, and execution report the same rejection.
+pub(crate) fn assert_validation_error(
+    evm: &mut Evm<'_, BaseEvmTypes>,
+    tx: &Recovered<TxEnvelope>,
+    expected: HandlerError,
+) {
+    assert_eq!(evm.validate_tx(tx).unwrap_err(), expected, "preparation");
+    assert_eq!(evm.validate_frame_prefix(tx, 1).unwrap_err(), expected, "prefix");
+    assert_eq!(evm.transact(tx).unwrap_err(), expected, "execution");
 }

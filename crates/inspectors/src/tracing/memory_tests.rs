@@ -203,3 +203,22 @@ mod js {
         }
     }
 }
+
+#[test]
+fn frame_start_shares_prepared_payload_and_gas() {
+    let tx = Arc::new(TxEip8141::default());
+    let mut evm = evm();
+    let mut gas = FrameGas::calculate(&tx, evm.version()).unwrap();
+    gas.maximum += 1;
+    let mut inspector = TracingInspector::new(TracingInspectorConfig::none());
+    <TracingInspector as Inspector<BaseEvmTypes>>::frame_transaction_start(
+        &mut inspector,
+        &tx,
+        &gas,
+        &mut evm,
+    );
+    assert!(Arc::ptr_eq(&inspector.frame_transaction.as_ref().unwrap().payload, &tx));
+    assert_eq!(inspector.traces.nodes()[0].trace.gas_limit, gas.maximum);
+    inspector.fuse();
+    assert_eq!(Arc::strong_count(&tx), 1);
+}

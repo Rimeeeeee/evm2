@@ -5,7 +5,11 @@ use crate::{
     Evm, EvmFeatures, EvmTypes, HostError, TxResult, TxResultExt, Version,
     bytecode::Bytecode,
     env::{TxEnv, TxEnvExt},
-    evm::{FrameTransactionResult, StateCheckpoint, frame::FrameTransactionRuntime},
+    evm::{
+        FrameTransactionResult, StateCheckpoint,
+        frame::FrameTransactionRuntime,
+        handler::{DefaultTxHandlerHooks, TxHandlerHooks},
+    },
     interpreter::{
         GasTracker, Host, InstrStop, Message, MessageExt, MessageKind, MessageResultExt,
     },
@@ -18,12 +22,14 @@ use alloy_consensus::TxEip8141;
 use alloy_eips::{
     eip4844::{DATA_GAS_PER_BLOB, VERSIONED_HASH_VERSION_KZG},
     eip8141::{
-        ENTRY_POINT, Eip8141Error, Frame, FrameGasUsed, FrameMode, FrameReceipt, FrameStatus,
-        NONCE_MANAGER, SECP256K1N, SECP256R1N, SignatureScheme, nonce_calldata, nonce_slot,
-        validate_nonce_keys,
+        ENTRY_POINT, Eip8141Error, FRAME_TX_INTRINSIC_COST, FRAME_TX_PER_FRAME_COST, Frame,
+        FrameGasUsed, FrameMode, FrameReceipt, FrameStatus, MAX_FRAMES, NONCE_MANAGER,
+        SignatureScheme, nonce_calldata, nonce_slot, validate_nonce_keys,
     },
 };
-use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
+use alloy_primitives::{Address, B256, Bytes, U256};
+use core::marker::PhantomData;
+use derive_where::derive_where;
 
 /// Gas reservations for a frame transaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +93,7 @@ struct Batch {
     warmth: Option<Vec<(Address, Vec<U256>)>>,
 }
 
+/// Wraps a validation reason as a frame transaction error.
 const fn invalid(reason: &'static str) -> HandlerError {
     HandlerError::InvalidFrameTransaction(reason)
 }
@@ -109,16 +116,16 @@ impl FrameGas {
                 gp.get(GasId::SstoreSetWithoutLoadCost),
             )?,
         )?;
-        let signatures =
-            tx.signatures.iter().try_fold(0, |s, sig| sum(s, sig.verification_gas()))?;
-        let value = tx
-            .frames
-            .iter()
-            .filter(|f| !f.value.is_zero() && f.target_address().is_some_and(|a| a != tx.sender))
-            .try_fold(0, |s, _| sum(s, 6_000))?;
+        let signatures = tx.signature_verification_gas();
         let base = sum(
-            sum(sum(12_000, mul(tx.frames.len() as u64, 475)?)?, signatures)?,
-            sum(value, access)?,
+            sum(
+                sum(
+                    FRAME_TX_INTRINSIC_COST,
+                    mul(tx.frames.len() as u64, FRAME_TX_PER_FRAME_COST)?,
+                )?,
+                signatures,
+            )?,
+            sum(tx.value_transfer_gas(), access)?,
         )?;
         let mut fields = core::iter::once(nonce_data.as_slice())
             .chain(tx.frames.iter().map(|frame| frame.data.as_ref()))
@@ -129,17 +136,11 @@ impl FrameGas {
                     if sig.signs_transaction_hash() { &[] } else { sig.signature.as_ref() },
                 ]
             }));
-        let (tokens, floor_tokens) = fields.try_fold((0, 0), |total, bytes| {
-            bytes.iter().try_fold(total, |(tokens, floor), byte| {
-                let nonzero = gp.get(GasId::TxTokenNonZeroByteMultiplier);
-                Ok::<_, HandlerError>((
-                    sum(tokens, if *byte == 0 { 1 } else { nonzero })?,
-                    sum(
-                        floor,
-                        if *byte == 0 { gp.get(GasId::TxFloorZeroByteMultiplier) } else { nonzero },
-                    )?,
-                ))
-            })
+        let (tokens, floor_tokens) = fields.try_fold((0, 0), |(tokens, floor), bytes| {
+            let (data_tokens, floor_tokens) = gp
+                .checked_tx_calldata_tokens(bytes)
+                .ok_or(invalid("EIP-8141 derived gas limit overflow"))?;
+            Ok::<_, HandlerError>((sum(tokens, data_tokens)?, sum(floor, floor_tokens)?))
         })?;
         // The signing hash commits to an empty-message witness's length, so its intrinsic
         // price must depend on that length alone, including when its bytes are all zero.
@@ -157,89 +158,32 @@ impl FrameGas {
         let floor_tokens = sum(floor_tokens, elided_tokens)?;
         let intrinsic = sum(base, mul(tokens, gp.get(GasId::TxTokenCost))?)?;
         let floor = sum(base, mul(floor_tokens, gp.get(GasId::TxFloorCostPerToken))?)?;
-        let execution =
-            sum(intrinsic, tx.frames.iter().try_fold(0, |s, f| sum(s, f.limits.execution))?)?
-                .max(floor);
-        let state = tx.frames.iter().try_fold(0, |s, f| sum(s, f.limits.state))?;
+        // Positive intrinsic gas makes checked totals reject saturation in the shared frame sums.
+        let execution = sum(intrinsic, tx.total_frame_execution_gas_limit())?.max(floor);
+        let state = tx.total_frame_state_gas_limit();
         Ok(Self { intrinsic, floor, execution, state, maximum: sum(execution, state)?, signatures })
     }
 }
 
 /// Executes an EIP-8141 transaction using Ethereum rules.
-pub fn handle<T: EvmTypes>(mut req: TxRequest<'_, '_, T, TxEip8141>) -> HandlerResult<TxResult<T>> {
-    let prepared = prepare(&mut req)?;
-    execute_prepared(req, prepared)
+pub fn handle<T: EvmTypes>(req: TxRequest<'_, '_, T, TxEip8141>) -> HandlerResult<TxResult<T>> {
+    handle_with_hooks::<T, DefaultTxHandlerHooks>(req)
 }
 
-/// Performs shared preparation without executing a frame or consuming a nonce.
-pub fn prepare<T: EvmTypes>(
+/// Executes an EIP-8141 transaction using Ethereum rules and custom handler hooks.
+pub fn handle_with_hooks<T: EvmTypes, H: TxHandlerHooks<T>>(
+    mut req: TxRequest<'_, '_, T, TxEip8141>,
+) -> HandlerResult<TxResult<T>> {
+    let prepared = prepare_with_hooks::<T, H>(&mut req)?;
+    execute_prepared::<T, H>(req, prepared)
+}
+
+/// Validates an EIP-8141 transaction and applies its pre-execution handler hook.
+pub fn prepare_with_hooks<T: EvmTypes, H: TxHandlerHooks<T>>(
     req: &mut TxRequest<'_, '_, T, TxEip8141>,
 ) -> HandlerResult<PreparedFrameTx> {
-    prepare_payload(req.host, req.tx.inner())
-}
-
-/// Executes the already-prepared frame transaction and settles payment once.
-pub fn execute_prepared<T: EvmTypes>(
-    req: TxRequest<'_, '_, T, TxEip8141>,
-    prepared: PreparedFrameTx,
-) -> HandlerResult<TxResult<T>> {
-    let host = req.host;
-    let result = run(host, &prepared, None);
-    host.frame_tx = None;
-    result
-}
-
-/// Native frame transaction handler with executable prefix validation.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct FrameHandler;
-
-impl<T: EvmTypes> TxHandler<T, TxEip8141, TxResult<T>> for FrameHandler {
-    fn validate(&self, mut req: TxRequest<'_, '_, T, TxEip8141>) -> HandlerResult<()> {
-        prepare(&mut req).map(|_| ())
-    }
-
-    fn execute(&self, req: TxRequest<'_, '_, T, TxEip8141>) -> HandlerResult<TxResult<T>> {
-        handle(req)
-    }
-
-    fn validate_frame_prefix(
-        &self,
-        req: TxRequest<'_, '_, T, TxEip8141>,
-        prefix_end: usize,
-    ) -> HandlerResult<FrameValidationResult> {
-        validate_prefix(req.host, req.tx.inner(), prefix_end)
-    }
-}
-
-pub(crate) fn validate_prefix<T: EvmTypes>(
-    host: &mut Evm<'_, T>,
-    payload: &TxEip8141,
-    prefix_end: usize,
-) -> HandlerResult<FrameValidationResult> {
-    if prefix_end == 0 || prefix_end > payload.frames.len() {
-        return Err(invalid("EIP-8141 validation prefix is outside frame bounds"));
-    }
-    let prepared = prepare_payload(host, payload)?;
-    let result = run(host, &prepared, Some(prefix_end))?;
-    let frame = result.frame.as_ref().unwrap();
-    if frame.receipts.len() != prefix_end {
-        return Err(invalid("EIP-8141 validation prefix boundary mismatch"));
-    }
-    Ok(FrameValidationResult {
-        payer: frame.payer,
-        max_cost: prepared.max_cost,
-        prefix_end,
-        sender_approved: host.frame_tx.as_ref().unwrap().approval.sender_approved,
-        signature_gas: prepared.gas.signatures,
-        execution_gas: frame.receipts.iter().map(|receipt| receipt.gas_used.execution).sum(),
-        state_gas: result.state_gas_spent,
-    })
-}
-
-fn prepare_payload<T: EvmTypes>(
-    host: &mut Evm<'_, T>,
-    tx: &TxEip8141,
-) -> HandlerResult<PreparedFrameTx> {
+    let host = &mut *req.host;
+    let tx = *req.tx.inner();
     validate_chain_id(host.version(), Some(tx.chain_id), false)?;
     if !host.feature(EvmFeatures::EIP8141) {
         return Err(HandlerError::UnsupportedTransactionType(6));
@@ -282,7 +226,7 @@ fn prepare_payload<T: EvmTypes>(
     if let Some(keys) = &tx.nonce_keys {
         validate_nonce_keys(keys).map_err(invalid)?;
     }
-    if tx.frames.is_empty() || tx.frames.len() > 64 {
+    if tx.frames.is_empty() || tx.frames.len() > MAX_FRAMES {
         return Err(invalid("EIP-8141 frame count must be in 1..=64"));
     }
     if gas.execution > host.version().tx_gas_limit_cap {
@@ -319,7 +263,7 @@ fn prepare_payload<T: EvmTypes>(
         }
     }
     let legacy_nonce = host.state.account(&tx.sender)?.nonce();
-    Ok(PreparedFrameTx {
+    let prepared = PreparedFrameTx {
         payload: Arc::new(tx.clone()),
         signature_hash,
         gas,
@@ -328,9 +272,83 @@ fn prepare_payload<T: EvmTypes>(
         blob_charge,
         max_cost,
         legacy_nonce,
+    };
+    H::before_frame_execution(host, req.envelope, &prepared)?;
+    Ok(prepared)
+}
+
+/// Executes and settles a prepared EIP-8141 transaction.
+pub fn execute_prepared<T: EvmTypes, H: TxHandlerHooks<T>>(
+    req: TxRequest<'_, '_, T, TxEip8141>,
+    prepared: PreparedFrameTx,
+) -> HandlerResult<TxResult<T>> {
+    let host = req.host;
+    let result = execute_frames(host, &prepared, None).and_then(|result| {
+        let result = H::settle_frame_transaction(host, req.envelope, &prepared, result)?;
+        host.inspect_frame(|inspector, host| inspector.frame_transaction_end(&result, host));
+        Ok(result)
+    });
+    host.frame_tx = None;
+    result
+}
+
+/// Native frame transaction handler with executable prefix validation.
+#[derive_where(Clone, Copy, Debug, Default)]
+pub struct FrameHandler<H = DefaultTxHandlerHooks>(PhantomData<fn() -> H>);
+
+impl<H> FrameHandler<H> {
+    /// Creates a frame handler using `H` for preparation and settlement.
+    pub const fn new() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<T: EvmTypes, H: TxHandlerHooks<T>> TxHandler<T, TxEip8141, TxResult<T>> for FrameHandler<H> {
+    fn validate(&self, mut req: TxRequest<'_, '_, T, TxEip8141>) -> HandlerResult<()> {
+        prepare_with_hooks::<T, H>(&mut req).map(|_| ())
+    }
+
+    fn execute(&self, req: TxRequest<'_, '_, T, TxEip8141>) -> HandlerResult<TxResult<T>> {
+        handle_with_hooks::<T, H>(req)
+    }
+
+    fn validate_frame_prefix(
+        &self,
+        req: TxRequest<'_, '_, T, TxEip8141>,
+        prefix_end: usize,
+    ) -> HandlerResult<FrameValidationResult> {
+        validate_prefix_with_hooks::<T, H>(req, prefix_end)
+    }
+}
+
+/// Validates payment approval through `prefix_end` without settling fees; caller discards effects.
+fn validate_prefix_with_hooks<T: EvmTypes, H: TxHandlerHooks<T>>(
+    mut req: TxRequest<'_, '_, T, TxEip8141>,
+    prefix_end: usize,
+) -> HandlerResult<FrameValidationResult> {
+    if prefix_end == 0 || prefix_end > req.tx.inner().frames.len() {
+        return Err(invalid("EIP-8141 validation prefix is outside frame bounds"));
+    }
+    let prepared = prepare_with_hooks::<T, H>(&mut req)?;
+    let host = req.host;
+    let result = execute_frames(host, &prepared, Some(prefix_end))?;
+    host.inspect_frame(|inspector, host| inspector.frame_transaction_end(&result, host));
+    let frame = result.frame.as_ref().unwrap();
+    if frame.receipts.len() != prefix_end {
+        return Err(invalid("EIP-8141 validation prefix boundary mismatch"));
+    }
+    Ok(FrameValidationResult {
+        payer: frame.payer,
+        max_cost: prepared.max_cost,
+        prefix_end,
+        sender_approved: host.frame_tx.as_ref().unwrap().approval.sender_approved,
+        signature_gas: prepared.gas.signatures,
+        execution_gas: frame.receipts.iter().map(|receipt| receipt.gas_used.execution).sum(),
+        state_gas: result.state_gas_spent,
     })
 }
 
+/// Verifies protocol signatures and signer identities, honoring simulation placeholders.
 fn validate_signatures(tx: &TxEip8141, hash: B256, placeholders: bool) -> HandlerResult<()> {
     for sig in &tx.signatures {
         if placeholders && sig.scheme != SignatureScheme::Arbitrary && sig.signature.is_empty() {
@@ -351,42 +369,26 @@ fn validate_signatures(tx: &TxEip8141, hash: B256, placeholders: bool) -> Handle
             sig.signer_address().unwrap_or_default()
         };
         let valid = match sig.scheme {
-            SignatureScheme::Arbitrary => sig.signer.is_empty(),
-            SignatureScheme::Secp256k1 if sig.signature.len() == 65 && sig.signature[0] <= 1 => {
-                let r = U256::from_be_slice(&sig.signature[1..33]);
-                let s = U256::from_be_slice(&sig.signature[33..]);
-                if r.is_zero() || r >= SECP256K1N || s.is_zero() || s > (SECP256K1N >> 1) {
-                    false
-                } else {
-                    let recovered = precompiles::crypto()
-                        .secp256k1_ecrecover(
-                            sig.signature[1..].try_into().unwrap(),
-                            sig.signature[0],
-                            &msg,
-                        )
-                        .ok()
-                        .map(|v| Address::from_slice(&v[12..]));
-                    if recovered.is_some_and(|address| address != expected) {
-                        return Err(invalid("EIP-8141 signature signer does not match"));
-                    }
-                    recovered == Some(expected)
-                }
-            }
-            SignatureScheme::P256 if sig.signature.len() == 128 => {
-                let r = U256::from_be_slice(&sig.signature[..32]);
-                let s = U256::from_be_slice(&sig.signature[32..64]);
-                !r.is_zero()
-                    && r < SECP256R1N
-                    && !s.is_zero()
-                    && s <= (SECP256R1N >> 1)
-                    && Address::from_slice(&keccak256(&sig.signature[64..])[12..]) == expected
-                    && precompiles::crypto().secp256r1_verify_signature(
+            SignatureScheme::Arbitrary => true,
+            SignatureScheme::Secp256k1 => {
+                let recovered = precompiles::crypto()
+                    .secp256k1_ecrecover(
+                        sig.signature[1..].try_into().unwrap(),
+                        sig.signature[0],
                         &msg,
-                        sig.signature[..64].try_into().unwrap(),
-                        sig.signature[64..].try_into().unwrap(),
                     )
+                    .ok()
+                    .map(|v| Address::from_slice(&v[12..]));
+                if recovered.is_some_and(|address| address != expected) {
+                    return Err(invalid("EIP-8141 signature signer does not match"));
+                }
+                recovered == Some(expected)
             }
-            _ => false,
+            SignatureScheme::P256 => precompiles::crypto().secp256r1_verify_signature(
+                &msg,
+                sig.signature[..64].try_into().unwrap(),
+                sig.signature[64..].try_into().unwrap(),
+            ),
         };
         if !valid {
             return Err(invalid("EIP-8141 signature validation failed"));
@@ -395,6 +397,7 @@ fn validate_signatures(tx: &TxEip8141, hash: B256, placeholders: bool) -> Handle
     Ok(())
 }
 
+/// Checks frame flags, batching, assertion ordering, expiry fields, and signature structure.
 fn validate_structure(tx: &TxEip8141, placeholders: bool) -> HandlerResult<()> {
     // Shared wire validation also applies a fixed gas schedule. Native execution must use
     // the selected Version, so validate structure here and calculate reservations separately.
@@ -416,7 +419,8 @@ fn validate_structure(tx: &TxEip8141, placeholders: bool) -> HandlerResult<()> {
         if frame.is_assertion() && previous_atomic {
             return Err(invalid("EIP-7906 atomic batch cannot end on a ASSERT frame"));
         }
-        if frame.flags & 2 != 0 && frame.resolved_target(tx.sender) != tx.sender {
+        if frame.allowed_scope().allows_execution() && frame.resolved_target(tx.sender) != tx.sender
+        {
             return Err(invalid("EIP-8141 execution approval target must be the sender"));
         }
         if frame.is_atomic_batch() && frame.mode == FrameMode::Verify {
@@ -427,7 +431,7 @@ fn validate_structure(tx: &TxEip8141, placeholders: bool) -> HandlerResult<()> {
         {
             return Err(invalid("EIP-8141 atomic batch must be followed by a non-VERIFY frame"));
         }
-        if (frame.is_atomic_batch() || previous_atomic) && frame.flags & 3 != 0 {
+        if (frame.is_atomic_batch() || previous_atomic) && !frame.allowed_scope().is_none() {
             return Err(invalid("EIP-8141 atomic batch frames cannot carry approval scope"));
         }
         if frame.is_expiry_verifier() {
@@ -472,7 +476,8 @@ fn validate_structure(tx: &TxEip8141, placeholders: bool) -> HandlerResult<()> {
     Ok(())
 }
 
-fn run<T: EvmTypes>(
+/// Runs frames with approval and rollback tracking, producing gas usage and receipts.
+fn execute_frames<T: EvmTypes>(
     host: &mut Evm<'_, T>,
     prepared: &PreparedFrameTx,
     prefix: Option<usize>,
@@ -484,7 +489,9 @@ fn run<T: EvmTypes>(
         prepared.max_cost,
         prepared.legacy_nonce,
     ));
-    host.inspect_frame(|inspector, host| inspector.frame_transaction_start(tx, host));
+    host.inspect_frame(|inspector, host| {
+        inspector.frame_transaction_start(tx, &prepared.gas, host)
+    });
     host.state.account(&tx.sender)?.warm();
     if host.feature(EvmFeatures::EIP3651) {
         host.state.prewarm(&host.block.beneficiary);
@@ -633,14 +640,11 @@ fn run<T: EvmTypes>(
         }),
         ..Default::default()
     };
-    if prefix.is_none() {
-        settle_fees(host, prepared, &result)?;
-    }
-    host.inspect_frame(|inspector, host| inspector.frame_transaction_end(&result, host));
     Ok(result)
 }
 
-fn settle_fees<T: EvmTypes>(
+/// Refunds unused payer escrow and pays the beneficiary's capped priority fee.
+pub(crate) fn settle_fees<T: EvmTypes>(
     host: &mut Evm<'_, T>,
     prepared: &PreparedFrameTx,
     result: &TxResult<T>,
@@ -667,6 +671,7 @@ fn settle_fees<T: EvmTypes>(
     Ok(())
 }
 
+/// Snapshots batch state, approval, state gas, and optional account/storage warmth.
 fn checkpoint<T: EvmTypes>(host: &Evm<'_, T>, start: usize, warmth: bool) -> Batch {
     let rt = host.frame_tx.as_ref().unwrap();
     Batch {
@@ -678,6 +683,7 @@ fn checkpoint<T: EvmTypes>(host: &Evm<'_, T>, start: usize, warmth: bool) -> Bat
     }
 }
 
+/// Restores a batch checkpoint and clears reverted logs, state gas, refunds, and optional outputs.
 fn rollback<T: EvmTypes>(
     host: &mut Evm<'_, T>,
     c: Batch,
@@ -704,6 +710,7 @@ fn rollback<T: EvmTypes>(
     }
 }
 
+/// Records a skipped frame in receipts and runtime bookkeeping and notifies the inspector.
 fn skipped<T: EvmTypes>(
     host: &mut Evm<'_, T>,
     receipts: &mut Vec<FrameReceipt>,
@@ -728,6 +735,7 @@ fn skipped<T: EvmTypes>(
     rt.state_gas_used.push(0);
 }
 
+/// Executes one frame with isolated execution and state gas budgets, returning its outcome.
 fn execute_frame<T: EvmTypes>(
     host: &mut Evm<'_, T>,
     tx_env: &TxEnv<T>,

@@ -9,7 +9,7 @@ use common::{APPROVE_BOTH, BODY, SENDER};
 use evm2::{
     BaseEvmTypes, Evm, Inspector,
     ethereum::eip8141::FrameGas,
-    evm::{AccountInfo, PendingState},
+    evm::PendingState,
     interpreter::{InstrStop, Interpreter, Message, MessageResult},
 };
 use std::sync::{Arc, Mutex};
@@ -28,13 +28,12 @@ fn evm(assertion_fails: bool) -> Evm<'static, BaseEvmTypes> {
         0x5f, 0x35, 0x5f, 0x55, 0x5f, 0x5f, 0xa0, 0x60, 0x20, 0x35, 0x15, 0x60, 0x11, 0x57, 0x5f,
         0x5f, 0xfd, 0x5b, 0x00,
     ];
-    let mut db = common::database([
+    let db = common::database_with_nonce_manager([
         (SENDER, APPROVE_BOTH),
         (BODY, &body),
         (HALT, &[0xfe]),
         (ASSERTION, if assertion_fails { &[0x5f, 0x5f, 0xfd][..] } else { &[0x00] }),
     ]);
-    db.insert_account_info(&NONCE_MANAGER, AccountInfo::default().with_nonce(1));
     common::evm(db)
 }
 

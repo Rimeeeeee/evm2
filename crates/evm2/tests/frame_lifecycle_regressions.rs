@@ -29,8 +29,11 @@ fn payload(frames: Vec<Frame>, keys: Vec<U256>) -> TxEip8141 {
 }
 
 fn evm(sender: &[u8], body: &[u8]) -> Evm<'static, BaseEvmTypes> {
-    let mut db = common::database([(SENDER, sender), (BODY, body), (FAILURE, &[0x5f, 0x5f, 0xfd])]);
-    db.insert_account_info(&NONCE_MANAGER, AccountInfo::default().with_nonce(1));
+    let db = common::database_with_nonce_manager([
+        (SENDER, sender),
+        (BODY, body),
+        (FAILURE, &[0x5f, 0x5f, 0xfd]),
+    ]);
     common::evm(db)
 }
 
@@ -63,24 +66,13 @@ fn reserved_zero_signature_message_is_rejected_even_with_placeholders() {
                 ..Default::default()
             });
             let tx = recovered(tx);
-            assert!(matches!(
-                evm.validate_tx(&tx),
-                Err(HandlerError::InvalidFrameTransaction(
-                    "EIP-8141 explicit signature message must be a non-zero 32-byte digest"
-                ))
-            ));
-            assert!(matches!(
-                evm.validate_frame_prefix(&tx, 1),
-                Err(HandlerError::InvalidFrameTransaction(
-                    "EIP-8141 explicit signature message must be a non-zero 32-byte digest"
-                ))
-            ));
-            assert!(matches!(
-                evm.transact(&tx),
-                Err(HandlerError::InvalidFrameTransaction(
-                    "EIP-8141 explicit signature message must be a non-zero 32-byte digest"
-                ))
-            ));
+            common::assert_validation_error(
+                &mut evm,
+                &tx,
+                HandlerError::InvalidFrameTransaction(
+                    "EIP-8141 explicit signature message must be a non-zero 32-byte digest",
+                ),
+            );
             assert_eq!(nonce(&mut evm, U256::ZERO), U256::ZERO);
         }
     }

@@ -80,18 +80,11 @@ const fn first_use_cost(evm: &Evm<'_, BaseEvmTypes>) -> u64 {
 }
 
 fn assert_nonce_mismatch(evm: &mut Evm<'_, BaseEvmTypes>, tx: &Recovered<TxEnvelope>) {
-    assert!(matches!(
-        evm.validate_tx(tx),
-        Err(HandlerError::InvalidFrameTransaction("EIP-8250 nonce sequence mismatch"))
-    ));
-    assert!(matches!(
-        evm.validate_frame_prefix(tx, 1),
-        Err(HandlerError::InvalidFrameTransaction("EIP-8250 nonce sequence mismatch"))
-    ));
-    assert!(matches!(
-        evm.transact(tx),
-        Err(HandlerError::InvalidFrameTransaction("EIP-8250 nonce sequence mismatch"))
-    ));
+    common::assert_validation_error(
+        evm,
+        tx,
+        HandlerError::InvalidFrameTransaction("EIP-8250 nonce sequence mismatch"),
+    );
 }
 
 #[test]

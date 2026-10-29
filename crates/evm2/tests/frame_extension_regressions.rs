@@ -3,7 +3,7 @@
 mod common;
 
 use alloy_consensus::{TxLegacy, transaction::Recovered};
-use alloy_eips::eip8141::{ENTRY_POINT, Frame, FrameMode, FrameStatus, NONCE_MANAGER};
+use alloy_eips::eip8141::{ENTRY_POINT, Frame, FrameMode, FrameStatus};
 use alloy_primitives::{Address, Bytes, Log, TxKind, U256};
 use common::{APPROVE_BOTH, BODY, SENDER};
 use evm2::{
@@ -195,8 +195,8 @@ fn tx(frames: Vec<Frame>) -> Recovered<TxEnvelope> {
 }
 
 fn evm(body: &[u8], inspector: Observe) -> Evm<'static, CustomTypes> {
-    let mut db = common::database([(SENDER, APPROVE_BOTH), (BODY, body), (CUSTOM, &[])]);
-    db.insert_account_info(&NONCE_MANAGER, AccountInfo::default().with_nonce(1));
+    let db =
+        common::database_with_nonce_manager([(SENDER, APPROVE_BOTH), (BODY, body), (CUSTOM, &[])]);
     let mut evm = Evm::new_with_ext(
         SpecId::BOGOTA,
         BlockEnvExt::<()>::default().with_ext(Marker(42)),

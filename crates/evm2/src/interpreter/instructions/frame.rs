@@ -13,18 +13,7 @@ pub fn approve(cx: _, [offset, len, scope]: [Word]) -> Result {
     if cx.state.host().is_assert_frame() {
         return Err(InstrStop::StateChangeDuringStaticCall);
     }
-    let len = len.to_usize()?;
-    let output = if len == 0 {
-        0..0
-    } else {
-        let offset = offset.to_usize()?;
-        let end = offset.checked_add(len).ok_or(InstrStop::MemoryOOG)?;
-        if end > u32::MAX as usize {
-            return Err(InstrStop::MemoryLimitOOG);
-        }
-        cx.state.resize_memory(cx.gas, offset, len)?;
-        offset as u32..end as u32
-    };
+    let output = super::control::output_memory_range(cx.gas, cx.state, offset, len)?;
     let address = cx.state.message().destination;
     let left = cx.gas.reservoir();
     let charge =
@@ -46,6 +35,7 @@ pub fn framedataload(cx: _, [offset, index]: [Word]) -> Result<out> {
     *out = b256_to_word(read_word_padded(&data, offset.to_usize_saturated()));
 }
 
+/// Checks optional source bounds, charges copy gas, and copies frame or signature data.
 fn copy_data<T: EvmTypesHost>(
     cx: GasInstructionCx<'_, '_, '_, T>,
     memory: &Word,
@@ -59,13 +49,10 @@ fn copy_data<T: EvmTypesHost>(
     if checked && data_offset.checked_add(len).is_none_or(|end| end > data.len()) {
         return Err(InstrStop::OutOfOffset);
     }
-    cx.gas.spend(cx.state.gas_params().copy_cost(len))?;
-    if len != 0 {
-        let memory = memory.to_usize()?;
-        cx.state.resize_memory(cx.gas, memory, len)?;
-        cx.state.0.memory.set_data(memory, data_offset, len, &data);
-    }
-    Ok(())
+    // SAFETY: Charging and copying data make no host calls.
+    let gas_params = unsafe { cx.state.gas_params_detached() };
+    cx.gas.spend(gas_params.copy_cost(len))?;
+    super::env::copy_data(cx.gas, &mut cx.state.0.memory, gas_params, memory, offset, len, &data)
 }
 
 #[instruction(dynamic_gas)]

@@ -1,5 +1,5 @@
 use crate::tracing::{FourByteInspector, TracingInspector, TracingInspectorConfig, final_refunded};
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
 use alloy_consensus::{Transaction, transaction::Recovered};
 use alloy_primitives::{Address, Log, U256, map::HashMap};
 use alloy_rpc_types_eth::TransactionInfo;
@@ -10,6 +10,7 @@ use alloy_rpc_types_trace::geth::{
 };
 use evm2::{
     EvmTypes, EvmTypesHost, Inspector, TxResultExt, TxResultWithState,
+    ethereum::eip8141::FrameGas,
     evm::{DbResult, DynDatabase},
     interpreter::{Interpreter, Message, MessageResult},
 };
@@ -188,9 +189,14 @@ impl MuxInspector {
 }
 
 impl<T: EvmTypes> Inspector<T> for MuxInspector {
-    fn frame_transaction_start(&mut self, tx: &alloy_consensus::TxEip8141, host: &mut T::Host<'_>) {
+    fn frame_transaction_start(
+        &mut self,
+        tx: &Arc<alloy_consensus::TxEip8141>,
+        gas: &FrameGas,
+        host: &mut T::Host<'_>,
+    ) {
         if let Some(inspector) = &mut self.tracing {
-            <TracingInspector as Inspector<T>>::frame_transaction_start(inspector, tx, host);
+            <TracingInspector as Inspector<T>>::frame_transaction_start(inspector, tx, gas, host);
         }
     }
 

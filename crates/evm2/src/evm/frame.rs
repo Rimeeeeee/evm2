@@ -26,6 +26,7 @@ use crate::registry::HandlerError;
 #[cfg(feature = "async")]
 use core::future::Future;
 
+/// Payment and execution approvals committed by a call or top-level frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct FrameApprovalState {
     pub(crate) payer: Option<Address>,
@@ -34,6 +35,7 @@ pub(crate) struct FrameApprovalState {
     pub(crate) sender_approved: bool,
 }
 
+/// Transaction-wide frame progress, scoped approvals, and introspection state.
 #[derive(Debug)]
 pub(crate) struct FrameTransactionRuntime {
     pub(crate) payload: Arc<TxEip8141>,
@@ -385,15 +387,14 @@ impl<T: EvmTypes> Evm<'_, T> {
         if payment && (old.payer.is_some() || (!old.sender_approved && !execution)) {
             return Err(InstrStop::Revert.into());
         }
-        let keys = rt.payload.nonce_keys.clone();
-        let keyed = keys.as_ref().is_some_and(|keys| !keys.is_empty());
+        let keys = rt.payload.nonce_keys.as_deref().filter(|keys| !keys.is_empty());
         let sequence = rt.payload.nonce;
         let maximum = rt.max_cost;
         let mut charged = 0u64;
         let mut precharge = old.gas_pre_charge;
         if payment {
-            if keyed {
-                for key in keys.as_ref().unwrap() {
+            if let Some(keys) = keys {
+                for key in keys {
                     let first = self
                         .state
                         .storage(&NONCE_MANAGER)?
@@ -429,13 +430,13 @@ impl<T: EvmTypes> Evm<'_, T> {
             if charged > state_left {
                 return Err(InstrStop::OutOfGas.into());
             }
-            if keyed {
+            if let Some(keys) = keys {
                 // MAX is the single-use marker: consuming it exhausts the selected keys.
                 let next = sequence.saturating_add(1);
-                for key in keys.unwrap() {
+                for key in keys {
                     self.state
                         .storage(&NONCE_MANAGER)?
-                        .into_slot(nonce_slot(sender, key))?
+                        .into_slot(nonce_slot(sender, *key))?
                         .set(U256::from(next));
                 }
             } else {

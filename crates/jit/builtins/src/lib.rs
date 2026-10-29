@@ -888,19 +888,8 @@ pub unsafe extern "C" fn __revmc_builtin_do_return(
 ) -> BuiltinResult {
     let rev![offset, len] = sp;
     let len = word_to_usize(len.to_u256())?;
-    let output = if len != 0 {
-        let offset = word_to_usize(offset.to_u256())?;
-        let Some(end) = offset.checked_add(len) else {
-            return Err(InstrStop::MemoryOOG.into());
-        };
-        if end > u32::MAX as usize {
-            return Err(InstrStop::MemoryLimitOOG.into());
-        }
-        ensure_memory(ecx, offset, len)?;
-        offset as u32..end as u32
-    } else {
-        0..0
-    };
+    let offset = if len == 0 { 0 } else { word_to_usize(offset.to_u256())? };
+    let output = output_memory_range(ecx, offset, len)?;
     ecx.interpreter_mut().set_output(output);
     Err(result.into())
 }
@@ -912,20 +901,7 @@ pub unsafe extern "C" fn __revmc_builtin_do_return_cc(
     len: u64,
     result: InstrStop,
 ) -> BuiltinResult {
-    let offset = offset as usize;
-    let len = len as usize;
-    let output = if len != 0 {
-        let Some(end) = offset.checked_add(len) else {
-            return Err(InstrStop::MemoryOOG.into());
-        };
-        if end > u32::MAX as usize {
-            return Err(InstrStop::MemoryLimitOOG.into());
-        }
-        ensure_memory(ecx, offset, len)?;
-        offset as u32..end as u32
-    } else {
-        0..0
-    };
+    let output = output_memory_range(ecx, offset as usize, len as usize)?;
     ecx.interpreter_mut().set_output(output);
     Err(result.into())
 }

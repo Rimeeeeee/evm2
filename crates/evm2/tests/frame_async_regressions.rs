@@ -31,9 +31,7 @@ use std::{
 const SUSPEND: Address = Address::with_last_byte(0xfe);
 
 fn database() -> InMemoryDB {
-    let mut database = common::database([(SENDER, APPROVE_BOTH)]);
-    database.insert_account_info(&NONCE_MANAGER, AccountInfo::default().with_nonce(1));
-    database
+    common::database_with_nonce_manager([(SENDER, APPROVE_BOTH)])
 }
 
 fn evm() -> Evm<'static, BaseEvmTypes> {
