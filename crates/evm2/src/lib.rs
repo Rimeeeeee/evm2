@@ -24,7 +24,7 @@ pub mod evm;
 pub use evm::config::EvmTypesHost;
 pub use evm::{
     AccountInfo, BlockStateAccumulator, Evm, ExecutedTx, InterpreterRunner, JournalEntry,
-    PendingState, TxResult, TxResultExt, TxResultWithState, config,
+    PendingState, TxResult, TxResultExt, TxResultWithState, TxStateChanges, config,
     config::{
         BaseEvmConfig, BaseEvmConfigSelector, BaseEvmTypes, EvmConfig, EvmConfigSelector, EvmTypes,
         ExecutionConfig,
@@ -44,7 +44,7 @@ pub(crate) mod trustme;
 pub(crate) mod test_utils;
 
 pub mod version;
-pub use version::{EvmFeatures, OpcodeConfig, Version};
+pub use version::{EvmFeatures, OpcodeChange, OpcodeConfig, OpcodeView, Version};
 
 mod spec_id;
 pub use spec_id::SpecId;

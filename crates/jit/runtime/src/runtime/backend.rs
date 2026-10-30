@@ -1,15 +1,17 @@
 use crate::{
-    EvmCompilerFn, eyre,
+    EvmCompilerFn,
+    eyre::{self, WrapErr},
     runtime::{
         LookupRequest,
-        api::{CompiledProgram, LoadedLibrary, ProgramKind},
+        api::{CompiledProgram, ProgramKind},
         config::{CompilationEvent, CompilationKind, RuntimeConfig, RuntimeTuning},
         storage::{
-            ArtifactKey, ArtifactManifest, ArtifactStore, RuntimeCacheKey, compile_config_hash,
+            ArtifactKey, ArtifactManifest, ArtifactStore, RuntimeCacheKey, StoredArtifact,
+            compile_config_hash,
         },
         worker::{
             AotSuccess, CompileJob, JitCodeBacking, JitObjectSuccess, SyncNotifier, WorkerPool,
-            WorkerResult, WorkerSuccess,
+            WorkerResult, WorkerSuccess, builtin_symbol_names,
         },
     },
 };
@@ -24,7 +26,7 @@ use quanta::Instant;
 #[cfg(feature = "llvm")]
 use std::ffi::CString;
 use std::{
-    mem,
+    fs, mem,
     ops::ControlFlow,
     sync::{Arc, atomic::Ordering},
     time::{SystemTime, UNIX_EPOCH},
@@ -32,6 +34,8 @@ use std::{
 
 #[cfg(feature = "llvm")]
 use crate::llvm::jit_memory_usage;
+#[cfg(feature = "llvm")]
+use evm2_jit_backend::{Backend, BackendConfig};
 #[cfg(feature = "llvm")]
 use evm2_jit_context::RawEvmCompilerFn;
 
@@ -64,44 +68,61 @@ fn jit_total_bytes() -> usize {
 }
 
 #[cfg(feature = "llvm")]
-struct JitObjectLinker {
+pub(crate) struct JitObjectLinker {
     backend: Option<crate::EvmLlvmBackend>,
+    /// Resolves the builtins of a custom host, which the helper leaves as symbols.
+    resolver: Option<fn(evm2_jit_builtins::Builtin) -> usize>,
 }
 
 #[cfg(not(feature = "llvm"))]
-struct JitObjectLinker;
+pub(crate) struct JitObjectLinker;
 
 #[cfg(feature = "llvm")]
 impl JitObjectLinker {
-    const fn new() -> Self {
-        Self { backend: None }
+    pub(crate) const fn new(resolver: Option<fn(evm2_jit_builtins::Builtin) -> usize>) -> Self {
+        Self { backend: None, resolver }
     }
 
     fn link(
         &mut self,
-        success: &JitObjectSuccess,
+        symbol_name: &str,
+        object: &[u8],
+        builtin_symbols: &[String],
     ) -> eyre::Result<(EvmCompilerFn, Arc<JitCodeBacking>)> {
         let backend = match &mut self.backend {
             Some(backend) => backend,
-            None => self.backend.insert(crate::EvmLlvmBackend::new(false)?),
+            None => {
+                let mut backend = crate::EvmLlvmBackend::new(false)?;
+                // Long-running nodes cannot afford debug object copies or the append-only perf map.
+                backend.apply_config(BackendConfig {
+                    debug_support: false,
+                    simple_perf: false,
+                    ..backend.config().clone()
+                });
+                self.backend.insert(backend)
+            }
         };
 
-        let symbol_name = CString::new(success.symbol_name.clone())?;
-        let builtin_symbols = success
-            .builtin_symbols
+        let symbol_name = CString::new(symbol_name)?;
+        let builtin_symbols = builtin_symbols
             .iter()
             .map(|name| {
-                let addr = evm2_jit_builtins::Builtin::parse(name)
-                    .ok_or_else(|| eyre::eyre!("unknown builtin symbol: {name}"))?
-                    .addr();
+                // The helper suffixed the symbols with the resolver's address.
+                let plain = self
+                    .resolver
+                    .and_then(|resolve| name.strip_suffix(&format!("_{:x}", resolve as usize)))
+                    .unwrap_or(name);
+                let builtin = evm2_jit_builtins::Builtin::parse(plain)
+                    .ok_or_else(|| eyre::eyre!("unknown builtin symbol: {name}"))?;
+                let addr = self.resolver.map_or_else(
+                    || builtin.addr::<evm2::BaseEvmTypes>(),
+                    |resolve| resolve(builtin),
+                );
                 Ok((CString::new(name.as_str())?, addr))
             })
             .collect::<eyre::Result<Vec<_>>>()?;
-        let (addr, tracker, jd_guard) = backend.link_jit_object_in_fresh_dylib(
-            &symbol_name,
-            &success.object_bytes,
-            &builtin_symbols,
-        )?;
+        let (addr, tracker, jd_guard) =
+            backend.link_jit_object_in_fresh_dylib(&symbol_name, object, &builtin_symbols)?;
         let func =
             EvmCompilerFn::new(unsafe { std::mem::transmute::<usize, RawEvmCompilerFn>(addr) });
         Ok((func, Arc::new(JitCodeBacking::new(tracker, jd_guard))))
@@ -110,15 +131,33 @@ impl JitObjectLinker {
 
 #[cfg(not(feature = "llvm"))]
 impl JitObjectLinker {
-    const fn new() -> Self {
+    pub(crate) const fn new(_resolver: Option<fn(evm2_jit_builtins::Builtin) -> usize>) -> Self {
         Self
     }
 
     fn link(
         &mut self,
-        _success: &JitObjectSuccess,
+        _symbol_name: &str,
+        _object: &[u8],
+        _builtin_symbols: &[String],
     ) -> eyre::Result<(EvmCompilerFn, Arc<JitCodeBacking>)> {
         eyre::bail!("LLVM backend not available");
+    }
+}
+
+impl JitObjectLinker {
+    /// Reads and links the object of a stored AOT artifact.
+    pub(crate) fn link_stored(
+        &mut self,
+        key: RuntimeCacheKey,
+        stored: &StoredArtifact,
+    ) -> eyre::Result<CompiledProgram> {
+        let object = fs::read(&stored.object_path)
+            .wrap_err_with(|| format!("read {:?}", stored.object_path))?;
+        // The object may reference any builtin of the base host.
+        let (func, backing) =
+            self.link(&stored.manifest.symbol_name, &object, &builtin_symbol_names(None))?;
+        Ok(CompiledProgram::new_aot(key, func, backing))
     }
 }
 
@@ -458,39 +497,25 @@ impl BackendState {
                 );
                 false
             }
-            Ok(Some(stored)) => {
-                match (|| -> eyre::Result<CompiledProgram> {
-                    let library = unsafe { libloading::Library::new(&stored.dylib_path) }
-                        .map_err(|e| eyre::eyre!("dlopen {:?}: {e}", stored.dylib_path))?;
-                    let func: EvmCompilerFn = unsafe {
-                        let sym: libloading::Symbol<'_, EvmCompilerFn> =
-                            library.get(stored.manifest.symbol_name.as_bytes()).map_err(|e| {
-                                eyre::eyre!("symbol '{}': {e}", stored.manifest.symbol_name)
-                            })?;
-                        *sym
-                    };
-                    let library = Arc::new(LoadedLibrary::new(library));
-                    Ok(CompiledProgram::new_aot(*key, func, library))
-                })() {
-                    Ok(program) => {
-                        debug!(
-                            code_hash = %key.code_hash,
-                            spec_id = ?key.spec_id,
-                            "loaded existing AOT artifact from store, skipping recompilation",
-                        );
-                        self.insert_resident(*key, Arc::new(program));
-                        true
-                    }
-                    Err(e) => {
-                        warn!(
-                            code_hash = %key.code_hash,
-                            error = %e,
-                            "failed to load persisted AOT artifact, will recompile",
-                        );
-                        false
-                    }
+            Ok(Some(stored)) => match self.jit_object_linker.link_stored(*key, &stored) {
+                Ok(program) => {
+                    debug!(
+                        code_hash = %key.code_hash,
+                        spec_id = ?key.spec_id,
+                        "loaded existing AOT artifact from store, skipping recompilation",
+                    );
+                    self.insert_resident(*key, Arc::new(program));
+                    true
                 }
-            }
+                Err(e) => {
+                    warn!(
+                        code_hash = %key.code_hash,
+                        error = %e,
+                        "failed to load persisted AOT artifact, will recompile",
+                    );
+                    false
+                }
+            },
             Ok(None) => false,
             Err(e) => {
                 warn!(
@@ -636,7 +661,11 @@ impl BackendState {
         success: JitObjectSuccess,
         compile_duration: std::time::Duration,
     ) {
-        match self.jit_object_linker.link(&success) {
+        match self.jit_object_linker.link(
+            &success.symbol_name,
+            &success.object_bytes,
+            &success.builtin_symbols,
+        ) {
             Ok((func, backing)) => {
                 let program = Arc::new(CompiledProgram::new_jit(key, func, backing));
                 self.insert_resident(key, program);
@@ -668,13 +697,13 @@ impl BackendState {
     fn handle_aot_success(&mut self, key: RuntimeCacheKey, success: AotSuccess) {
         let artifact_key = self.artifact_key(key);
 
-        let content_hash = keccak256(&success.dylib_bytes).0;
+        let content_hash = keccak256(&success.object_bytes).0;
 
         let manifest = ArtifactManifest {
             artifact_key,
             symbol_name: success.symbol_name.clone(),
             bytecode_len: success.bytecode_len,
-            artifact_len: success.dylib_bytes.len(),
+            artifact_len: success.object_bytes.len(),
             created_at_unix_secs: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -684,7 +713,7 @@ impl BackendState {
 
         // Persist to store if available.
         if let Some(store) = &self.store {
-            if let Err(e) = store.store(&artifact_key, &manifest, &success.dylib_bytes) {
+            if let Err(e) = store.store(&artifact_key, &manifest, &success.object_bytes) {
                 warn!(
                     code_hash = %key.code_hash,
                     error = %e,
@@ -698,49 +727,35 @@ impl BackendState {
             debug!(
                 code_hash = %key.code_hash,
                 spec_id = ?key.spec_id,
-                dylib_len = success.dylib_bytes.len(),
+                object_len = success.object_bytes.len(),
                 "AOT artifact persisted to store",
             );
 
-            // Load from store to get the canonical path, then dlopen.
+            // Load from store to get the canonical path, then link.
             match store.load(&artifact_key) {
-                Ok(Some(stored)) => {
-                    match (|| -> eyre::Result<CompiledProgram> {
-                        let library = unsafe { libloading::Library::new(&stored.dylib_path) }
-                            .map_err(|e| eyre::eyre!("dlopen {:?}: {e}", stored.dylib_path))?;
-                        let func: EvmCompilerFn = unsafe {
-                            let sym: libloading::Symbol<'_, EvmCompilerFn> =
-                                library.get(success.symbol_name.as_bytes()).map_err(|e| {
-                                    eyre::eyre!("symbol '{}': {e}", success.symbol_name)
-                                })?;
-                            *sym
-                        };
-                        let library = Arc::new(LoadedLibrary::new(library));
-                        Ok(CompiledProgram::new_aot(key, func, library))
-                    })() {
-                        Ok(program) => {
-                            self.insert_resident(key, Arc::new(program));
-                            self.remove_entry(&key);
-                            self.inner.stats.compilations_succeeded.fetch_add(1, Ordering::Relaxed);
+                Ok(Some(stored)) => match self.jit_object_linker.link_stored(key, &stored) {
+                    Ok(program) => {
+                        self.insert_resident(key, Arc::new(program));
+                        self.remove_entry(&key);
+                        self.inner.stats.compilations_succeeded.fetch_add(1, Ordering::Relaxed);
 
-                            debug!(
-                                code_hash = %key.code_hash,
-                                spec_id = ?key.spec_id,
-                                "AOT program loaded into resident map",
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                code_hash = %key.code_hash,
-                                error = %e,
-                                "failed to load persisted AOT artifact",
-                            );
-                            // Persisted successfully but couldn't load — remove so JIT can retry.
-                            self.remove_entry(&key);
-                            self.inner.stats.compilations_failed.fetch_add(1, Ordering::Relaxed);
-                        }
+                        debug!(
+                            code_hash = %key.code_hash,
+                            spec_id = ?key.spec_id,
+                            "AOT program linked into resident map",
+                        );
                     }
-                }
+                    Err(e) => {
+                        warn!(
+                            code_hash = %key.code_hash,
+                            error = %e,
+                            "failed to link persisted AOT artifact",
+                        );
+                        // Persisted successfully but couldn't link — remove so JIT can retry.
+                        self.remove_entry(&key);
+                        self.inner.stats.compilations_failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                },
                 Ok(None) => {
                     warn!(
                         code_hash = %key.code_hash,
@@ -824,18 +839,13 @@ impl BackendState {
             }
         }
 
-        // Phase 3: enforce memory budget by evicting LRU JIT entries.
+        // Phase 3: enforce memory budget by evicting LRU entries.
         if budget > 0 && jit_total_bytes() > budget {
-            // Collect JIT entries sorted by last_hit_at ascending (oldest first).
-            // AOT entries are excluded because they don't contribute to `jit_total_bytes()`.
-            let mut entries: Vec<(RuntimeCacheKey, Instant)> = self
-                .resident_meta
-                .iter()
-                .filter(|(key, _)| {
-                    self.inner.resident.get(key).is_some_and(|p| matches!(p.kind, ProgramKind::Jit))
-                })
-                .map(|(key, meta)| (*key, meta.last_hit_at))
-                .collect();
+            // Collect entries sorted by last_hit_at ascending (oldest first). AOT entries count
+            // too: their linked objects are part of `jit_total_bytes()`, and an evicted one
+            // reloads from the store.
+            let mut entries: Vec<(RuntimeCacheKey, Instant)> =
+                self.resident_meta.iter().map(|(key, meta)| (*key, meta.last_hit_at)).collect();
             entries.sort_by_key(|(_, t)| *t);
 
             for (key, _) in entries {
@@ -977,7 +987,7 @@ pub(crate) fn run(
         cold_head: None,
         cold_tail: None,
         workers,
-        jit_object_linker: JitObjectLinker::new(),
+        jit_object_linker: JitObjectLinker::new(config.host.resolver),
         result_rx,
         store: config.store,
         tuning: config.tuning,
@@ -1052,7 +1062,7 @@ mod notifier_tests {
             cold_head: None,
             cold_tail: None,
             workers,
-            jit_object_linker: JitObjectLinker::new(),
+            jit_object_linker: JitObjectLinker::new(config.host.resolver),
             result_rx,
             config_hash: compile_config_hash(&config),
             store: config.store,
@@ -1588,16 +1598,13 @@ mod tests {
     #[test]
     fn jit_object_linker_relinks_live_symbol_name() {
         let success = compile_jit_object("jit_duplicate_symbol");
-        let success2 = JitObjectSuccess {
-            symbol_name: success.symbol_name.clone(),
-            object_bytes: success.object_bytes.clone(),
-            builtin_symbols: success.builtin_symbols.clone(),
-        };
 
-        let mut linker = JitObjectLinker::new();
-        let (_first_func, _first_backing) = linker.link(&success).unwrap();
-        let (_second_func, _second_backing) = linker
-            .link(&success2)
+        let mut linker = JitObjectLinker::new(None);
+        let link = |linker: &mut JitObjectLinker| {
+            linker.link(&success.symbol_name, &success.object_bytes, &success.builtin_symbols)
+        };
+        let (_first_func, _first_backing) = link(&mut linker).unwrap();
+        let (_second_func, _second_backing) = link(&mut linker)
             .expect("same symbol should link while previous backing remains alive");
     }
 }

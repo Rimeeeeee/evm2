@@ -5,13 +5,11 @@
 //! - Fire-and-forget lookup-observed events to the backend thread.
 //! - Background JIT compilation for hot keys (threshold-based promotion).
 
-use crate::{
-    EvmCompilerFn,
-    eyre::{self, WrapErr},
-};
+use crate::eyre::{self, WrapErr};
 use alloy_primitives::B256;
-use api::LoadedLibrary;
-use backend::{Command, CompileJitRequest, EventQueue, PrepareAotRequest, ResidentMap};
+use backend::{
+    Command, CompileJitRequest, EventQueue, JitObjectLinker, PrepareAotRequest, ResidentMap,
+};
 use crossbeam_channel as chan;
 use crossbeam_queue::ArrayQueue;
 use evm2::SpecId;
@@ -33,7 +31,9 @@ pub use api::{
 };
 
 mod config;
-pub use config::{CompilationEvent, CompilationKind, JitMode, RuntimeConfig, RuntimeTuning};
+pub use config::{
+    CompilationEvent, CompilationKind, HostConfig, JitMode, RuntimeConfig, RuntimeTuning,
+};
 
 mod backend;
 
@@ -107,6 +107,12 @@ pub(crate) struct BackendInner {
     started: AtomicBool,
     /// Blocking mode: every lookup synchronously compiles and never falls back.
     blocking: bool,
+    host: config::HostConfig,
+    /// Key of the last opcode config and spec that matched the host's opcode table.
+    verified_opcodes: std::sync::atomic::AtomicU64,
+    /// Key of the last opcode config and spec that did not match the host's opcode table.
+    rejected_opcodes: std::sync::atomic::AtomicU64,
+    gas_params: Option<evm2::version::GasParams>,
     /// Tuning knobs (Copy). Cached for hot-path eligibility checks.
     tuning: crate::runtime::config::RuntimeTuning,
     /// Bounded channel for control commands (compile_jit, prepare_aot, clears,
@@ -183,6 +189,9 @@ impl JitBackend {
             eyre::bail!("AOT mode does not support out-of-process compilation");
         }
 
+        if !config.host.is_default() && (config.aot || config.store.is_some()) {
+            eyre::bail!("custom hosts require JIT without an artifact store");
+        }
         let enabled = config.enabled;
         let (tx, rx) = chan::bounded::<Command>(config.tuning.channel_capacity);
         let events = ArrayQueue::new(config.tuning.channel_capacity);
@@ -199,6 +208,10 @@ impl JitBackend {
                 enabled: AtomicBool::new(false),
                 started: AtomicBool::new(false),
                 blocking: config.blocking,
+                host: config.host.clone(),
+                verified_opcodes: std::sync::atomic::AtomicU64::new(0),
+                rejected_opcodes: std::sync::atomic::AtomicU64::new(0),
+                gas_params: config.gas_params,
                 tx,
                 thread: std::sync::Mutex::new(None),
                 shutdown_timeout: config.tuning.shutdown_timeout,
@@ -208,6 +221,48 @@ impl JitBackend {
         };
         this.set_enabled(enabled)?;
         Ok(this)
+    }
+
+    /// Checks that generated code matches the interpreter type, gas schedule, and opcode table.
+    pub(crate) fn supports_host<T: evm2::EvmTypesHost>(
+        &self,
+        config: &evm2::ExecutionConfig<T>,
+    ) -> bool {
+        let host = &self.inner.host;
+        host.type_id == std::any::TypeId::of::<T>()
+            && config.version().gas_params
+                == *self
+                    .inner
+                    .gas_params
+                    .as_ref()
+                    .unwrap_or(&evm2::Version::base(config.base_spec_id()).gas_params)
+            && self.opcodes_match(config)
+    }
+
+    /// Checks the active opcode config against the host's opcode table.
+    fn opcodes_match<T: evm2::EvmTypesHost>(&self, config: &evm2::ExecutionConfig<T>) -> bool {
+        let active = config.opcode_config();
+        // The verdict depends on the base spec too. Addresses leave the top byte free.
+        let address =
+            active as *const evm2::OpcodeConfig<T> as u64 | (config.base_spec_id() as u64) << 56;
+        if self.inner.verified_opcodes.load(Ordering::Relaxed) == address {
+            return true;
+        }
+        if self.inner.rejected_opcodes.load(Ordering::Relaxed) == address {
+            return false;
+        }
+        let matches = match &self.inner.host.opcodes {
+            None => config.has_base_opcode_table(),
+            Some(opcodes) => {
+                // SAFETY: The caller checked that the host type is `T`, so `opcodes.config` is a
+                // `&'static OpcodeConfig<T>`.
+                active.same_table(unsafe { &*(opcodes.config as *const evm2::OpcodeConfig<T>) })
+            }
+        };
+        let cache =
+            if matches { &self.inner.verified_opcodes } else { &self.inner.rejected_opcodes };
+        cache.store(address, Ordering::Relaxed);
+        matches
     }
 
     /// Looks up a compiled function for the given request.
@@ -600,6 +655,7 @@ impl JitBackend {
         info!(count = artifacts.len(), "loading AOT artifacts");
 
         let config_hash = storage::compile_config_hash(config);
+        let mut linker = JitObjectLinker::new(config.host.resolver);
         let mut out: Vec<(RuntimeCacheKey, Arc<CompiledProgram>)> =
             Vec::with_capacity(artifacts.len());
         let mut loaded = 0u64;
@@ -620,7 +676,7 @@ impl JitBackend {
                 continue;
             }
 
-            match Self::load_artifact(&artifact_key, &stored) {
+            match linker.link_stored(key, &stored) {
                 Ok(program) => {
                     out.push((key, Arc::new(program)));
                     loaded += 1;
@@ -638,22 +694,6 @@ impl JitBackend {
 
         info!(loaded, failed, skipped, "AOT preload complete");
         Ok(out)
-    }
-
-    /// Loads a single artifact: `dlopen`s the dylib path and resolves the symbol.
-    fn load_artifact(key: &ArtifactKey, stored: &StoredArtifact) -> eyre::Result<CompiledProgram> {
-        let library = unsafe { libloading::Library::new(&stored.dylib_path) }
-            .wrap_err_with(|| format!("dlopen {:?}", stored.dylib_path))?;
-
-        let func: EvmCompilerFn = unsafe {
-            let sym: libloading::Symbol<'_, EvmCompilerFn> = library
-                .get(stored.manifest.symbol_name.as_bytes())
-                .wrap_err_with(|| format!("symbol '{}'", stored.manifest.symbol_name))?;
-            *sym
-        };
-
-        let library = Arc::new(LoadedLibrary::new(library));
-        Ok(CompiledProgram::new_aot(key.runtime, func, library))
     }
 
     /// Applies a clear before startup, or queues it after the backend takes ownership.

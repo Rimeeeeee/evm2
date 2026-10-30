@@ -122,7 +122,16 @@ pub trait Host<T: EvmTypesHost> {
     fn execution_config(&self) -> &ExecutionConfig<T>;
 
     /// Returns the block environment.
+    ///
+    /// Compiled code keeps a pointer to the returned environment for the whole run, so the host
+    /// must keep it at a stable address and unchanged while the interpreter runs.
     fn block_env(&mut self) -> &BlockEnv<T>;
+
+    /// Returns the transaction environment.
+    ///
+    /// Compiled code keeps a pointer to the returned environment for the whole run, so the host
+    /// must keep it at a stable address while the interpreter runs.
+    fn tx_env(&mut self) -> &TxEnv<T>;
 
     /// Loads account information.
     fn load_account(
@@ -174,7 +183,6 @@ pub trait Host<T: EvmTypesHost> {
     /// Executes a message inside this host.
     fn execute_message(
         &mut self,
-        tx_env: &TxEnv<T>,
         message: &mut Message<T>,
     ) -> Result<MessageResult<T>, ExecutionError>;
 
