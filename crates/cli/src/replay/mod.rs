@@ -467,7 +467,7 @@ fn ggas(gas_used: u128) -> f64 {
 
 #[cfg(test)]
 mod collect_tests {
-    use super::*;
+    use super::collect_json_files;
     use std::{
         fs,
         sync::atomic::{AtomicUsize, Ordering},
@@ -510,6 +510,9 @@ mod collect_tests {
 
     #[test]
     fn file_filter_matches_path_or_file_name() {
+        use super::{NameFilter, file_selected};
+        use std::path::Path;
+
         let path = Path::new("test-fixtures/frontier/create/create_one_byte.json");
 
         // An empty filter selects everything.
@@ -525,7 +528,10 @@ mod collect_tests {
 
 #[cfg(all(test, feature = "jit"))]
 mod tests {
-    use super::*;
+    use super::{
+        BlockchainTestExecutionMode, Replay, StateTestExecutionMode,
+        replay_blockchain_execution_mode, replay_state_execution_mode,
+    };
     use std::path::PathBuf;
 
     fn replay(jit: bool, aot: bool) -> Replay {

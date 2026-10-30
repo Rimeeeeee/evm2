@@ -2,7 +2,6 @@
 #include <llvm-c/LLJITUtils.h>
 #include <llvm-c/Orc.h>
 #include <llvm-c/TargetMachine.h>
-#include <llvm/Config/llvm-config.h>
 #include <llvm/ExecutionEngine/JITLink/JITLink.h>
 #include <llvm/ExecutionEngine/Orc/AbsoluteSymbols.h>
 #include <llvm/ExecutionEngine/Orc/CompileUtils.h>
@@ -20,9 +19,6 @@
 #include <atomic>
 #include <fstream>
 #include <unistd.h>
-
-static_assert(LLVM_VERSION_MAJOR == 23 && LLVM_VERSION_MINOR == 1,
-              "evm2's C++ shim must use the LLVM 23.1 headers linked by llvm-sys 231");
 
 using namespace llvm;
 

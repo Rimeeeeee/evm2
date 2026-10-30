@@ -23,7 +23,7 @@ env:
 jobs:
   smoke:
     name: smoke (${{ matrix.dispatch_backend }})
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-latest
     timeout-minutes: 20
     permissions:
       id-token: write

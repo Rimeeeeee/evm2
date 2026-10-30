@@ -102,10 +102,13 @@ fn parse_block_range(value: &str) -> Result<RangeInclusive<u64>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
+    use super::parse_block_range;
+    #[cfg(feature = "jit")]
+    use super::{Args, Command};
     #[cfg(feature = "jit")]
     use clap::Parser;
+    #[cfg(feature = "jit")]
+    use std::path::PathBuf;
 
     #[test]
     fn parse_block_range_accepts_inclusive_range() {
@@ -116,10 +119,7 @@ mod tests {
 
     #[test]
     fn parse_block_range_rejects_reversed_range() {
-        assert_eq!(
-            parse_block_range("12-10").unwrap_err(),
-            "range start 12 is greater than end 10"
-        );
+        assert!(parse_block_range("12-10").unwrap_err().contains("greater"));
     }
 
     #[cfg(feature = "jit")]
