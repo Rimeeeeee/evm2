@@ -554,6 +554,10 @@ mod tests {
             &self.block
         }
 
+        fn tx_env(&mut self) -> &TxEnv<TestTypes> {
+            unimplemented!()
+        }
+
         fn load_account(
             &mut self,
             _address: &Address,
@@ -608,7 +612,6 @@ mod tests {
 
         fn execute_message(
             &mut self,
-            _tx_env: &TxEnv<TestTypes>,
             _message: &mut Message<TestTypes>,
         ) -> Result<MessageResult<TestTypes>, crate::ExecutionError> {
             unimplemented!()

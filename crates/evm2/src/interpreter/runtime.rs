@@ -5,7 +5,6 @@ use super::{
 use crate::{
     EvmTypesHost, ExecutionConfig, ExecutionError, HostError, SpecId, Version,
     bytecode::Bytecode,
-    env::TxEnv,
     evm::inspector::Inspector,
     interpreter::dispatch,
     trustme,
@@ -19,17 +18,18 @@ use derive_where::derive_where;
 /// EVM interpreter.
 #[derive_where(Debug)]
 pub struct Interpreter<'frame, 'host, T: EvmTypesHost> {
-    pub(in crate::interpreter) bytecode: Bytecode,
-    // Borrows the immutable allocations owned by `bytecode`. Cleared before replacing it;
-    // accessors must shorten the erased lifetime to the borrow of this interpreter.
+    // Borrowed from the frame's message rather than cloned: a per-frame `Arc` clone writes the
+    // shared refcount next to the read-mostly bytecode, which bounces between last-level caches
+    // when threads on several of them run the same contracts.
+    pub(in crate::interpreter) bytecode: &'frame Bytecode,
+    // Borrows the immutable allocations of `bytecode`. Cleared before replacing it; accessors
+    // must shorten the erased lifetime to the borrow of this interpreter.
     bytecode_ref: Option<BytecodeRef<'static>>,
     pub(in crate::interpreter) memory: Memory,
     pub(in crate::interpreter) return_data: Bytes,
 
     pub(in crate::interpreter) pc: *const u8,
     output: Range<u32>,
-    #[derive_where(skip)]
-    tx_env: Option<&'frame TxEnv<T>>,
     #[derive_where(skip)]
     message: Option<&'frame Message<T>>,
     host: Option<NonNull<T::Host<'host>>>,
@@ -39,35 +39,36 @@ pub struct Interpreter<'frame, 'host, T: EvmTypesHost> {
     pub(in crate::interpreter) stack: Box<StackBacking>,
 
     pub(in crate::interpreter) gas: Gas,
+    /// Remaining gas plus spilled state gas at the start of the current inspected step.
+    step_gas_before: u64,
+    /// Remaining gas plus spilled state gas once the current step finished charging, if it
+    /// marked that point.
+    step_gas_after_charge: Option<u64>,
     pub(in crate::interpreter) result: Result,
     error: Option<ExecutionError>,
-    step_gas_before: u64,
-    failed_charge: Option<u64>,
     spec: SpecId,
     features: EvmFeatures,
     is_static: bool,
 }
 
 // SAFETY: The interpreter's internal pointers are always valid. `pc` and `bytecode_ref` point into
-// immutable owned bytecode and its jump table. Frame-local references are cleared before pooling,
-// and host/inspector pointers are installed for
+// the frame's immutable bytecode and its jump table. Frame-local references are cleared before
+// pooling, and host/inspector pointers are installed for
 // execution and not used after the owning execution context is gone. The `Sync` bounds make the
 // retained shared frame references safe to transfer between threads.
 unsafe impl<T> Send for Interpreter<'_, '_, T>
 where
     T: EvmTypesHost,
     T::MessageExt: Sync,
-    T::TxEnvExt: Sync,
 {
 }
 
 impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
-    /// Creates an interpreter from a transaction-global environment and a frame-local message,
-    /// which carries the bytecode to run.
-    pub fn new(tx_env: &'frame TxEnv<T>, message: &'frame Message<T>) -> Self {
+    /// Creates an interpreter from a frame-local message, which carries the bytecode to run.
+    pub fn new(message: &'frame Message<T>) -> Self {
         // SAFETY: Calling init right after.
         let mut interp = unsafe { Self::uninit() };
-        interp.init(tx_env, message);
+        interp.init(message);
         interp
     }
 
@@ -75,20 +76,19 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     ///
     /// Must call `init` before use.
     unsafe fn uninit() -> Self {
-        let bytecode = Bytecode::new();
+        let bytecode = <&Bytecode>::default();
         Self {
             pc: bytecode.original_byte_slice().as_ptr(),
             bytecode,
             bytecode_ref: None,
             stack_len: 0,
             gas: Gas::new(0),
+            step_gas_before: 0,
+            step_gas_after_charge: None,
             memory: Memory::new(),
             result: Ok(()),
             error: None,
-            step_gas_before: 0,
-            failed_charge: None,
             output: 0..0,
-            tx_env: None,
             message: None,
             is_static: false,
             return_data: Bytes::new(),
@@ -102,29 +102,31 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     }
 
     /// Initializes this interpreter for a new frame, retaining reusable allocations.
-    fn init(&mut self, tx_env: &'frame TxEnv<T>, message: &'frame Message<T>) {
-        let bytecode = message.code.clone();
+    fn init(&mut self, message: &'frame Message<T>) {
         let gas_limit = message.gas_limit;
         let is_static = message.is_static();
-        self.pc = bytecode.bytes_slice().as_ptr();
-        self.bytecode_ref = None;
-        self.bytecode = bytecode;
+        self.set_bytecode(&message.code);
         self.stack_len = 0;
         self.gas = Gas::new_with_execution_gas_and_reservoir(gas_limit, message.reservoir);
         self.memory.clear();
         self.result = Ok(());
         self.error = None;
-        self.step_gas_before = 0;
-        self.failed_charge = None;
         self.output = 0..0;
-        self.tx_env = Some(tx_env);
         self.message = Some(message);
         self.is_static = is_static;
         self.return_data = Bytes::new();
     }
 
-    pub(crate) const fn clear_frame_refs(&mut self) {
-        self.tx_env = None;
+    /// Points the interpreter at `bytecode` and resets the program counter and the cached view.
+    pub(crate) fn set_bytecode(&mut self, bytecode: &'frame Bytecode) {
+        self.pc = bytecode.bytes_slice().as_ptr();
+        self.bytecode_ref = None;
+        self.bytecode = bytecode;
+    }
+
+    pub(crate) fn clear_frame_refs(&mut self) {
+        self.bytecode = Default::default();
+        self.bytecode_ref = None;
         self.message = None;
         self.host = None;
         self.inspector = None;
@@ -183,7 +185,7 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     /// Returns the active bytecode.
     #[inline]
     pub fn bytecode(&self) -> BytecodeRef<'_> {
-        self.bytecode_ref.unwrap_or_else(|| BytecodeRef::new(&self.bytecode))
+        self.bytecode_ref.unwrap_or_else(|| BytecodeRef::new(self.bytecode))
     }
 
     /// Returns the original active bytecode bytes.
@@ -234,6 +236,26 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
         self.gas = gas;
     }
 
+    /// Returns the execution gas the current step charged, before its effects.
+    ///
+    /// This is the gas remaining at the start of the step minus the gas remaining once the step
+    /// finished charging, leaving out state gas that spills into the remaining gas because the
+    /// reservoir was short or is refilled from it. State gas is not part of the execution cost;
+    /// [`Gas::state_gas_spent`] reports it. Call and create steps finish charging right before
+    /// they hand gas to the child, so their cost includes the forwarded gas for calls and
+    /// excludes it for creates. Any other step finishes charging when it ends, which makes its
+    /// cost the execution gas it consumed.
+    ///
+    /// Only meaningful in [`Inspector::step_end`](crate::inspector::Inspector::step_end).
+    #[inline]
+    pub const fn step_cost(&self) -> u64 {
+        let after = match self.step_gas_after_charge {
+            Some(after) => after,
+            None => self.gas.remaining_excluding_state_spill(),
+        };
+        self.step_gas_before.saturating_sub(after)
+    }
+
     /// Returns the current linear memory.
     #[inline]
     pub const fn memory(&self) -> &Memory {
@@ -258,15 +280,6 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
         self.result = result;
     }
 
-    /// Returns the execution gas the current step attempted to charge when it ran out of gas.
-    ///
-    /// Only set during an inspector's `step_end`, where the remaining gas has already been
-    /// zeroed after the failed charge.
-    #[inline]
-    pub const fn failed_charge(&self) -> Option<u64> {
-        self.failed_charge
-    }
-
     /// Sets the current instruction result to `stop`.
     #[inline]
     pub const fn set_stop(&mut self, stop: InstrStop) {
@@ -284,13 +297,6 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     #[doc(hidden)]
     pub const fn message_field_offset_for_jit() -> usize {
         core::mem::offset_of!(Self, message)
-    }
-
-    /// Returns the cached transaction-global environment.
-    #[inline]
-    pub const fn tx_env(&self) -> &'frame TxEnv<T> {
-        // SAFETY: `tx_env` is initialized before execution starts.
-        unsafe { self.tx_env.unwrap_unchecked() }
     }
 
     /// Returns return data from the last call-like operation.
@@ -426,10 +432,11 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
     #[doc(hidden)]
     pub fn prepare_run(&mut self, host: &mut T::Host<'host>) {
         if self.bytecode_ref.is_none() {
-            // SAFETY: The view borrows immutable allocations retained by our owned `Bytecode`,
-            // so moving the interpreter does not invalidate it. `init` clears the view before
-            // replacing the owner, and accessors tie the returned view to `&self`.
-            let bytecode = unsafe { trustme::decouple_lt(&self.bytecode) };
+            // SAFETY: The view borrows immutable allocations of the frame's `Bytecode`, which
+            // outlives the interpreter's `'frame` borrow, so moving the interpreter does not
+            // invalidate it. `init` and `clear_frame_refs` clear the view before replacing the
+            // borrow, and accessors tie the returned view to `&self`.
+            let bytecode = unsafe { trustme::decouple_lt(self.bytecode) };
             self.bytecode_ref = Some(BytecodeRef::new(bytecode));
         }
         self.gas.tracker_mut().set_isolated_state(host.frame_transaction_active());
@@ -440,6 +447,53 @@ impl<'frame, 'host, T: EvmTypesHost> Interpreter<'frame, 'host, T> {
         self.features = version.features;
         self.host = Some(NonNull::from(host));
         self.inspector = None;
+    }
+
+    /// Runs the host's instruction implementation for the opcode at `pc` on the interpreter
+    /// stack, which holds `stack_len` words, and returns the new stack length.
+    ///
+    /// Gas is read from and written to this interpreter, so the caller must keep it current.
+    ///
+    /// # Safety
+    ///
+    /// The first `stack_len` words of the stack must be initialized.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`prepare_run`](Self::prepare_run) has not run, or if `pc` or `stack_len` is out
+    /// of bounds.
+    #[doc(hidden)]
+    pub unsafe fn run_external_instruction(
+        &mut self,
+        pc: usize,
+        stack_len: usize,
+    ) -> core::result::Result<usize, InstrStop> {
+        let bytecode = self.bytecode_ref.expect("`prepare_run` must precede external instructions");
+        assert!(pc < self.bytecode.original_byte_slice().len(), "pc out of bounds");
+        assert!(stack_len <= StackMut::CAPACITY, "stack length out of bounds");
+        let host = self.host.expect("`prepare_run` must precede external instructions");
+        // SAFETY: `prepare_run` installed the host, which outlives the run.
+        let config = unsafe { host.as_ref() }.execution_config();
+        // SAFETY: `pc` is in bounds.
+        let mut pc = Pc::new(unsafe { bytecode.as_ptr().add(pc) });
+        let instr = config.opcode_config().instruction(pc.op()).instr;
+        self.stack_len = stack_len;
+        let this: *mut Self = self;
+        // SAFETY: Instructions must not access the stack through `InterpreterState` while the
+        // separate stack view is live, as in the dispatch loop.
+        let (state, mut stack) = unsafe {
+            (
+                InterpreterState::wrap_mut(&mut *this),
+                StackMut { stack: &mut (*this).stack, len: &mut (*this).stack_len },
+            )
+        };
+        let start = pc.as_ptr();
+        instr(&mut pc, stack.reborrow(), state)?;
+        // Compiled code continues at the next instruction.
+        if pc.as_ptr() != start {
+            return Err(InstrStop::FatalExternalError);
+        }
+        Ok(self.stack_len)
     }
 
     #[inline(never)]
@@ -530,14 +584,6 @@ impl<'frame, 'host, T: EvmTypesHost> InterpreterState<'frame, 'host, T> {
     pub(crate) const fn set_pc_stack_len(&mut self, pc: *const u8, stack_len: usize) {
         self.0.pc = pc;
         self.0.stack_len = stack_len;
-    }
-
-    /// Returns the cached transaction-global environment.
-    #[inline]
-    pub const fn tx(&self) -> &'frame TxEnv<T> {
-        // SAFETY: `tx_env` is initialized at the beginning of `run` and remains set for
-        // instruction execution.
-        unsafe { self.0.tx_env.unwrap_unchecked() }
     }
 
     /// Returns the active base specification ID.
@@ -659,12 +705,12 @@ impl<'frame, 'host, T: EvmTypesHost> InterpreterState<'frame, 'host, T> {
     pub(crate) fn inspect_step(&mut self, pc: Pc, stack_len: usize) {
         self.0.pc = pc.as_ptr();
         self.0.stack_len = stack_len;
+        self.0.step_gas_before = self.0.gas.remaining_excluding_state_spill();
+        self.0.step_gas_after_charge = None;
         unsafe {
             let mut inspector = self.0.inspector.unwrap_unchecked();
             inspector.as_mut().step(&mut self.0);
         }
-        self.0.step_gas_before = self.0.gas.remaining();
-        self.0.failed_charge = None;
     }
 
     #[inline]
@@ -673,8 +719,6 @@ impl<'frame, 'host, T: EvmTypesHost> InterpreterState<'frame, 'host, T> {
         self.0.stack_len = stack_len;
         if self.0.result.is_err_and(InstrStop::is_out_of_gas) {
             cold_path();
-            self.0.failed_charge =
-                Some(self.0.step_gas_before.wrapping_sub(self.0.gas.remaining()));
             // Failed charges may leave a wrapped counter until frame settlement.
             self.0.gas.set_remaining(0);
         }
@@ -682,6 +726,13 @@ impl<'frame, 'host, T: EvmTypesHost> InterpreterState<'frame, 'host, T> {
             let mut inspector = self.0.inspector.unwrap_unchecked();
             inspector.as_mut().step_end(&mut self.0);
         }
+    }
+
+    /// Marks that the current step finished charging gas, so [`Interpreter::step_cost`] stops
+    /// counting gas after this point.
+    #[inline]
+    pub(crate) const fn finish_step_charge(&mut self, gas: &Gas) {
+        self.0.step_gas_after_charge = Some(gas.remaining_excluding_state_spill());
     }
 
     #[inline]
@@ -712,15 +763,14 @@ impl<T: EvmTypesHost> InterpreterPool<T> {
 
     pub(crate) fn pop<'frame, 'host>(
         &mut self,
-        tx_env: &'frame TxEnv<T>,
         message: &'frame Message<T>,
     ) -> Box<Interpreter<'frame, 'host, T>> {
         let frame = match self.frames.pop() {
             Some(mut frame) => {
-                frame.init(tx_env, message);
+                frame.init(message);
                 frame
             }
-            None => Box::new(Interpreter::new(tx_env, message)),
+            None => Box::new(Interpreter::new(message)),
         };
         // SAFETY: Frames stored in the pool have their frame-local references cleared before they
         // are erased to `'static`. Rebinding the lifetime is only used to initialize the next
@@ -753,13 +803,12 @@ impl<T: EvmTypesHost> InterpreterPool<T> {
 #[cfg(test)]
 mod owned_error_tests {
     use super::*;
-    use crate::{DatabaseError, env::TxEnvExt, interpreter::MessageExt, test_utils::TestTypes};
+    use crate::{DatabaseError, interpreter::MessageExt, test_utils::TestTypes};
 
     #[test]
     fn owned_error_is_taken_on_exit() {
-        let tx = TxEnvExt::default();
         let message = MessageExt::default();
-        let mut interpreter = Interpreter::<TestTypes>::new(&tx, &message);
+        let mut interpreter = Interpreter::<TestTypes>::new(&message);
         let error = DatabaseError::new(core::fmt::Error, false);
         let stop = interpreter.fail(error.clone());
         let result = interpreter.finish_run(stop);

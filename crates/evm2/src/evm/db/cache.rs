@@ -165,7 +165,7 @@ impl<ExtDB> CacheDB<ExtDB> {
             let overlay = &entry.storage;
             // Like revm's in-block cache, later transactions read the unchanged slots of a created
             // account as zero, without a storage wipe reaching the state stream.
-            let wiped = overlay.wiped || entry.just_created;
+            let wiped = overlay.wiped || entry.discards_storage();
             let mut changed_slots = overlay.changed_slots().peekable();
             if wiped || changed_slots.peek().is_some() {
                 let storage = self.cache.storage.entry(address).or_default();
@@ -250,6 +250,19 @@ impl<ExtDB> CacheDB<ExtDB> {
     #[inline]
     pub fn insert_block_hash(&mut self, number: &Word, hash: &B256) {
         self.cache.block_hashes.insert(*number, *hash);
+    }
+
+    /// Checks that the attached read BAL, if any, covers storage slot `key`.
+    ///
+    /// Used by reads that know the slot's value without consulting storage, such as a slot of an
+    /// account created in the transaction, so they keep the coverage check of
+    /// [`DynDatabase::get_storage`].
+    #[inline]
+    pub(crate) fn check_bal_storage(&self, address: &Address, key: &Word) -> DbResult<()> {
+        match self.bal_context.bal_storage(address, key) {
+            Ok(_) => Ok(()),
+            Err(err) => Err(DatabaseError::new(err, false)),
+        }
     }
 }
 

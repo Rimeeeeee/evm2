@@ -8,7 +8,7 @@ use alloy_eips::eip8141::{
 };
 use alloy_primitives::{Address, Bytes, TxKind, U256};
 use evm2::{
-    Precompiles, SpecId, TxResultWithState,
+    BaseEvmTypes, Evm, Precompiles, SpecId, TxResultWithState,
     bytecode::Bytecode,
     env::BlockEnvExt,
     ethereum::{TxEnvelope, ethereum_tx_registry},

@@ -16,7 +16,7 @@ use core::{
 };
 pub use evm2::interpreter::{Gas, InstrStop, Memory};
 use evm2::{
-    BaseEvmTypes, SpecId,
+    BaseEvmTypes, EvmTypesHost, SpecId,
     env::{BlockEnv, TxEnv},
     interpreter::{Host, Interpreter, Message},
     version::{EvmFeatures, GasParams},
@@ -35,7 +35,7 @@ pub use arch::evm2_jit_exit;
 /// This struct uses `#[repr(C)]` to ensure a stable field layout since the JIT compiler
 /// generates code that accesses fields by offset using `offset_of!`.
 #[repr(C)]
-pub struct EvmContext<'ctx, 'frame, 'host> {
+pub struct EvmContext<'ctx, 'frame, 'host, T: EvmTypesHost = BaseEvmTypes> {
     /// The gas.
     ///
     /// First, so compiled code addresses the remaining gas through the context pointer
@@ -43,7 +43,7 @@ pub struct EvmContext<'ctx, 'frame, 'host> {
     pub gas: Gas,
 
     /// Active interpreter frame.
-    pub interpreter: NonNull<Interpreter<'frame, 'host, BaseEvmTypes>>,
+    pub interpreter: NonNull<Interpreter<'frame, 'host, T>>,
 
     /// The size of return data from the last call-like operation.
     pub return_data_len: usize,
@@ -63,25 +63,23 @@ pub struct EvmContext<'ctx, 'frame, 'host> {
     pub mem_len: usize,
 
     /// The host's block environment, cached for block opcodes.
-    pub block_env: NonNull<BlockEnv<BaseEvmTypes>>,
-    /// The transaction environment, cached for transaction opcodes.
-    pub tx_env: &'frame TxEnv<BaseEvmTypes>,
+    pub block_env: NonNull<BlockEnv<T>>,
+    /// The host's transaction environment, cached for transaction opcodes.
+    pub tx_env: NonNull<TxEnv<T>>,
 
-    _marker: PhantomData<&'ctx mut Interpreter<'frame, 'host, BaseEvmTypes>>,
+    _marker: PhantomData<&'ctx mut Interpreter<'frame, 'host, T>>,
 }
 
-impl fmt::Debug for EvmContext<'_, '_, '_> {
+impl<T: EvmTypesHost> fmt::Debug for EvmContext<'_, '_, '_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EvmContext").field("memory", &self.memory()).finish_non_exhaustive()
     }
 }
 
-impl<'ctx, 'frame, 'host> EvmContext<'ctx, 'frame, 'host> {
+impl<'ctx, 'frame, 'host, T: EvmTypesHost> EvmContext<'ctx, 'frame, 'host, T> {
     /// Creates a new context from an interpreter.
     #[inline]
-    pub fn from_interpreter(
-        interpreter: &'ctx mut Interpreter<'frame, 'host, BaseEvmTypes>,
-    ) -> Self {
+    pub fn from_interpreter(interpreter: &'ctx mut Interpreter<'frame, 'host, T>) -> Self {
         unsafe { Self::from_interpreter_with_stack(interpreter).0 }
     }
 
@@ -93,12 +91,12 @@ impl<'ctx, 'frame, 'host> EvmContext<'ctx, 'frame, 'host> {
     /// the first `stack_len` words are initialized before accessing the interpreter stack.
     #[inline]
     pub unsafe fn from_interpreter_with_stack(
-        interpreter: &'ctx mut Interpreter<'frame, 'host, BaseEvmTypes>,
+        interpreter: &'ctx mut Interpreter<'frame, 'host, T>,
     ) -> (Self, &'ctx mut EvmStack, &'ctx mut usize) {
         let interpreter_ptr = ptr::from_mut(&mut *interpreter);
         let interpreter_ptr = unsafe { NonNull::new_unchecked(interpreter_ptr) };
         let block_env = NonNull::from(interpreter.host().block_env());
-        let tx_env = interpreter.tx_env();
+        let tx_env = NonNull::from(interpreter.host().tx_env());
         let message = interpreter.message();
         let gas = interpreter.gas();
         let calldatasize = message.input.len();
@@ -131,13 +129,13 @@ impl<'ctx, 'frame, 'host> EvmContext<'ctx, 'frame, 'host> {
 
     /// Returns the active interpreter frame.
     #[inline]
-    pub const fn interpreter(&self) -> &Interpreter<'frame, 'host, BaseEvmTypes> {
+    pub const fn interpreter(&self) -> &Interpreter<'frame, 'host, T> {
         unsafe { self.interpreter.as_ref() }
     }
 
     /// Returns the active interpreter frame mutably.
     #[inline]
-    pub const fn interpreter_mut(&mut self) -> &mut Interpreter<'frame, 'host, BaseEvmTypes> {
+    pub const fn interpreter_mut(&mut self) -> &mut Interpreter<'frame, 'host, T> {
         unsafe { self.interpreter.as_mut() }
     }
 
@@ -166,7 +164,7 @@ impl<'ctx, 'frame, 'host> EvmContext<'ctx, 'frame, 'host> {
 
     /// Returns host state consumed by host-touching builtins.
     #[inline]
-    pub fn host(&mut self) -> &mut (impl Host<BaseEvmTypes> + '_) {
+    pub const fn host(&mut self) -> &mut T::Host<'host> {
         self.interpreter_mut().host()
     }
 
@@ -178,14 +176,14 @@ impl<'ctx, 'frame, 'host> EvmContext<'ctx, 'frame, 'host> {
 
     /// Returns the current block environment.
     #[inline]
-    pub const fn block_env(&self) -> &BlockEnv<BaseEvmTypes> {
+    pub const fn block_env(&self) -> &BlockEnv<T> {
         unsafe { self.block_env.as_ref() }
     }
 
-    /// Returns the transaction-global environment.
+    /// Returns the current transaction environment.
     #[inline]
-    pub const fn tx_env(&self) -> &'frame TxEnv<BaseEvmTypes> {
-        self.tx_env
+    pub const fn tx_env(&self) -> &TxEnv<T> {
+        unsafe { self.tx_env.as_ref() }
     }
 
     /// Returns active runtime version data.
@@ -214,7 +212,7 @@ impl<'ctx, 'frame, 'host> EvmContext<'ctx, 'frame, 'host> {
 
     /// Returns the active frame-local call/create message.
     #[inline]
-    pub const fn message(&self) -> &'frame Message<BaseEvmTypes> {
+    pub const fn message(&self) -> &'frame Message<T> {
         self.interpreter().message()
     }
 
@@ -346,9 +344,9 @@ impl EvmCompilerFn {
     /// The caller must ensure that the function is safe to call for this interpreter state, and
     /// that the remaining gas is at most `i64::MAX`.
     #[inline]
-    pub unsafe fn call_with_interpreter<'ctx, 'frame, 'host>(
+    pub unsafe fn call_with_interpreter<'ctx, 'frame, 'host, T: EvmTypesHost>(
         self,
-        interpreter: &'ctx mut Interpreter<'frame, 'host, BaseEvmTypes>,
+        interpreter: &'ctx mut Interpreter<'frame, 'host, T>,
     ) -> InstrStop {
         let (mut ecx, stack, stack_len) =
             unsafe { EvmContext::from_interpreter_with_stack(interpreter) };
@@ -374,9 +372,9 @@ impl EvmCompilerFn {
     /// The caller must ensure that the arguments are valid, that the function is safe to call, and
     /// that the remaining gas is at most `i64::MAX`.
     #[inline]
-    pub unsafe fn call(
+    pub unsafe fn call<T: EvmTypesHost>(
         self,
-        ecx: &mut EvmContext<'_, '_, '_>,
+        ecx: &mut EvmContext<'_, '_, '_, T>,
         stack: &mut EvmStack,
         stack_len: &mut usize,
     ) -> InstrStop {
@@ -398,9 +396,9 @@ impl EvmCompilerFn {
     ///
     /// See [`call`](Self::call).
     #[inline(never)]
-    pub unsafe fn call_noinline(
+    pub unsafe fn call_noinline<T: EvmTypesHost>(
         self,
-        ecx: &mut EvmContext<'_, '_, '_>,
+        ecx: &mut EvmContext<'_, '_, '_, T>,
         stack: &mut EvmStack,
         stack_len: &mut usize,
     ) -> InstrStop {
@@ -833,7 +831,7 @@ mod tests {
     use evm2::{
         DatabaseError, Evm, ExecutionError, InterpreterRunner,
         bytecode::Bytecode,
-        env::{BlockEnvExt, TxEnvExt},
+        env::BlockEnvExt,
         evm::{EmptyDB, precompile::NoPrecompiles},
         interpreter::MessageExt,
         registry::TxRegistry,
@@ -866,7 +864,6 @@ mod tests {
                 .interpreter_mut()
                 .fail(DatabaseError::new(core::fmt::Error, false))
         }
-        let tx = TxEnvExt::default();
         let mut message = MessageExt {
             gas_limit: 30_000,
             code: Bytecode::new_legacy(Bytes::from_static(&[0x00])),
@@ -880,12 +877,12 @@ mod tests {
             NoPrecompiles::default(),
         );
         host.set_interpreter_runner(TestRunner(EvmCompilerFn::new(fail)));
-        let error = host.execute_message(&tx, &mut message).unwrap_err();
+        let error = host.execute_message(&mut message).unwrap_err();
         let ExecutionError::Database(error) = error else { panic!("expected database error") };
         assert!(!error.is_fatal());
         assert!(error.downcast_ref::<core::fmt::Error>().is_some());
         host.set_interpreter_runner(TestRunner(EvmCompilerFn::new(__test_fn)));
-        assert_eq!(host.execute_message(&tx, &mut message).unwrap().stop, InstrStop::Stop);
+        assert_eq!(host.execute_message(&mut message).unwrap().stop, InstrStop::Stop);
     }
 
     #[test]

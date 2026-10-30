@@ -17,7 +17,7 @@ impl FrameDiff {
     pub(super) fn capture(state: &State<'_>) -> Self {
         let mut diff = Self::default();
         let absent = AccountInfo::default();
-        for a in state.transaction_account_changes() {
+        for a in state.transaction_changes().account_changes() {
             let before = a.original.unwrap_or(&absent);
             let after = a.current.unwrap_or(&absent);
             if before.nonce != after.nonce {
@@ -194,7 +194,7 @@ mod tests {
         host.frame_tx = Some(runtime);
         for selector in [0, 1, 2, 3, 0x11] {
             assert_eq!(host.txtrace(U256::from(selector), U256::ZERO), Some(U256::ZERO));
-            assert_eq!(host.state.transaction_account_changes().count(), 0);
+            assert_eq!(host.state.transaction_changes().account_changes().count(), 0);
             assert!(!host.state.is_storage_warm(&address, &slot));
         }
     }

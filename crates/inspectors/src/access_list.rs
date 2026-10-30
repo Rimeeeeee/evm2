@@ -146,7 +146,9 @@ impl<T: EvmTypes> Inspector<T> for AccessListInspector {
                 }
             }
             op::DELEGATECALL | op::CALL | op::STATICCALL | op::CALLCODE => {
-                if let Some([_, slot]) = interp.stack().peekn() {
+                // `go-ethereum` reads the target once five items are on the stack, even if the call
+                // then underflows.
+                if let Some([_, slot, _, _, _]) = interp.stack().peekn() {
                     let addr = Address::from_word(B256::from(slot.to_be_bytes()));
                     if !self.excluded.contains(&addr) {
                         self.touched_slots.entry(addr).or_default();
@@ -163,7 +165,7 @@ impl<T: EvmTypes> Inspector<T> for AccessListInspector {
         message: &mut Message<T>,
     ) -> Option<MessageResult<T>> {
         // At the top-level frame, fill the excluded addresses.
-        if message.depth == 0 {
+        if message.depth == interp.version().initial_call_depth {
             self.collect_excluded_addresses(message, interp.host());
         }
         None
@@ -175,7 +177,7 @@ impl<T: EvmTypes> Inspector<T> for AccessListInspector {
         message: &mut Message<T>,
     ) -> Option<MessageResult<T>> {
         // At the top-level frame, fill the excluded addresses.
-        if message.depth == 0 {
+        if message.depth == interp.version().initial_call_depth {
             self.collect_excluded_addresses(message, interp.host());
         }
         None

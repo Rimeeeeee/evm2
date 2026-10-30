@@ -1243,7 +1243,7 @@ mod extensions {
     impl Inspector<CustomTypes> for Observe {
         fn initialize_interp(&mut self, interp: &mut Interpreter<'_, '_, CustomTypes>) {
             assert_eq!(interp.message().ext, Marker(77));
-            assert_eq!(interp.tx_env().ext, Marker(11));
+            assert_eq!(interp.host().tx_env().ext, Marker(11));
             assert_eq!(interp.host().block().ext, Marker(42));
             interp.host().ext_mut().initialized += 1;
         }
