@@ -67,6 +67,8 @@ pub enum SpecId {
     ///
     /// Activated at block TBD
     AMSTERDAM,
+    /// Bogota
+    BOGOTA,
 }
 
 impl SpecId {
@@ -78,7 +80,7 @@ impl SpecId {
 
     /// Latest known specification ID.
     #[doc(alias = "MAX")]
-    pub const NEXT: Self = Self::AMSTERDAM;
+    pub const NEXT: Self = Self::BOGOTA;
 
     /// Number of SpecId variants.
     pub const COUNT: usize = Self::NEXT as usize - Self::MIN as usize + 1;
@@ -181,6 +183,7 @@ macro_rules! for_each_spec {
             PRAGUE prague,
             OSAKA osaka,
             AMSTERDAM amsterdam,
+            BOGOTA bogota,
         }
     };
 }

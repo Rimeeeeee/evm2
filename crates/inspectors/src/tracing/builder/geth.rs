@@ -1,4 +1,5 @@
 //! Geth trace builder
+
 use crate::tracing::{
     final_refunded,
     tx_state::TxState,
@@ -149,15 +150,49 @@ impl<'a> GethTraceBuilder<'a> {
         struct_logs: &mut Vec<StructLog>,
         mut stacks: Option<&mut [StackSnapshots]>,
     ) {
+        let mut json_len = 0;
+        if main_trace_node.trace.frame_transaction_root {
+            for child in &main_trace_node.children {
+                self.fill_geth_trace_at_depth(
+                    &self.nodes[*child],
+                    opts,
+                    storage,
+                    struct_logs,
+                    &mut json_len,
+                    stacks.as_deref_mut(),
+                );
+            }
+            return;
+        }
+        self.fill_geth_trace_at_depth(
+            main_trace_node,
+            opts,
+            storage,
+            struct_logs,
+            &mut json_len,
+            stacks,
+        );
+    }
+
+    /// Flattens a real call subtree without counting the synthetic frame root as EVM depth.
+    fn fill_geth_trace_at_depth(
+        &self,
+        main_trace_node: &CallTraceNode,
+        opts: &GethDefaultTracingOptions,
+        storage: &mut HashMap<Address, BTreeMap<B256, B256>>,
+        struct_logs: &mut Vec<StructLog>,
+        json_len: &mut u64,
+        mut stacks: Option<&mut [StackSnapshots]>,
+    ) {
         // Suspend only the parent iterator when entering a child. Scratch space scales with
         // call depth rather than step count, and a trace without subcalls needs no allocation.
         let mut steps = main_trace_node.steps_with_children();
         let mut parents = Vec::new();
-        let mut json_len = 0u64;
+        let depth_offset = u64::from(!self.nodes[0].trace.frame_transaction_root);
 
         loop {
             // geth stops logging once the JSON written so far is over the limit.
-            if opts.limit.is_some_and(|limit| json_len > limit) {
+            if opts.limit.is_some_and(|limit| *json_len > limit) {
                 break;
             }
             let Some(CallTraceStepStackItem { trace_node, step, call_child_id }) = steps.next()
@@ -177,8 +212,11 @@ impl<'a> GethTraceBuilder<'a> {
             } else {
                 step.stack.as_deref().map(<[U256]>::to_vec)
             };
-            let mut log =
-                step.convert_to_geth_struct_log(opts, trace_node.trace.depth as u64 + 1, stack);
+            let mut log = step.convert_to_geth_struct_log(
+                opts,
+                trace_node.trace.depth as u64 + depth_offset,
+                stack,
+            );
 
             // geth snapshots the storage of the contract, with the slots of all its earlier
             // SLOADs and SSTOREs, unless the opcode fails before it runs.
@@ -197,7 +235,7 @@ impl<'a> GethTraceBuilder<'a> {
 
             // Add step to geth trace
             if opts.limit.is_some() {
-                json_len = json_len.saturating_add(struct_log_json_len(&log) as u64);
+                *json_len = json_len.saturating_add(struct_log_json_len(&log) as u64);
             }
             struct_logs.push(log);
 
@@ -318,8 +356,8 @@ impl<'a> GethTraceBuilder<'a> {
         let include_logs = opts.with_log.unwrap_or_default();
         // first fill up the root
         let main_trace_node = &self.nodes[0];
-        // Like any other failed call, a failed root drops its own logs.
-        let root_logs_visible = include_logs && !main_trace_node.trace.is_error();
+        let root_logs_visible = include_logs
+            && (main_trace_node.trace.frame_transaction_root || !main_trace_node.trace.is_error());
         let mut root_call_frame = main_trace_node.geth_empty_call_frame(root_logs_visible);
         root_call_frame.gas_used = U256::from(gas_used);
         if let Some(gas) = gas.filter(|_| self.is_eip8037_enabled()) {
@@ -329,6 +367,21 @@ impl<'a> GethTraceBuilder<'a> {
         }
 
         if opts.only_top_call.unwrap_or_default() {
+            if main_trace_node.trace.frame_transaction_root {
+                root_call_frame.calls = main_trace_node
+                    .children
+                    .iter()
+                    .map(|child| {
+                        let node = &self.nodes[*child];
+                        let mut call =
+                            node.geth_empty_call_frame(include_logs && !node.trace.is_error());
+                        for log in &mut call.logs {
+                            log.position = Some(0);
+                        }
+                        call
+                    })
+                    .collect();
+            }
             // No subcall frames are collected, so logs have no position relative to them.
             for log in &mut root_call_frame.logs {
                 log.position = Some(0);
@@ -433,6 +486,9 @@ impl<'a> GethTraceBuilder<'a> {
             }
             let code = if code_enabled { load_account_code(db, &db_acc)? } else { None };
             let mut acc_state = AccountState::from_account_info(db_acc.nonce, db_acc.balance, code);
+            if self.features.contains(EvmFeatures::EIP8298) {
+                acc_state.code_hash = (!db_acc.is_empty_code_hash()).then_some(db_acc.code_hash);
+            }
 
             // insert the original value of all loaded storage slots
             if storage_enabled {
@@ -482,6 +538,16 @@ impl<'a> GethTraceBuilder<'a> {
 
             let mut pre_state =
                 AccountState::from_account_info(db_acc.nonce, db_acc.balance, pre_code);
+            if self.features.contains(EvmFeatures::EIP8298) {
+                pre_state.code_hash = (!db_acc.is_empty_code_hash()).then_some(db_acc.code_hash);
+                // Empty hashes are omitted in prestate, but signal code removal in poststate.
+                post_state.code_hash =
+                    if !info.is_empty_code_hash() || pre_state.code_hash.is_some() {
+                        Some(info.code_hash)
+                    } else {
+                        None
+                    };
+            }
 
             // Geth reports `"code":"0x"` when the transaction clears the code the account had.
             if pre_state.code.is_some() && post_state.code.is_none() {
@@ -675,7 +741,7 @@ impl<'a> GethTraceBuilder<'a> {
             }
 
             let include_logs = include_logs
-                && !trace.is_error()
+                && (trace.frame_transaction_root || !trace.is_error())
                 && node.parent.is_none_or(|parent| frames[parent].logs_visible);
             let call_frame = if idx == 0 {
                 top_call.take().unwrap()
@@ -1020,6 +1086,48 @@ mod tests {
                     ),
                 ]))),
             );
+        }
+    }
+
+    #[test]
+    fn prestate_diff_retains_code_hash_changes_with_code_disabled() {
+        let address = Address::with_last_byte(1);
+        let code = Bytecode::new_legacy(Bytes::from_static(&[op::STOP]));
+        let original = AccountInfo::default().with_nonce(1).with_code(code.clone());
+        let builder = GethTraceBuilder::new(Vec::new()).with_features(EvmFeatures::EIP8298);
+
+        for code_enabled in [false, true] {
+            for next_code in [
+                code.clone(),
+                Bytecode::new_legacy(Bytes::from_static(&[op::PUSH0, op::STOP])),
+                Bytecode::default(),
+            ] {
+                let current = original.clone().with_code(next_code.clone());
+                let mut db = CacheDB::new(EmptyDB::default());
+                db.insert_account_info(&address, original.clone());
+                let mut state = TxState::default();
+                state.accounts.insert(
+                    address,
+                    TxAccount { current: Some(current.clone()), ..Default::default() },
+                );
+                let PreStateFrame::Diff(diff) = builder
+                    .geth_prestate_diff_traces(&state, &mut db, code_enabled, false)
+                    .unwrap()
+                else {
+                    panic!("expected diff prestate frame")
+                };
+                if current.code_hash == original.code_hash {
+                    assert!(diff.pre.is_empty());
+                    assert!(diff.post.is_empty());
+                } else {
+                    assert_eq!(diff.pre[&address].code_hash, Some(original.code_hash));
+                    assert_eq!(diff.post[&address].code_hash, Some(current.code_hash));
+                    assert_eq!(
+                        diff.post[&address].code,
+                        code_enabled.then(|| next_code.original_bytes())
+                    );
+                }
+            }
         }
     }
 }

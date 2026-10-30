@@ -11,7 +11,7 @@ use evm2::{
 use evm2_jit_backend::{Result, eyre::bail};
 use oxc_index::IndexVec;
 use smallvec::SmallVec;
-use std::{borrow::Cow, cell::RefCell};
+use std::{borrow::Cow, cell::RefCell, fmt::Write};
 
 mod passes;
 pub(crate) use passes::{
@@ -748,7 +748,7 @@ impl<'a> Bytecode<'a> {
         let operand =
             |depth| self.const_operand(inst, depth).and_then(|value| u64::try_from(value).ok());
         match data.opcode {
-            op::KECCAK256 | op::RETURN | op::REVERT | op::LOG0..=op::LOG4 => {
+            op::KECCAK256 | op::RETURN | op::REVERT | op::APPROVE | op::LOG0..=op::LOG4 => {
                 [Some((operand(0), operand(1))), None]
             }
             op::MLOAD | op::MSTORE => [Some((operand(0), Some(32))), None],
@@ -782,7 +782,6 @@ impl<'a> Bytecode<'a> {
     #[inline(never)]
     fn log_const_input_stats(&self) {
         use op::*;
-        use std::fmt::Write;
 
         // per_input[depth] = [total, const_count, fits_usize_count].
         struct Entry {
@@ -907,8 +906,6 @@ impl<'a> Bytecode<'a> {
     /// Logs IR statistics and top 5 longest blocks at trace level.
     #[inline(never)]
     fn log_ir_stats(&self) {
-        use std::fmt::Write;
-
         let s = self.ir_stats();
         trace!(
             total_insts = s.total,
@@ -941,8 +938,6 @@ impl<'a> Bytecode<'a> {
 
     /// Returns the name for a basic block.
     pub(crate) fn op_block_name(&self, inst: Option<Inst>, name: &str) -> String {
-        use std::fmt::Write;
-
         let Some(inst) = inst else {
             return format!("entry.{name}");
         };
@@ -1228,7 +1223,7 @@ impl InstData {
             || self.flags.contains(InstFlags::UNKNOWN)
             || matches!(
                 self.opcode,
-                op::STOP | op::RETURN | op::REVERT | op::INVALID | op::SELFDESTRUCT
+                op::STOP | op::RETURN | op::REVERT | op::INVALID | op::SELFDESTRUCT | op::APPROVE
             )
     }
 }

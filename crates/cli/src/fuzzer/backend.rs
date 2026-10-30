@@ -219,7 +219,7 @@ const fn revm_spec(spec: SpecId) -> RevmSpecId {
         SpecId::PRAGUE => RevmSpecId::PRAGUE,
         SpecId::OSAKA => RevmSpecId::OSAKA,
         SpecId::AMSTERDAM => RevmSpecId::AMSTERDAM,
-        _ => RevmSpecId::CANCUN,
+        _ => RevmSpecId::AMSTERDAM,
     }
 }
 
@@ -240,5 +240,14 @@ mod tests {
             assert_eq!(Evm2Backend::default().run(case), expected, "fresh evm2 seed {seed}");
             assert_eq!(evm2.run(case), expected, "reused evm2 seed {seed}");
         }
+    }
+
+    #[test]
+    fn unsupported_reference_forks_use_amsterdam() {
+        let mut case = CaseGenerator::default().generate(&mut Gen::new(1)).clone();
+        case.spec = SpecId::AMSTERDAM;
+        let expected = RevmBackend::default().run(&case);
+        case.spec = SpecId::BOGOTA;
+        assert_eq!(RevmBackend::default().run(&case), expected);
     }
 }

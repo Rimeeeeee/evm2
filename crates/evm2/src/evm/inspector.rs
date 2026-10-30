@@ -2,10 +2,13 @@
 
 use crate::{
     EvmTypesHost,
+    ethereum::eip8141::FrameGas,
     evm::NonStaticAny,
     interpreter::{Interpreter, Message, MessageResult},
 };
-use alloc::boxed::Box;
+use alloc::{boxed::Box, sync::Arc};
+use alloy_consensus::TxEip8141;
+use alloy_eips::eip8141::{Frame, FrameReceipt};
 use alloy_primitives::{Address, Log, U256};
 use auto_impl::auto_impl;
 
@@ -106,6 +109,38 @@ pub trait Inspector<T: EvmTypesHost>: NonStaticAny {
         let _ = target;
         let _ = value;
         let _ = host;
+    }
+
+    /// Starts a frame transaction with its shared payload and prepared gas before frame entry.
+    fn frame_transaction_start(
+        &mut self,
+        tx: &Arc<TxEip8141>,
+        gas: &FrameGas,
+        host: &mut T::Host<'_>,
+    ) {
+        let _ = (tx, gas, host);
+    }
+
+    /// Starts an ordered top-level frame, including entries that fail before dispatch.
+    fn frame_start(&mut self, index: usize, frame: &Frame, host: &mut T::Host<'_>) {
+        let _ = (index, frame, host);
+    }
+
+    /// Reports an executed or skipped frame. Later rollback may revise its state gas and logs.
+    fn frame_end(
+        &mut self,
+        index: usize,
+        receipt: &FrameReceipt,
+        output: &alloy_primitives::Bytes,
+        stop: crate::interpreter::InstrStop,
+        host: &mut T::Host<'_>,
+    ) {
+        let _ = (index, receipt, output, stop, host);
+    }
+
+    /// Reconciles traces with final canonical outcomes after rollback and settlement.
+    fn frame_transaction_end(&mut self, result: &crate::TxResult<T>, host: &mut T::Host<'_>) {
+        let _ = (result, host);
     }
 }
 
