@@ -483,6 +483,17 @@ fn execute_frames<T: EvmTypes>(
     prefix: Option<usize>,
 ) -> HandlerResult<TxResult<T>> {
     let tx = &prepared.payload;
+    *host.tx_env_mut() = TxEnvExt {
+        origin: ENTRY_POINT,
+        gas_price: prepared.gas_price,
+        chain_id: U256::from(host.version().chain_id),
+        blob_hashes: tx
+            .blob_versioned_hashes
+            .iter()
+            .map(|hash| U256::from_be_bytes(hash.0))
+            .collect(),
+        ..TxEnv::<T>::default()
+    };
     host.frame_tx = Some(FrameTransactionRuntime::new(
         tx.clone(),
         prepared.signature_hash,
@@ -497,17 +508,6 @@ fn execute_frames<T: EvmTypes>(
         host.state.prewarm(&host.block.beneficiary);
     }
     host.warm_precompiles();
-    let mut tx_env = TxEnvExt {
-        origin: ENTRY_POINT,
-        gas_price: prepared.gas_price,
-        chain_id: U256::from(host.version().chain_id),
-        blob_hashes: tx
-            .blob_versioned_hashes
-            .iter()
-            .map(|hash| U256::from_be_bytes(hash.0))
-            .collect(),
-        ..TxEnv::<T>::default()
-    };
     let mut receipts = Vec::<FrameReceipt>::with_capacity(tx.frames.len());
     let mut outputs = Vec::with_capacity(tx.frames.len());
     let mut refunds = Vec::with_capacity(tx.frames.len());
@@ -538,10 +538,10 @@ fn execute_frames<T: EvmTypes>(
         rt.state_gas_used.push(0);
         let gas_checkpoint = rt.state_gas_checkpoint();
         let log_start = host.logs().len();
+        host.tx_env_mut().origin =
+            if frame.mode == FrameMode::Sender { tx.sender } else { ENTRY_POINT };
         host.inspect_frame(|inspector, host| inspector.frame_start(i, frame, host));
-        tx_env.origin = if frame.mode == FrameMode::Sender { tx.sender } else { ENTRY_POINT };
-        let (stop, execution, state_used, refund, output) =
-            execute_frame(host, &tx_env, tx, frame)?;
+        let (stop, execution, state_used, refund, output) = execute_frame(host, tx, frame)?;
         stops[i] = stop;
         if !stop.is_success() {
             host.state.rollback(state, host.version().features);
@@ -738,7 +738,6 @@ fn skipped<T: EvmTypes>(
 /// Executes one frame with isolated execution and state gas budgets, returning its outcome.
 fn execute_frame<T: EvmTypes>(
     host: &mut Evm<'_, T>,
-    tx_env: &TxEnv<T>,
     tx: &TxEip8141,
     frame: &Frame,
 ) -> HandlerResult<(InstrStop, u64, u64, i64, Bytes)> {
@@ -784,14 +783,15 @@ fn execute_frame<T: EvmTypes>(
             reservoir: gas.reservoir(),
             destination: target,
             call_target: target,
-            caller: tx_env.origin,
+            caller: if frame.mode == FrameMode::Sender { tx.sender } else { ENTRY_POINT },
+            depth: host.version().initial_call_depth,
             code,
             code_address,
             input: frame.data.clone(),
             value: frame.value,
             ..Message::<T>::default()
         };
-        Ok(host.execute_message(tx_env, &mut message)?)
+        Ok(host.execute_message(&mut message)?)
     })();
     let (stop, state, refund, output) = match run {
         Ok(result) => {

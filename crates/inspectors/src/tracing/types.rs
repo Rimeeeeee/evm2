@@ -64,9 +64,9 @@ pub struct CallTrace {
     /// Whether this frame was skipped by atomic/assertion control flow.
     pub skipped: bool,
 
-    /// The depth of the call.
+    /// The inspector-visible depth of the call.
     ///
-    /// Zero represents the root trace node.
+    /// The root starts at [`evm2::Version::initial_call_depth`], normally zero.
     ///
     /// The depth of a call's steps is the depth of the call plus one.
     pub depth: usize,
@@ -131,8 +131,8 @@ pub struct CallTrace {
     pub steps: Vec<CallTraceStep>,
     /// The deltas recorded for [`Self::steps`], in step order.
     ///
-    /// Only steps that report memory or storage, make a call or gain gas have an entry, and only
-    /// if [`record_step_deltas`] is enabled.
+    /// Only steps that report memory or storage, make a call or gain gas have an entry. Memory
+    /// and storage require [`record_step_deltas`]; gas balances are recorded independently.
     ///
     /// [`record_step_deltas`]: crate::tracing::TracingInspectorConfig::record_step_deltas
     #[cfg_attr(feature = "serde", serde(default))]
@@ -477,9 +477,7 @@ impl CallTraceNode {
             }
 
             if self.trace.frame_index.is_none()
-                && !self
-                    .status()
-                    .is_some_and(|status| status.is_revert() || status == InstrStop::NonceOverflow)
+                && !self.status().is_some_and(InstrStop::is_frame_revert)
             {
                 call_frame.gas_used = U256::from(self.trace.gas_limit);
                 call_frame.output = None;
@@ -710,6 +708,11 @@ pub struct CallTraceStep {
     pub state_gas_spent: i64,
     /// Change of the contract state after step execution (effect of the SLOAD/SSTORE instructions)
     pub storage_change: Option<Box<StorageChange>>,
+    /// The key and value a geth struct log snapshots for an SLOAD or SSTORE: the value the slot
+    /// holds before an SLOAD, or the value an SSTORE writes.
+    ///
+    /// Only set if state diffs are recorded.
+    pub storage_slot: Option<Box<(U256, U256)>>,
     /// Final status of the step
     ///
     /// This is set after the step was executed.
@@ -743,10 +746,14 @@ impl CallTraceStep {
                 format!("opcode {:#x} not defined", self.op.get()).into()
             },
             pc: self.pc as u64,
-            refund_counter: Some(self.gas_refund_counter),
+            // geth omits a zero refund and empty memory and return data.
+            refund_counter: (self.gas_refund_counter != 0).then_some(self.gas_refund_counter),
             stack,
             memory: if opts.is_memory_enabled() {
-                self.memory.as_ref().map(RecordedMemory::memory_chunks)
+                self.memory
+                    .as_ref()
+                    .map(RecordedMemory::memory_chunks)
+                    .filter(|memory| !memory.is_empty())
             } else {
                 None
             },
@@ -795,7 +802,8 @@ impl CallTraceStep {
 /// The deltas a [`CallTraceStep`] produced, as reported by parity's `vmTrace`.
 ///
 /// Recorded in [`CallTrace::step_deltas`] for the steps that report memory or storage, make a
-/// call or gain gas, when [`record_step_deltas`] is enabled.
+/// call or gain gas. Memory and storage require [`record_step_deltas`]; gas balances are recorded
+/// independently.
 ///
 /// [`record_step_deltas`]: crate::tracing::TracingInspectorConfig::record_step_deltas
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -808,7 +816,8 @@ pub struct StepDelta {
     /// The storage written by an `SSTORE`, taken from its operands, so it is also set when the
     /// value does not change.
     pub store: Option<StorageDelta>,
-    /// The remaining gas after a call-like step or an instruction that gained gas.
+    /// The remaining gas after a call-like step or a step whose remaining gas after execution is
+    /// not `gas_remaining - gas_cost`, such as one that gained gas or drew state gas from it.
     ///
     /// For all other steps the remaining gas after execution is `gas_remaining - gas_cost`.
     pub gas_remaining_after: Option<u64>,

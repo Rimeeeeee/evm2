@@ -78,9 +78,16 @@ fn frame_floor_is_charged_in_addition_to_state() {
     assert!(mapped.frame.is_some());
 }
 
-#[test]
-fn approval_executes_body_and_commits_explicit_sender_nonce() {
+#[rstest::rstest]
+fn approval_executes_body_and_commits_explicit_sender_nonce(
+    #[values(0, 7)] initial_call_depth: u16,
+) {
     let mut evm = evm(&[0x60, 42, 0x5f, 0x55, 0x00], &[]);
+    let mut version = Version::new(SpecId::BOGOTA);
+    version.initial_call_depth = initial_call_depth;
+    set_version(&mut evm, version);
+    evm.tx_env_mut().origin = ASSERTION;
+    evm.tx_env_mut().gas_price = U256::from(99);
     let tx =
         recovered(payload(vec![frame(FrameMode::Verify, SENDER), frame(FrameMode::Sender, BODY)]));
     let result = evm.transact(&tx).unwrap().commit();
@@ -92,6 +99,8 @@ fn approval_executes_body_and_commits_explicit_sender_nonce() {
     assert!(outcome.receipts[1].gas_used.state > 0);
     assert_eq!(evm.state_mut().account(&SENDER).unwrap().nonce(), 1);
     assert_eq!(stored(&mut evm, BODY, U256::ZERO), U256::from(42));
+    assert_eq!(evm.tx_env().origin, SENDER);
+    assert_eq!(evm.tx_env().gas_price, U256::ZERO);
 }
 
 #[test]

@@ -1,6 +1,9 @@
 //! Transaction execution lifecycle and result types.
 
-use super::{AccountChanges, BlockStateAccumulator, Evm, PendingState, StateChangeSink};
+use super::{
+    AccountChanges, BlockStateAccumulator, Evm, PendingState, StateChangeSink, StateChangeSource,
+    TxStateChanges,
+};
 use crate::{EvmTypesHost, interpreter::InstrStop};
 use alloc::vec::Vec;
 use alloy_eips::eip8141::{FrameReceipt, FrameReceiptPayload};
@@ -102,12 +105,12 @@ impl<E> TxResultExt<E> {
 
     /// Returns whether execution ended with the `REVERT` opcode.
     ///
-    /// Unlike [`InstrStop::is_revert`], this does not count [`InstrStop::CallTooDeep`] or
-    /// [`InstrStop::OutOfFunds`]. Those are call-frame failures that the interpreter treats as
-    /// reverts, but a transaction result reports them as halts.
+    /// Unlike [`InstrStop::is_frame_revert`], this does not count [`InstrStop::CallTooDeep`],
+    /// [`InstrStop::OutOfFunds`] or [`InstrStop::NonceOverflow`]. Those are call-frame failures
+    /// that the interpreter treats as reverts, but a transaction result reports them as halts.
     #[inline]
     pub const fn is_revert(&self) -> bool {
-        !self.status && matches!(self.stop, InstrStop::Revert)
+        !self.status && self.stop.is_revert()
     }
 
     /// Returns whether execution failed for a reason other than the `REVERT` opcode.
@@ -316,10 +319,21 @@ impl<'evm, 'host, T: EvmTypesHost> ExecutedTx<'evm, 'host, T> {
     /// and then [`commit`](Self::commit) or [`discard`](Self::discard) the transaction.
     #[inline]
     pub fn account_changes(&self) -> impl Iterator<Item = AccountChanges<'_>> {
-        self.has_pending_state()
-            .then(|| self.evm.state.transaction_account_changes())
-            .into_iter()
-            .flatten()
+        self.changes().account_changes()
+    }
+
+    /// Returns a borrowed view of the transaction's state changes.
+    ///
+    /// Like [`account_changes`](Self::account_changes), this borrows the transaction state in
+    /// place, so a caller can inspect what the transaction wrote, including single accounts and
+    /// storage slots, before deciding to [`commit`](Self::commit) or [`discard`](Self::discard).
+    #[inline]
+    pub fn changes(&self) -> TxStateChanges<'_> {
+        if self.has_pending_state() {
+            self.evm.state.transaction_changes()
+        } else {
+            TxStateChanges::empty()
+        }
     }
 
     /// Accepts the transaction state into the internal accepted overlay.
@@ -349,7 +363,7 @@ impl<'evm, 'host, T: EvmTypesHost> ExecutedTx<'evm, 'host, T> {
         sink: &mut S,
     ) -> Result<TxResult<T>, S::Error> {
         if self.has_pending_state() {
-            self.evm.state.visit_transaction_changes(sink)?;
+            self.evm.state.transaction_changes().visit(sink)?;
             self.commit_pending_state();
         }
         Ok(self.take_result())
@@ -374,7 +388,7 @@ impl<'evm, 'host, T: EvmTypesHost> ExecutedTx<'evm, 'host, T> {
         sink: &mut S,
     ) -> Result<TxResult<T>, S::Error> {
         if self.has_pending_state() {
-            self.evm.state.visit_transaction_changes(sink)?;
+            self.evm.state.transaction_changes().visit(sink)?;
             self.clear_pending_state();
         }
         Ok(self.take_result())
@@ -393,6 +407,14 @@ impl<'evm, 'host, T: EvmTypesHost> ExecutedTx<'evm, 'host, T> {
         let pending_state = self.take_pending_state();
         let result = self.take_result();
         TxResultWithState { result, pending_state, _non_exhaustive: () }
+    }
+}
+
+impl<T: EvmTypesHost> StateChangeSource for ExecutedTx<'_, '_, T> {
+    /// Visits the transaction's changes in place, as [`PendingState`]'s implementation does for
+    /// detached state.
+    fn visit<S: StateChangeSink>(&self, sink: &mut S) -> Result<(), S::Error> {
+        self.changes().visit(sink)
     }
 }
 
@@ -458,8 +480,13 @@ mod tests {
         let revert = with_stop(false, InstrStop::Revert);
         assert!(!revert.is_success() && revert.is_revert() && !revert.is_halt());
 
-        // Counted by `InstrStop::is_revert`, but not a top-level `REVERT`.
-        for stop in [InstrStop::OutOfFunds, InstrStop::CallTooDeep, InstrStop::OutOfGas] {
+        // Counted by `InstrStop::is_frame_revert`, but not a top-level `REVERT`.
+        for stop in [
+            InstrStop::OutOfFunds,
+            InstrStop::CallTooDeep,
+            InstrStop::NonceOverflow,
+            InstrStop::OutOfGas,
+        ] {
             let halt = with_stop(false, stop);
             assert!(!halt.is_success() && !halt.is_revert() && halt.is_halt(), "{stop:?}");
         }

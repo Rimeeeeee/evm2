@@ -31,12 +31,12 @@ use std::{
 
 #[cfg(feature = "llvm")]
 use crate::{
-    EvmCompiler, EvmLlvmBackend, Linker,
+    EvmCompiler, EvmLlvmBackend,
     llvm::{JitDylibGuard, orc::ResourceTracker},
     runtime::config::JitMode,
 };
 #[cfg(feature = "llvm")]
-use std::{cell::RefCell, fs::File, io::Read, time::Instant};
+use std::{cell::RefCell, time::Instant};
 
 #[cfg(all(feature = "llvm", unix))]
 type OutOfProcessHelper = Option<Arc<super::out_of_process::HelperProcess>>;
@@ -120,7 +120,7 @@ pub(crate) struct WorkerResult {
 pub(crate) enum WorkerSuccess {
     /// JIT compilation produced an in-memory function pointer.
     Jit(JitSuccess),
-    /// AOT compilation produced shared-library bytes.
+    /// AOT compilation produced relocatable object bytes to persist and link in process.
     Aot(AotSuccess),
     /// JIT compilation produced relocatable object bytes to link in the parent.
     JitObject(JitObjectSuccess),
@@ -147,10 +147,10 @@ pub(crate) struct JitObjectSuccess {
 }
 
 pub(crate) struct AotSuccess {
-    /// The symbol name in the shared library.
+    /// The symbol name in the object file.
     pub(crate) symbol_name: String,
-    /// The raw shared-library bytes (.so / .dylib).
-    pub(crate) dylib_bytes: Vec<u8>,
+    /// The raw relocatable object bytes.
+    pub(crate) object_bytes: Vec<u8>,
     /// Length of the original bytecode.
     pub(crate) bytecode_len: usize,
 }
@@ -483,6 +483,12 @@ pub(super) fn compile_with_state(
     };
     let t0 = Instant::now();
 
+    if state_slot
+        .as_ref()
+        .is_some_and(|state| state.profile != CompilerProfile::new(config, target))
+    {
+        *state_slot = None;
+    }
     if state_slot.is_none() {
         match CompilerState::new(config, target) {
             Ok(s) => *state_slot = Some(s),
@@ -558,6 +564,7 @@ pub(super) fn compile_with_state(
 pub(super) struct CompilerState {
     compiler: EvmCompiler<EvmLlvmBackend>,
     compilations_since_recycle: usize,
+    profile: CompilerProfile,
 }
 
 #[cfg(feature = "llvm")]
@@ -566,7 +573,50 @@ impl CompilerState {
         Ok(Self {
             compiler: create_compiler(config, target.is_aot_backend())?,
             compilations_since_recycle: 0,
+            profile: CompilerProfile::new(config, target),
         })
+    }
+}
+
+/// Worker threads can serve different backends; never reuse a compiler across ABI/gas profiles.
+#[cfg(feature = "llvm")]
+#[derive(PartialEq, Eq)]
+struct CompilerProfile {
+    host_type: std::any::TypeId,
+    layout: evm2_jit_codegen::HostLayout,
+    resolver: Option<usize>,
+    symbol_suffix: Option<usize>,
+    opcode_view: Option<std::sync::Arc<evm2::OpcodeView>>,
+    opt_level: crate::OptimizationLevel,
+    gas_params: Option<evm2::version::GasParams>,
+    debug_assertions: bool,
+    single_error: bool,
+    no_dedup: bool,
+    no_dse: bool,
+    target: CompilerTarget,
+}
+
+#[cfg(feature = "llvm")]
+impl CompilerProfile {
+    fn new(config: &RuntimeConfig, target: CompilerTarget) -> Self {
+        Self {
+            host_type: config.host.type_id,
+            layout: config.host.layout,
+            resolver: config.host.resolver.map(|resolver| resolver as usize),
+            symbol_suffix: config.host.symbol_suffix,
+            opcode_view: config.host.opcodes.as_ref().map(|opcodes| opcodes.view.clone()),
+            opt_level: if target.is_aot_backend() {
+                config.tuning.aot_opt_level
+            } else {
+                config.tuning.jit_opt_level
+            },
+            gas_params: config.gas_params,
+            debug_assertions: config.debug_assertions,
+            single_error: config.single_error,
+            no_dedup: config.no_dedup,
+            no_dse: config.no_dse,
+            target,
+        }
     }
 }
 
@@ -588,12 +638,28 @@ pub(super) fn create_compiler(
     } else {
         config.tuning.jit_opt_level
     });
+    // Long-running nodes cannot afford the debug object copies or the append-only perf map.
+    compiler.set_debug_support(false);
+    compiler.set_simple_perf(false);
     compiler.set_debug_assertions(config.debug_assertions);
     compiler.set_single_error(config.single_error);
     compiler.set_dedup(!config.no_dedup);
     compiler.set_dse(!config.no_dse);
     if let Some(gas_params) = &config.gas_params {
         compiler.set_gas_params(*gas_params);
+    }
+    if let Some(resolver) = config.host.resolver {
+        // SAFETY: HostConfig construction establishes the resolver and layout contract.
+        unsafe { compiler.set_host(config.host.layout, resolver) };
+    } else {
+        // SAFETY: HostConfig construction establishes the layout contract.
+        unsafe { compiler.set_layout(config.host.layout) };
+        if let Some(suffix) = config.host.symbol_suffix {
+            compiler.set_builtin_symbol_suffix(suffix);
+        }
+    }
+    if let Some(opcodes) = &config.host.opcodes {
+        compiler.set_opcode_view((*opcodes.view).clone());
     }
     Ok(compiler)
 }
@@ -622,20 +688,28 @@ fn compile_jit_artifact(
     }
 }
 
-/// Compiles a single bytecode to a shared library and returns the raw bytes.
+/// Compiles a single bytecode to a relocatable object and returns the raw bytes.
+#[cfg(feature = "llvm")]
+fn compile_object(
+    job: &CompileJob,
+    compiler: &mut EvmCompiler<EvmLlvmBackend>,
+) -> Result<Vec<u8>, String> {
+    compiler
+        .translate(&job.symbol_name, &job.bytecode[..], job.key.spec_id)
+        .map_err(|e| format!("object translate failed: {e}"))?;
+
+    let mut object_bytes = Vec::new();
+    compiler.write_object(&mut object_bytes).map_err(|e| format!("object write failed: {e}"))?;
+    Ok(object_bytes)
+}
+
+/// Compiles a single bytecode to a relocatable object that the parent links as JIT code.
 #[cfg(feature = "llvm")]
 pub(super) fn compile_jit_object_artifact(
     job: &CompileJob,
     compiler: &mut EvmCompiler<EvmLlvmBackend>,
 ) -> Result<WorkerSuccess, String> {
-    compiler
-        .translate(&job.symbol_name, &job.bytecode[..], job.key.spec_id)
-        .map_err(|e| format!("JIT object translate failed: {e}"))?;
-
-    let mut object_bytes = Vec::new();
-    compiler
-        .write_object(&mut object_bytes)
-        .map_err(|e| format!("JIT object write failed: {e}"))?;
+    let object_bytes = compile_object(job, compiler)?;
     let mut builtin_symbols: Vec<String> = compiler
         .backend()
         .pending_symbol_names()
@@ -643,10 +717,7 @@ pub(super) fn compile_jit_object_artifact(
         .map(|name| name.to_string_lossy().into_owned())
         .collect();
     if builtin_symbols.is_empty() {
-        builtin_symbols = evm2_jit_builtins::Builtin::ALL
-            .iter()
-            .map(|builtin| builtin.name().to_string())
-            .collect();
+        builtin_symbols = builtin_symbol_names(compiler.builtin_symbol_suffix());
     }
 
     debug!(
@@ -662,43 +733,33 @@ pub(super) fn compile_jit_object_artifact(
     }))
 }
 
+/// Returns the names of all builtin symbols that an object compiled with `suffix` may reference.
+pub(super) fn builtin_symbol_names(suffix: Option<usize>) -> Vec<String> {
+    evm2_jit_builtins::Builtin::ALL
+        .iter()
+        .map(|builtin| match suffix {
+            Some(suffix) => format!("{}_{suffix:x}", builtin.name()),
+            None => builtin.name().to_string(),
+        })
+        .collect()
+}
+
 #[cfg(feature = "llvm")]
 fn compile_aot_artifact(
     job: &CompileJob,
     compiler: &mut EvmCompiler<EvmLlvmBackend>,
 ) -> Result<WorkerSuccess, String> {
-    compiler
-        .translate(&job.symbol_name, &job.bytecode[..], job.key.spec_id)
-        .map_err(|e| format!("AOT translate failed: {e}"))?;
-
-    let tmp_dir = tempfile::tempdir().map_err(|e| format!("failed to create temp dir: {e}"))?;
-
-    let obj_path = tmp_dir.path().join("a.o");
-    let so_path = tmp_dir.path().join("a.so");
-
-    compiler
-        .write_object_to_file(&obj_path)
-        .map_err(|e| format!("AOT write object failed: {e}"))?;
-
-    let linker = Linker::new();
-    linker
-        .link(&so_path, [obj_path.to_str().unwrap()])
-        .map_err(|e| format!("AOT link failed: {e}"))?;
-
-    let mut dylib_bytes = Vec::new();
-    File::open(&so_path)
-        .and_then(|mut f| f.read_to_end(&mut dylib_bytes))
-        .map_err(|e| format!("failed to read linked .so: {e}"))?;
+    let object_bytes = compile_object(job, compiler)?;
 
     debug!(
         bytecode_len = job.bytecode.len(),
-        dylib_len = dylib_bytes.len(),
+        object_len = object_bytes.len(),
         "AOT compilation succeeded",
     );
 
     Ok(WorkerSuccess::Aot(AotSuccess {
         symbol_name: job.symbol_name.clone(),
-        dylib_bytes,
+        object_bytes,
         bytecode_len: job.bytecode.len(),
     }))
 }

@@ -42,6 +42,12 @@ pub use config::{OpcodeFilter, StackSnapshotType, TracingInspectorConfig};
 mod fourbyte;
 pub use fourbyte::FourByteInspector;
 
+mod keccak;
+pub use keccak::{
+    DEFAULT_MAX_RECORDED_BYTES, KECCAK256_PREIMAGE_TRACER, Keccak256PreimageInspector,
+    LimitExceeded as Keccak256PreimageLimitExceeded, MEMORY_PAD_LIMIT,
+};
+
 mod limits;
 use limits::TraceBudget;
 pub use limits::{TraceLimitBehavior, TraceLimits};
@@ -409,10 +415,9 @@ impl TracingInspector {
         gas_limit: u64,
         maybe_precompile: Option<bool>,
     ) {
-        let frame_index = self
-            .frame_transaction
-            .as_ref()
-            .and_then(|frames| (depth == 0).then_some(frames.active));
+        let frame_index = self.frame_transaction.as_ref().and_then(|frames| {
+            (depth == self.traces.arena[0].trace.depth).then_some(frames.active)
+        });
         let depth = depth + usize::from(self.frame_transaction.is_some());
         // This will only be true if the inspector is configured to exclude precompiles and the call
         // is to a precompile
@@ -427,7 +432,11 @@ impl TracingInspector {
         let steps = self.reusable_step_vecs.pop().unwrap_or_default();
 
         // the currently active call is the parent of the new call
-        let parent = self.trace_stack.last().map_or(0, |entry| entry.trace_idx);
+        let parent = self
+            .trace_stack
+            .last()
+            .map(|entry| entry.trace_idx)
+            .or_else(|| self.frame_transaction.as_ref().map(|_| 0));
 
         let trace_idx = self.traces.push_trace(
             parent,
@@ -561,6 +570,12 @@ impl TracingInspector {
 
         self.last_journal_len = interp.host().state().journal().len();
 
+        let storage_slot = if self.config.record_state_diff {
+            storage_slot(interp.stack().as_slice(), op.get())
+        } else {
+            None
+        };
+
         let step_idx = node.trace.steps.len();
         node.trace.steps.push(CallTraceStep {
             pc: interp.pc(),
@@ -583,6 +598,7 @@ impl TracingInspector {
                 .then_some(interp.gas().reservoir()),
             state_gas_spent: interp.gas().state_gas_spent(),
             storage_change: None,
+            storage_slot,
             status: None,
 
             // This is never populated in `TracingInspector`.
@@ -647,6 +663,7 @@ impl TracingInspector {
             );
         }
 
+        let address = interp.message().destination;
         let host = interp.host();
         let journal = host.state().journal();
 
@@ -682,11 +699,20 @@ impl TracingInspector {
             };
         }
 
-        // The gas cost is the difference between the recorded gas remaining at the start of the
-        // step the remaining gas here, at the end of the step.
-        step.gas_cost = interp
-            .failed_charge()
-            .unwrap_or_else(|| step.gas_remaining.saturating_sub(interp.gas().remaining()));
+        // The slot an SLOAD read is loaded now, and the SLOAD did not change it.
+        if let Some(slot) = &mut step.storage_slot
+            && step.op.get() == op::SLOAD
+        {
+            slot.1 = host.state().get_storage(&address, &slot.0).unwrap_or_default();
+        }
+
+        // An out-of-gas step consumes the whole remainder, except the reentrancy sentry, which
+        // halts before any charge.
+        step.gas_cost = if interp.result() == Err(InstrStop::ReentrancySentryOOG) {
+            0
+        } else {
+            interp.step_cost()
+        };
         let state_gas_delta = interp.gas().state_gas_spent().saturating_sub(step.state_gas_spent);
         if step.state_gas_reservoir.is_some() && state_gas_delta != 0 {
             step.state_gas_cost = Some(state_gas_delta);
@@ -695,24 +721,27 @@ impl TracingInspector {
         // set the status
         step.status = interp.result().err();
 
-        if self.config.record_step_deltas {
-            if step.status.is_some_and(|status| status.is_halt()) {
-                return;
-            }
-            // Call results, returned memory and gas are already available in evm2's `step_end`.
-            // Gas credits cannot be recovered from the saturated unsigned gas cost.
-            let gas_remaining_after = (step.is_call_like_op()
-                || interp.gas().remaining() > step.gas_remaining)
-                .then_some(interp.gas().remaining());
-            if gas_remaining_after.is_some()
-                && node.trace.step_deltas.last().is_none_or(|delta| delta.step != step_idx)
-            {
-                node.trace.step_deltas.push(StepDelta { step: step_idx, ..Default::default() });
-            }
-            if let Some(delta) =
-                node.trace.step_deltas.last_mut().filter(|delta| delta.step == step_idx)
-            {
-                delta.gas_remaining_after = gas_remaining_after;
+        if step.status.is_some_and(|status| status.is_halt()) {
+            return;
+        }
+        // The gas a child returns, gas credits and state gas drawn from the remaining gas cannot be
+        // recovered from the step cost, so record the balance after the step even without memory
+        // and storage deltas.
+        let remaining = interp.gas().remaining();
+        let gas_remaining_after = (step.is_call_like_op()
+            || remaining != step.gas_remaining.saturating_sub(step.gas_cost))
+        .then_some(remaining);
+        if gas_remaining_after.is_some()
+            && node.trace.step_deltas.last().is_none_or(|delta| delta.step != step_idx)
+        {
+            node.trace.step_deltas.push(StepDelta { step: step_idx, ..Default::default() });
+        }
+        if let Some(delta) =
+            node.trace.step_deltas.last_mut().filter(|delta| delta.step == step_idx)
+        {
+            delta.gas_remaining_after = gas_remaining_after;
+            // Call results and returned memory are already available in evm2's `step_end`.
+            if self.config.record_step_deltas {
                 if step.is_call_like_op()
                     && let Some(range) = &mut delta.write_range
                 {
@@ -775,6 +804,7 @@ impl<T: EvmTypes> Inspector<T> for TracingInspector {
         self.features = host.version().features;
         self.traces.arena[0].trace = CallTrace {
             frame_transaction_root: true,
+            depth: usize::from(host.version().initial_call_depth),
             address: ENTRY_POINT,
             caller: tx.sender,
             gas_limit: gas.maximum,
@@ -792,7 +822,7 @@ impl<T: EvmTypes> Inspector<T> for TracingInspector {
         receipt: &FrameReceipt,
         output: &Bytes,
         stop: InstrStop,
-        _host: &mut T::Host<'_>,
+        host: &mut T::Host<'_>,
     ) {
         let frames = self.frame_transaction.as_mut().unwrap();
         frames.active = index;
@@ -802,7 +832,7 @@ impl<T: EvmTypes> Inspector<T> for TracingInspector {
             node
         } else {
             self.start_trace_on_call(
-                0,
+                usize::from(host.version().initial_call_depth),
                 frame.resolved_target(sender),
                 if self.config.record_inputs { frame.data.clone() } else { Bytes::new() },
                 frame.value,
@@ -958,7 +988,7 @@ impl<T: EvmTypes> Inspector<T> for TracingInspector {
             .then(|| self.is_precompile_call(interp.host(), &to, &value));
 
         let input = if self.config.record_inputs
-            && (message.depth == 0 || self.budget.reserve(message.input.len()))
+            && (self.trace_stack.is_empty() || self.budget.reserve(message.input.len()))
         {
             message.input.clone()
         } else {
@@ -1000,7 +1030,7 @@ impl<T: EvmTypes> Inspector<T> for TracingInspector {
         self.features = interp.version().features;
 
         let input = if self.config.record_inputs
-            && (message.depth == 0 || self.budget.reserve(message.input.len()))
+            && (self.trace_stack.is_empty() || self.budget.reserve(message.input.len()))
         {
             message.input.clone()
         } else {
@@ -1023,19 +1053,10 @@ impl<T: EvmTypes> Inspector<T> for TracingInspector {
     fn create_end(
         &mut self,
         _interp: &mut Interpreter<'_, '_, T>,
-        message: &Message<T>,
+        _message: &Message<T>,
         result: &mut MessageResult<T>,
     ) {
-        let trace_idx = self.last_trace_idx();
         self.fill_trace_on_call_end(result);
-        // A nested CREATE whose creator nonce cannot be incremented returns successfully but
-        // without an address, leaving its gas unspent.
-        if message.depth > 0 && result.created_address.is_none() && result.stop == InstrStop::Return
-        {
-            let trace = &mut self.traces.arena[trace_idx].trace;
-            trace.status = Some(InstrStop::NonceOverflow);
-            trace.success = false;
-        }
     }
 
     fn selfdestruct(
@@ -1097,6 +1118,19 @@ impl From<alloy_rpc_types_eth::TransactionInfo> for TransactionContext {
             tx_index: tx_info.index.map(|idx| idx as usize),
             tx_hash: tx_info.hash,
         }
+    }
+}
+
+/// Returns the key and value of the storage slot an SSTORE is about to write, or the key of the
+/// slot an SLOAD is about to read, with a zero value that `step_end` replaces.
+fn storage_slot(stack: &[U256], op: u8) -> Option<Box<(U256, U256)>> {
+    match op {
+        op::SLOAD => Some(Box::new((*stack.last()?, U256::ZERO))),
+        op::SSTORE => {
+            let [.., value, key] = stack else { return None };
+            Some(Box::new((*key, *value)))
+        }
+        _ => None,
     }
 }
 

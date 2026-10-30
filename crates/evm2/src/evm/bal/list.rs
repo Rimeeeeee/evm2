@@ -3,7 +3,7 @@
 use super::{AccountBal, BalError, BlockAccessIndex};
 use crate::{
     bytecode::BytecodeDecodeError,
-    evm::state::{Account, AccountInfo, PendingState},
+    evm::state::{Account, AccountFlags, AccountInfo, PendingState},
 };
 use alloc::vec::Vec;
 use alloy_eip7928::{
@@ -115,7 +115,7 @@ impl Bal {
             account.original.as_ref().unwrap_or(&absent),
             account.present.as_ref().unwrap_or(&absent),
         );
-        if account.code_adopted {
+        if account.flags.contains(AccountFlags::CODE_ADOPTED) {
             bal_account.account_info.mark_code_adopted(bal_index);
         }
         bal_account.storage.update_pending(bal_index, &account.storage.slots);

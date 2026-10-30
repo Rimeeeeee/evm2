@@ -26,7 +26,7 @@ use alloc::{
 };
 use alloy_consensus::{Transaction, TxEip8141, transaction::Recovered};
 use alloy_eips::eip8141::{ENTRY_POINT, Frame, FrameMode, FrameReceipt, FrameStatus};
-use alloy_primitives::{Address, Bytes, TxKind, U256, map::HashSet};
+use alloy_primitives::{Address, Bytes, TxKind, U256};
 use boa_engine::{
     Context, JsError, JsNativeError, JsObject, JsResult, JsValue, Script, Source,
     builtins::error::Error, error::EngineError, js_string, object::builtins::JsArray,
@@ -139,10 +139,14 @@ pub struct JsInspector {
     call_stack: Vec<CallStackItem>,
     /// Monotonically increasing ID used to refresh callback contract input.
     next_call_id: u64,
-    /// Marker to track whether the precompiles have been registered.
-    precompiles_registered: bool,
+    /// The precompiles read by `isPrecompiled`, set on the first call hook of a transaction.
+    precompiles: PrecompileList,
     /// Pre-execution states captured in `step()` to be processed in `step_end()`.
     pending_steps: Vec<PendingStep>,
+    /// Depth of the root frame, which can be non-zero for a nested transaction root.
+    ///
+    /// Pending steps are indexed relative to it.
+    root_depth: u16,
     /// Retained until `fuse`; result collection prioritizes it over cancellation.
     hook_error: Option<JsError>,
     /// Optional cancellation signal shared with the caller.
@@ -171,9 +175,10 @@ impl JsInspector {
     ///  - `fault`: a function that will be called when the transaction fails.
     ///
     /// Optional functions are invoked during inspection:
-    /// - `setup`: a function that will be called before the inspection starts.
-    /// - `enter`: a function that will be called when the execution enters a new call.
-    /// - `exit`: a function that will be called when the execution exits a call.
+    /// - `setup`: a function that will be called before the inspection starts, with the config as a
+    ///   JSON string.
+    /// - `enter` and `exit`: functions that will be called when the execution enters and exits a
+    ///   call. Both must be present or both absent.
     /// - `step`: a function that will be called when the execution steps to the next instruction.
     ///
     /// This also accepts a sender half of a channel to communicate with the database service so the
@@ -200,6 +205,8 @@ impl JsInspector {
         ctx.runtime_limits_mut().set_recursion_limit(RECURSION_LIMIT);
 
         register_builtins(&mut ctx)?;
+        let precompiles = PrecompileList::default();
+        precompiles.register_callable(&mut ctx)?;
 
         // parse the code
         let wrapped = format!("({code})");
@@ -238,8 +245,9 @@ impl JsInspector {
             reusable_db,
             call_stack: Default::default(),
             next_call_id: 1,
-            precompiles_registered: false,
+            precompiles,
             pending_steps: Vec::new(),
+            root_depth: 0,
             hook_error: None,
             interrupt: None,
             frame_transaction: None,
@@ -267,6 +275,8 @@ impl JsInspector {
     /// wrappers are recreated so their own properties do not carry over between transactions.
     pub fn fuse(&mut self) -> Result<(), JsInspectorError> {
         self.ensure_not_interrupted()?;
+        // `setup` of the fresh tracer must not see the previous transaction's precompiles.
+        self.precompiles.clear();
         let JsTracerObject { obj, result_fn, fault_fn, enter_fn, exit_fn, step_fn } =
             JsTracerObject::evaluate(&self.script, &self.config, &mut self.ctx)?;
         // Callback objects are mutable JS objects: replacing their Rust state does not remove
@@ -292,9 +302,9 @@ impl JsInspector {
         self.exit_fn = exit_fn;
         self.step_fn = step_fn;
         self.call_stack.clear();
-        self.precompiles_registered = false;
         self.pending_steps.clear();
         self.frame_transaction = None;
+        self.root_depth = 0;
         self.hook_error = None;
 
         Ok(())
@@ -354,7 +364,7 @@ impl JsInspector {
 
         if result.status {
             output_bytes = Some(result.output.clone());
-        } else if result.stop.is_revert() {
+        } else if result.stop.is_frame_revert() {
             error = Some("execution reverted".to_string());
             output_bytes = Some(result.output.clone());
         } else {
@@ -370,6 +380,7 @@ impl JsInspector {
         });
 
         let base_fee = block.basefee.try_into().unwrap_or(u64::MAX);
+        let gas_tip = tx.effective_tip_per_gas(base_fee).unwrap_or_default();
 
         let mut ctx = JsEvmContext {
             r#type: match kind {
@@ -382,13 +393,11 @@ impl JsInspector {
             input: tx.input().clone(),
             gas: tx.gas_limit(),
             gas_used: result.tx_gas_used(),
-            gas_price: tx.effective_gas_price(Some(base_fee)).try_into().unwrap_or(u64::MAX),
+            gas_price: U256::from(gas_tip),
             value: tx.value(),
             block: block.number.try_into().unwrap_or(u64::MAX),
             coinbase: block.beneficiary,
             output: output_bytes.unwrap_or_default(),
-            time: block.timestamp.to_string(),
-            intrinsic_gas: 0,
             transaction_ctx: self.transaction_context,
             error,
         };
@@ -400,11 +409,12 @@ impl JsInspector {
             ctx.input = Bytes::new();
             ctx.value = U256::ZERO;
             ctx.gas = frame.gas.maximum;
-            ctx.intrinsic_gas = frame.gas.intrinsic;
-            ctx.gas_price =
-                result.frame.as_ref().map_or(0, |frame| frame.gas_price.saturating_to());
+            ctx.gas_price = result.frame.as_ref().map_or(U256::ZERO, |frame| frame.gas_price);
         }
         let ctx = ctx.into_js_object(&mut self.ctx)?;
+        if let Some(frame) = &self.frame_transaction {
+            ctx.set(js_string!("intrinsicGas"), frame.gas.intrinsic, false, &mut self.ctx)?;
+        }
         if let Some(frame) = &self.frame_transaction
             && let Some(outcome) = &result.frame
         {
@@ -552,11 +562,15 @@ impl JsInspector {
     /// Pushes a new call to the stack
     fn push_call(
         &mut self,
+        depth: u16,
         contract: Contract,
         kind: CallKind,
         gas_limit: u64,
         frame_refund: i64,
     ) -> &CallStackItem {
+        if self.call_stack.is_empty() {
+            self.root_depth = depth;
+        }
         let enclosing_refund =
             self.call_stack.last().map_or(0, |parent| parent.enclosing_refund + frame_refund);
         let call = CallStackItem {
@@ -575,16 +589,11 @@ impl JsInspector {
         self.active_call()
     }
 
-    /// Registers the precompiles in the JS context
+    /// Sets the active precompiles read by `isPrecompiled`.
     fn register_precompiles<T: EvmTypes>(&mut self, host: &Evm<'_, T>) {
-        if self.precompiles_registered {
-            return;
+        if !self.precompiles.is_set() {
+            self.precompiles.set(host.precompiles().addresses());
         }
-        let precompiles = PrecompileList(HashSet::from_iter(host.precompiles().addresses()));
-
-        let _ = precompiles.register_callable(&mut self.ctx);
-
-        self.precompiles_registered = true
     }
 
     /// Sets a shared handle that cooperatively interrupts JavaScript tracing.
@@ -617,8 +626,14 @@ impl JsInspector {
     /// ```
     #[must_use]
     pub fn with_interrupt(mut self, interrupt: JsInspectorInterrupt) -> Self {
-        self.interrupt = Some(interrupt);
+        self.set_interrupt(interrupt);
         self
+    }
+
+    /// Sets the shared handle that cooperatively interrupts JavaScript tracing, see
+    /// [`Self::with_interrupt`].
+    pub fn set_interrupt(&mut self, interrupt: JsInspectorInterrupt) {
+        self.interrupt = Some(interrupt);
     }
 
     #[inline]
@@ -650,7 +665,8 @@ impl JsInspector {
         if !self.check_interrupt(interp) {
             return false;
         }
-        if let Some(pending) = self.pending_steps.get_mut(usize::from(interp.message().depth)) {
+        let index = self.pending_step_index(interp);
+        if let Some(pending) = self.pending_steps.get_mut(index) {
             pending.active = false;
         }
         // Step hooks must set the stop as well as record the fatal execution error.
@@ -675,8 +691,9 @@ impl JsInspector {
         fault: bool,
         error: Option<String>,
     ) {
-        let depth = usize::from(interp.message().depth);
-        let pending = &mut self.pending_steps[depth];
+        let depth = interp.message().depth;
+        let index = self.pending_step_index(interp);
+        let pending = &mut self.pending_steps[index];
         let call = self.call_stack.last().expect("call stack is empty");
         // evm2's CALL/CREATE step_end runs after the child has returned and merged its refund.
         let frame_refund = if matches!(
@@ -692,7 +709,8 @@ impl JsInspector {
         let info = StepInfo {
             cost: interp.gas().spent().saturating_sub(pending.gas_spent_before),
             refund: refund.max(0) as u64,
-            depth: depth as u64,
+            // Geth reports the depth starting at 1 for the top-level call.
+            depth: u64::from(depth) + 1,
             error,
             caller: interp.message().caller,
             contract: interp.message().destination,
@@ -721,6 +739,38 @@ impl JsInspector {
             self.record_hook_error(if fault { "fault" } else { "step" }, err);
         }
     }
+
+    /// Ends the parent's call-like step before its child runs, like geth.
+    ///
+    /// Invoked on [Inspector::call] and [Inspector::create], where the parent has charged the step,
+    /// including the gas forwarded to the child, and the child has not returned any gas yet.
+    /// `step_end` then skips the step. A `step` error is recorded like on any other step and does
+    /// not affect the child.
+    fn end_call_step<T: EvmTypes>(
+        &mut self,
+        interp: &mut Interpreter<'_, '_, T>,
+        message: &Message<T>,
+    ) {
+        // The top-level message has no parent step.
+        if self.step_fn.is_none()
+            || self.hook_errored()
+            || message.depth != interp.message().depth + 1
+        {
+            return;
+        }
+        let index = self.pending_step_index(interp);
+        if let Some(pending) = self.pending_steps.get_mut(index)
+            && core::mem::take(&mut pending.active)
+        {
+            self.invoke_step_hook(interp, false, None);
+        }
+    }
+
+    /// Returns the pending-step slot of the current frame, relative to the root frame.
+    #[inline]
+    fn pending_step_index<T: EvmTypes>(&self, interp: &Interpreter<'_, '_, T>) -> usize {
+        usize::from(interp.message().depth - self.root_depth)
+    }
 }
 
 impl<T: EvmTypes> Inspector<T> for JsInspector {
@@ -740,6 +790,7 @@ impl<T: EvmTypes> Inspector<T> for JsInspector {
             observed: false,
         });
         self.push_call(
+            host.version().initial_call_depth,
             Contract {
                 caller: tx.sender,
                 contract: ENTRY_POINT,
@@ -823,11 +874,11 @@ impl<T: EvmTypes> Inspector<T> for JsInspector {
         if self.check_and_halt(interp) || self.hook_errored() {
             return;
         }
-        let depth = usize::from(interp.message().depth);
-        if self.pending_steps.len() <= depth {
-            self.pending_steps.resize_with(depth + 1, PendingStep::default);
+        let index = self.pending_step_index(interp);
+        if self.pending_steps.len() <= index {
+            self.pending_steps.resize_with(index + 1, PendingStep::default);
         }
-        let pending = &mut self.pending_steps[depth];
+        let pending = &mut self.pending_steps[index];
         pending.gas_spent_before = interp.gas().spent();
         pending.frame_refund = interp.gas().refunded();
         pending.instruction = FaultStep {
@@ -851,8 +902,8 @@ impl<T: EvmTypes> Inspector<T> for JsInspector {
         if self.check_and_halt(interp) || self.hook_errored() {
             return;
         }
-        let depth = usize::from(interp.message().depth);
-        let Some(pending) = self.pending_steps.get_mut(depth) else {
+        let index = self.pending_step_index(interp);
+        let Some(pending) = self.pending_steps.get_mut(index) else {
             return;
         };
         if !core::mem::take(&mut pending.active) {
@@ -894,7 +945,8 @@ impl<T: EvmTypes> Inspector<T> for JsInspector {
             return None;
         }
         self.register_precompiles(interp.host());
-        if message.depth == 0
+        self.end_call_step(interp, message);
+        if message.depth == self.root_depth
             && let Some(frame) = &mut self.frame_transaction
         {
             frame.observed = true;
@@ -911,9 +963,10 @@ impl<T: EvmTypes> Inspector<T> for JsInspector {
         let gas_limit = self
             .frame_transaction
             .as_ref()
-            .filter(|_| message.depth == 0)
+            .filter(|_| message.depth == self.root_depth)
             .map_or(message.gas_limit, |frame| frame.payload.frames[frame.active].limits.execution);
         self.push_call(
+            message.depth,
             Contract { caller, contract, value: message.value, input: message.input.clone() },
             message.kind.into(),
             gas_limit,
@@ -946,7 +999,9 @@ impl<T: EvmTypes> Inspector<T> for JsInspector {
         if self.check_interrupt(interp) {
             return;
         }
-        if self.can_call_exit() && !(message.depth == 0 && self.frame_transaction.is_some()) {
+        if self.can_call_exit()
+            && !(message.depth == self.root_depth && self.frame_transaction.is_some())
+        {
             let frame_result = FrameResult {
                 frame_index: self.active_call().frame_index,
                 gas_used: result.gas.spent(),
@@ -971,7 +1026,9 @@ impl<T: EvmTypes> Inspector<T> for JsInspector {
             return None;
         }
         self.register_precompiles(interp.host());
+        self.end_call_step(interp, message);
         self.push_call(
+            message.depth,
             Contract {
                 caller: message.caller,
                 contract: message.destination,
@@ -1167,17 +1224,21 @@ impl JsTracerObject {
         let exit_fn = obj.get(js_string!("exit"), ctx)?.as_object().filter(|o| o.is_callable());
         let step_fn = obj.get(js_string!("step"), ctx)?.as_object().filter(|o| o.is_callable());
 
-        let js_config_value =
-            JsValue::from_json(config, ctx).map_err(JsInspectorError::InvalidJsonConfig)?;
+        if enter_fn.is_some() != exit_fn.is_some() {
+            return Err(JsInspectorError::EnterExitMismatch);
+        }
 
-        if let Some(setup_fn) = obj.get(js_string!("setup"), ctx)?.as_object() {
-            if !setup_fn.is_callable() {
-                return Err(JsInspectorError::SetupFunctionNotCallable);
-            }
-
-            // call setup()
+        // Like geth, `setup` receives the config as a JSON string, `{}` if there is none, and a
+        // non-callable `setup` is ignored.
+        if let Some(setup_fn) = obj.get(js_string!("setup"), ctx)?.as_object()
+            && setup_fn.is_callable()
+        {
+            let config = match config {
+                serde_json::Value::Null => js_string!("{}"),
+                config => js_string!(config.to_string()),
+            };
             setup_fn
-                .call(&(obj.clone().into()), core::slice::from_ref(&js_config_value), ctx)
+                .call(&(obj.clone().into()), &[config.into()], ctx)
                 .map_err(JsInspectorError::SetupCallFailed)?;
         }
 
@@ -1221,17 +1282,13 @@ pub enum JsInspectorError {
     #[error("trace object must expose a function fault()")]
     FaultFunctionMissing,
 
-    /// The setup object must be a callable function.
-    #[error("setup object must be a function")]
-    SetupFunctionNotCallable,
+    /// The trace object must expose either both or none of `enter()` and `exit()`.
+    #[error("trace object must expose either both or none of enter() and exit()")]
+    EnterExitMismatch,
 
     /// Failure during the invocation of the `setup()` function.
     #[error("failed to call setup(): {0}")]
     SetupCallFailed(JsError),
-
-    /// Invalid JSON configuration encountered.
-    #[error("invalid JSON config: {0}")]
-    InvalidJsonConfig(JsError),
 
     /// Tracing was cancelled through the shared interrupt flag.
     #[error("JavaScript tracing interrupted")]
@@ -1326,8 +1383,8 @@ fn with_message_suffix(err: JsError, suffix: &str, ctx: &mut Context) -> JsError
 mod tests {
     use super::*;
     use alloc::{string::ToString, vec, vec::Vec};
-    use alloy_consensus::{TxLegacy, transaction::Recovered};
-    use alloy_primitives::{Address, Bytes, TxKind, U256, bytes, hex};
+    use alloy_consensus::{TxEip1559, TxLegacy, transaction::Recovered};
+    use alloy_primitives::{Address, B256, Bytes, TxKind, U256, bytes, hex};
     use boa_engine::error::{EngineError, RuntimeLimitError};
     use evm2::{
         BaseEvmTypes, Evm, Precompiles, SpecId, Version,
@@ -1365,6 +1422,108 @@ mod tests {
         assert!(matches!(result, Err(JsInspectorError::FaultFunctionMissing)));
     }
 
+    #[test]
+    fn test_setup_receives_config_json_string() {
+        let code = |expected: &str| {
+            format!(
+                r#"{{
+                    setup: function(config) {{
+                        if (typeof config !== "string" || config !== '{expected}') {{
+                            throw new Error(typeof config + ":" + config);
+                        }}
+                    }},
+                    fault: function() {{}},
+                    result: function() {{}}
+                }}"#
+            )
+        };
+        JsInspector::new(code(r#"{"a":1}"#), json!({"a": 1})).unwrap();
+        JsInspector::new(code("{}"), serde_json::Value::Null).unwrap();
+        let result = JsInspector::new(code("{}"), json!({"a": 1}));
+        assert!(matches!(result, Err(JsInspectorError::SetupCallFailed(_))));
+    }
+
+    #[test]
+    fn test_enter_exit_must_come_together() {
+        for functions in ["enter: function() {},", "exit: function() {},"] {
+            let code = format!("{{{functions} fault: function() {{}}, result: function() {{}}}}");
+            let result = JsInspector::new(code, serde_json::Value::Null);
+            assert!(matches!(result, Err(JsInspectorError::EnterExitMismatch)));
+        }
+        let code = "{enter: function() {}, exit: function() {}, fault: function() {}, result: function() {}}";
+        JsInspector::new(code.to_string(), serde_json::Value::Null).unwrap();
+    }
+
+    #[test]
+    fn test_ctx_matches_geth() {
+        let code = r#"{
+            fault: function() {},
+            result: function(ctx) {
+                return [ctx.gasPrice.toString(), ctx.intrinsicGas, ctx.time];
+            }
+        }"#;
+        // The tip is min(max_priority_fee, max_fee - base_fee).
+        for (max_fee, expected) in
+            [(10_000_000_000u128, "1000000000"), (5_500_000_000, "500000000")]
+        {
+            let insp = JsInspector::new(code.to_string(), serde_json::Value::Null).unwrap();
+            let tx = TxEnvelope::Eip1559(TxEip1559 {
+                chain_id: 1,
+                gas_limit: 1_000_000,
+                max_fee_per_gas: max_fee,
+                max_priority_fee_per_gas: 1_000_000_000,
+                to: TxKind::Call(Address::repeat_byte(0x01)),
+                ..Default::default()
+            });
+            let res = try_run_tx(insp, None, true, U256::from(5_000_000_000u64), tx).unwrap();
+            assert_eq!(res, json!([expected, null, null]));
+        }
+    }
+
+    #[test]
+    fn test_ctx_transaction_fields_need_non_zero_hashes() {
+        let code = r#"{
+            fault: function() {},
+            result: function(ctx) {
+                return [ctx.blockHash !== undefined, ctx.txIndex, ctx.txHash !== undefined];
+            }
+        }"#;
+        let hash = Some(B256::repeat_byte(1));
+        let zero = Some(B256::ZERO);
+        for (block_hash, tx_hash, tx_index, expected) in [
+            (None, None, None, json!([false, null, false])),
+            (hash, None, Some(3), json!([true, null, false])),
+            (zero, hash, Some(3), json!([false, null, false])),
+            (hash, zero, Some(3), json!([true, null, false])),
+            (hash, hash, Some(3), json!([true, 3, true])),
+            (hash, hash, None, json!([true, 0, true])),
+        ] {
+            let tx_context = TransactionContext { block_hash, tx_index, tx_hash };
+            let insp = JsInspector::with_transaction_context(
+                code.to_string(),
+                serde_json::Value::Null,
+                tx_context,
+            )
+            .unwrap();
+            let res = try_run_tx(insp, None, true, U256::ZERO, legacy_tx(1024)).unwrap();
+            assert_eq!(res, expected);
+        }
+    }
+
+    #[test]
+    fn test_is_precompiled_is_false_in_setup() {
+        let code = r#"{
+            before: false,
+            setup: function() { this.before = isPrecompiled("0x01"); },
+            fault: function() {},
+            result: function() { return this.before; }
+        }"#;
+        let mut insp = JsInspector::new(code.to_string(), serde_json::Value::Null).unwrap();
+        insp.precompiles.set([Address::with_last_byte(1)]);
+        insp.fuse().unwrap();
+        assert_eq!(try_run_tx(insp, None, true, U256::ZERO, legacy_tx(0)).unwrap(), json!(false));
+    }
+
     fn run_trace(code: &str, contract: Option<Bytes>, success: bool) -> serde_json::Value {
         try_run_trace(code, contract, success).unwrap()
     }
@@ -1373,6 +1532,26 @@ mod tests {
         code: &str,
         contract: Option<Bytes>,
         success: bool,
+    ) -> Result<serde_json::Value, JsInspectorError> {
+        let insp = JsInspector::new(code.to_string(), serde_json::Value::Null).unwrap();
+        try_run_tx(insp, contract, success, U256::ZERO, legacy_tx(1024))
+    }
+
+    fn legacy_tx(gas_price: u128) -> TxEnvelope {
+        TxEnvelope::Legacy(TxLegacy {
+            gas_price,
+            gas_limit: 1_000_000,
+            to: TxKind::Call(Address::repeat_byte(0x01)),
+            ..Default::default()
+        })
+    }
+
+    fn try_run_tx(
+        insp: JsInspector,
+        contract: Option<Bytes>,
+        success: bool,
+        basefee: U256,
+        tx: TxEnvelope,
     ) -> Result<serde_json::Value, JsInspectorError> {
         let addr = Address::repeat_byte(0x01);
         let mut db = CacheDB::new(EmptyDB::default());
@@ -1394,25 +1573,16 @@ mod tests {
             },
         );
 
-        let insp = JsInspector::new(code.to_string(), serde_json::Value::Null).unwrap();
         let mut evm = Evm::<BaseEvmTypes>::new(
             SpecId::CANCUN,
-            evm2::env::BlockEnvExt::default(),
+            evm2::env::BlockEnvExt { basefee, ..Default::default() },
             ethereum_tx_registry(SpecId::CANCUN),
             db,
             Precompiles::base(SpecId::CANCUN),
         );
         evm.set_inspector(insp);
 
-        let tx = Recovered::new_unchecked(
-            TxEnvelope::Legacy(TxLegacy {
-                gas_price: 1024,
-                gas_limit: 1_000_000,
-                to: TxKind::Call(addr),
-                ..Default::default()
-            }),
-            Address::ZERO,
-        );
+        let tx = Recovered::new_unchecked(tx, Address::ZERO);
         let res = evm.transact(&tx).expect("pass without error").detach();
 
         assert_eq!(res.result.status, success);
@@ -1446,27 +1616,20 @@ mod tests {
     }
 
     #[test]
-    fn test_memory_slice_rejects_non_finite_indexes() {
+    fn test_memory_slice_non_finite_indexes_are_zero() {
         let code = r#"{
-            depths: [],
-            step: function(log) { this.depths.push(log.memory.slice(Infinity, NaN)); },
+            res: [],
+            step: function(log) {
+                if (log.op.toString() === 'STOP') {
+                    this.res.push(log.memory.slice(Infinity, NaN).length, log.memory.slice(NaN, 2).length);
+                    this.res.push(log.memory.slice(0, Infinity).length);
+                }
+            },
             fault: function() {},
-            result: function() { return this.depths; }
+            result: function() { return this.res; }
         }"#;
-        let err = try_run_trace(code, None, true).unwrap_err();
-        assert!(matches!(err, JsInspectorError::JsError(_)));
-    }
-
-    #[test]
-    fn test_memory_slice_rejects_non_finite_end() {
-        let code = r#"{
-            depths: [],
-            step: function(log) { this.depths.push(log.memory.slice(0, Infinity)); },
-            fault: function() {},
-            result: function() { return this.depths; }
-        }"#;
-        let err = try_run_trace(code, None, true).unwrap_err();
-        assert!(matches!(err, JsInspectorError::JsError(_)));
+        let res = run_trace(code, None, true);
+        assert_eq!(res, json!([0, 2, 0]));
     }
 
     #[test]
@@ -1494,75 +1657,107 @@ mod tests {
     }
 
     #[test]
-    fn test_stack_peek() {
+    fn test_memory_get_uint_returns_bigint() {
         let code = r#"{
-            depths: [],
-            step: function(log) { this.depths.push(log.stack.peek(-1)); },
+            res: [],
+            step: function(log) {
+                if (log.op.toString() === 'STOP') {
+                    var word = log.memory.getUint(0);
+                    this.res.push(typeof word, word.toString(), log.memory.getUint(NaN).toString());
+                    this.res.push(log.memory.getUint(Infinity).toString());
+                }
+            },
             fault: function() {},
-            result: function() { return this.depths; }
+            result: function() { return this.res; }
         }"#;
-        let err = try_run_trace(code, None, true).unwrap_err();
-        assert!(matches!(err, JsInspectorError::JsError(_)));
+        // PUSH1 42, PUSH1 0, MSTORE, STOP
+        let res = run_trace(code, Some(bytes!("0x602a60005200")), true);
+        assert_eq!(res, json!(["bigint", "42", "42", "42"]));
     }
 
     #[test]
-    fn test_stack_peek_nan() {
-        let code = r#"{
-            depths: [],
-            step: function(log) { this.depths.push(log.stack.peek(NaN)); },
-            fault: function() {},
-            result: function() { return this.depths; }
-        }"#;
-        let err = try_run_trace(code, None, true).unwrap_err();
-        assert!(matches!(err, JsInspectorError::JsError(_)));
+    fn test_memory_and_stack_errors_match_geth() {
+        // PUSH1 42, PUSH1 0, MSTORE, PUSH1 1, PUSH1 2, STOP
+        let contract = Some(bytes!("0x602a600052600160020000"));
+        for (expression, expected) in [
+            ("log.memory.slice(5, 2)", "tracer accessed out of bound memory: offset 5, end 2"),
+            ("log.memory.slice(-1, 4)", "tracer accessed out of bound memory: offset -1, end 4"),
+            (
+                "log.memory.slice(0, 1e30)",
+                "tracer accessed out of bound memory: offset 0, end -9223372036854775808",
+            ),
+            (
+                "log.memory.slice(0, 1048577 + 32)",
+                "reached limit for padding memory slice: 1048577",
+            ),
+            (
+                "log.memory.getUint(1)",
+                "tracer accessed out of bound memory: available 32, offset 1, size 32",
+            ),
+            (
+                "log.memory.getUint(-1)",
+                "tracer accessed out of bound memory: available 32, offset -1, size 32",
+            ),
+            ("log.stack.peek(2)", "tracer accessed out of bound stack: size 2, index 2"),
+            ("log.stack.peek(-1)", "tracer accessed out of bound stack: size 2, index -1"),
+            (
+                "log.stack.peek(9223372036854775807n)",
+                "tracer accessed out of bound stack: size 2, index -9223372036854775808",
+            ),
+        ] {
+            let code = format!(
+                "{{step: function(log) {{ if (log.op.toString() === 'STOP') {expression}; }}, fault: function() {{}}, result: function() {{}}}}"
+            );
+            let JsInspectorError::JsError(error) =
+                try_run_trace(&code, contract.clone(), true).unwrap_err()
+            else {
+                panic!("{expression}: unexpected error");
+            };
+            assert_eq!(
+                error.as_native().unwrap().message(),
+                format!("{expected}    in server-side tracer function 'step'"),
+                "{expression}"
+            );
+        }
     }
 
     #[test]
-    fn test_stack_peek_infinity() {
+    fn test_stack_peek_index_conversion() {
         let code = r#"{
-            depths: [],
-            step: function(log) { this.depths.push(log.stack.peek(Infinity)); },
+            res: [],
+            step: function(log) {
+                if (log.op.toString() === 'STOP') {
+                    this.res.push(
+                        log.stack.peek(NaN).toString(),
+                        log.stack.peek(Infinity).toString(),
+                        log.stack.peek(1.5).toString(),
+                        log.stack.peek('1').toString(),
+                        log.stack.peek(1n).toString()
+                    );
+                }
+            },
             fault: function() {},
-            result: function() { return this.depths; }
+            result: function() { return this.res; }
         }"#;
-        let err = try_run_trace(code, None, true).unwrap_err();
-        assert!(matches!(err, JsInspectorError::JsError(_)));
+        let res = run_trace(code, Some(bytes!("0x600160020000")), true);
+        assert_eq!(res, json!(["2", "2", "1", "1", "1"]));
     }
 
     #[test]
-    fn test_memory_get_uint() {
+    fn test_frame_value_is_undefined_for_staticcall() {
         let code = r#"{
-            depths: [],
-            step: function(log, db) { this.depths.push(log.memory.getUint(-64)); },
+            res: [],
+            enter: function(frame) { this.res.push([frame.getType(), String(frame.getValue())]); },
+            exit: function() {},
             fault: function() {},
-            result: function() { return this.depths; }
+            result: function() { return this.res; }
         }"#;
-        let err = try_run_trace(code, None, true).unwrap_err();
-        assert!(matches!(err, JsInspectorError::JsError(_)));
-    }
-
-    #[test]
-    fn test_memory_get_uint_rejects_non_finite_offset() {
-        let code = r#"{
-            depths: [],
-            step: function(log, db) { this.depths.push(log.memory.getUint(Infinity)); },
-            fault: function() {},
-            result: function() { return this.depths; }
-        }"#;
-        let err = try_run_trace(code, None, true).unwrap_err();
-        assert!(matches!(err, JsInspectorError::JsError(_)));
-    }
-
-    #[test]
-    fn test_memory_get_uint_rejects_nan_offset() {
-        let code = r#"{
-            depths: [],
-            step: function(log, db) { this.depths.push(log.memory.getUint(NaN)); },
-            fault: function() {},
-            result: function() { return this.depths; }
-        }"#;
-        let err = try_run_trace(code, None, true).unwrap_err();
-        assert!(matches!(err, JsInspectorError::JsError(_)));
+        // CALL and STATICCALL of the identity precompile.
+        let calls = bytes!("0x6000600060006000600060046101fff1600060006000600060046101fffa00");
+        assert_eq!(
+            run_trace(code, Some(calls), true),
+            json!([["CALL", "0"], ["STATICCALL", "undefined"]])
+        );
     }
 
     #[test]
@@ -1857,7 +2052,7 @@ mod tests {
                 if (op === 'MSTORE8' || op === 'STOP') {
                     this.res.push(log.memory.length());
                     if (log.memory.length() > 0) {
-                        this.res.push(log.memory.getUint(0)[0]);
+                        this.res.push(Number(log.memory.getUint(0) >> 248n));
                         this.res.push(log.memory.slice(0, 2)[0]);
                     }
                 }
@@ -1928,8 +2123,6 @@ mod tests {
         let code = r#"{
             counts: { log: 0, db: 0, enter: 0, exit: 0 },
             setup: function(config) {
-                if (config.used) throw new Error("config was reused");
-                config.used = true;
                 this.ready = true;
             },
             mark: function(object, kind) {

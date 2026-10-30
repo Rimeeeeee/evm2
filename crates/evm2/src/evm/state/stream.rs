@@ -45,6 +45,12 @@ pub struct AccountChanges<'a> {
     pub selfdestructed: bool,
     /// Whether the last code change adopted an existing hash.
     pub code_adopted: bool,
+    /// Whether the account was touched by the transaction, even if [`Self::is_changed`] is false.
+    ///
+    /// Loaded-only accounts are not touched. Reverted touches are excluded, except for the
+    /// EIP-161 precompile-3 rule. This metadata survives transaction finalization and detachment.
+    /// It is not emitted through [`StateChangeSink`].
+    pub touched: bool,
     /// The account's new bytecode keyed by code hash, when its code changed to non-empty code.
     pub code: Option<(B256, &'a Bytecode)>,
     /// The account's loaded storage slots and wipe marker.

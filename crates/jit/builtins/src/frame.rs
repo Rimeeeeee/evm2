@@ -2,11 +2,9 @@
 
 use super::*;
 
-builtins! {
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn __revmc_builtin_approve(
-    ecx: &mut EvmContext,
+#[inline]
+pub unsafe fn __revmc_builtin_approve<T: EvmTypesHost>(
+    ecx: &mut EvmContext<'_, '_, '_, T>,
     sp: &mut [EvmWord; 3],
 ) -> BuiltinResult {
     let rev![offset, len, scope] = sp;
@@ -27,23 +25,20 @@ pub unsafe extern "C" fn __revmc_builtin_approve(
     Err(InstrStop::Return.into())
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn __revmc_builtin_txparam(
-    ecx: &mut EvmContext,
+#[inline]
+pub unsafe fn __revmc_builtin_txparam<T: EvmTypesHost>(
+    ecx: &mut EvmContext<'_, '_, '_, T>,
     param: &mut EvmWord,
 ) -> BuiltinResult {
     let left = ecx.gas.reservoir();
-    *param = ecx
-        .host()
-        .frame_tx_param(param.to_u256(), left)
-        .ok_or(InstrStop::OpcodeNotFound)?
-        .into();
+    *param =
+        ecx.host().frame_tx_param(param.to_u256(), left).ok_or(InstrStop::OpcodeNotFound)?.into();
     Ok(())
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn __revmc_builtin_framedataload(
-    ecx: &mut EvmContext,
+#[inline]
+pub unsafe fn __revmc_builtin_framedataload<T: EvmTypesHost>(
+    ecx: &mut EvmContext<'_, '_, '_, T>,
     sp: &mut [EvmWord; 2],
 ) -> BuiltinResult {
     let rev![offset, index] = sp;
@@ -53,9 +48,9 @@ pub unsafe extern "C" fn __revmc_builtin_framedataload(
     Ok(())
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn __revmc_builtin_frameparam(
-    ecx: &mut EvmContext,
+#[inline]
+pub unsafe fn __revmc_builtin_frameparam<T: EvmTypesHost>(
+    ecx: &mut EvmContext<'_, '_, '_, T>,
     sp: &mut [EvmWord; 2],
 ) -> BuiltinResult {
     let rev![index, param] = sp;
@@ -67,9 +62,9 @@ pub unsafe extern "C" fn __revmc_builtin_frameparam(
     Ok(())
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn __revmc_builtin_sigparam(
-    ecx: &mut EvmContext,
+#[inline]
+pub unsafe fn __revmc_builtin_sigparam<T: EvmTypesHost>(
+    ecx: &mut EvmContext<'_, '_, '_, T>,
     sp: &mut [EvmWord; 2],
 ) -> BuiltinResult {
     let rev![index, param] = sp;
@@ -81,9 +76,9 @@ pub unsafe extern "C" fn __revmc_builtin_sigparam(
     Ok(())
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn __revmc_builtin_txtrace(
-    ecx: &mut EvmContext,
+#[inline]
+pub unsafe fn __revmc_builtin_txtrace<T: EvmTypesHost>(
+    ecx: &mut EvmContext<'_, '_, '_, T>,
     sp: &mut [EvmWord; 2],
 ) -> BuiltinResult {
     let rev![param, index] = sp;
@@ -95,9 +90,9 @@ pub unsafe extern "C" fn __revmc_builtin_txtrace(
     Ok(())
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn __revmc_builtin_framedatacopy(
-    ecx: &mut EvmContext,
+#[inline]
+pub unsafe fn __revmc_builtin_framedatacopy<T: EvmTypesHost>(
+    ecx: &mut EvmContext<'_, '_, '_, T>,
     sp: &mut [EvmWord; 4],
 ) -> BuiltinResult {
     let rev![memory, offset, len, index] = sp;
@@ -105,19 +100,20 @@ pub unsafe extern "C" fn __revmc_builtin_framedatacopy(
     copy_frame_bytes(ecx, memory.to_u256(), offset.to_u256(), len.to_u256(), &data, false)
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn __revmc_builtin_sigdatacopy(
-    ecx: &mut EvmContext,
+#[inline]
+pub unsafe fn __revmc_builtin_sigdatacopy<T: EvmTypesHost>(
+    ecx: &mut EvmContext<'_, '_, '_, T>,
     sp: &mut [EvmWord; 4],
 ) -> BuiltinResult {
     let rev![memory, offset, len, index] = sp;
-    let data = ecx.host().frame_signature_bytes(index.to_u256()).ok_or(InstrStop::OpcodeNotFound)?;
+    let data =
+        ecx.host().frame_signature_bytes(index.to_u256()).ok_or(InstrStop::OpcodeNotFound)?;
     copy_frame_bytes(ecx, memory.to_u256(), offset.to_u256(), len.to_u256(), &data, false)
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn __revmc_builtin_eventdatacopy(
-    ecx: &mut EvmContext,
+#[inline]
+pub unsafe fn __revmc_builtin_eventdatacopy<T: EvmTypesHost>(
+    ecx: &mut EvmContext<'_, '_, '_, T>,
     sp: &mut [EvmWord; 4],
 ) -> BuiltinResult {
     let rev![index, memory, offset, len] = sp;
@@ -125,8 +121,8 @@ pub unsafe extern "C" fn __revmc_builtin_eventdatacopy(
     copy_frame_bytes(ecx, memory.to_u256(), offset.to_u256(), len.to_u256(), &data, true)
 }
 
-fn copy_frame_bytes(
-    ecx: &mut EvmContext,
+fn copy_frame_bytes<T: EvmTypesHost>(
+    ecx: &mut EvmContext<'_, '_, '_, T>,
     memory: U256,
     offset: U256,
     len: U256,
@@ -145,6 +141,4 @@ fn copy_frame_bytes(
         ecx.memory_mut().set_data(memory, offset, len, data);
     }
     Ok(())
-}
-
 }

@@ -22,6 +22,7 @@ alloy-eip7928.workspace = true
 alloy-eips.workspace = true
 alloy-primitives.workspace = true
 auto_impl.workspace = true
+bitflags.workspace = true
 derive-where.workspace = true
 thiserror.workspace = true
 typeid.workspace = true
@@ -36,6 +37,9 @@ phf = { workspace = true, features = ["macros"], optional = true }
 
 # "serde"
 serde = { workspace = true, features = ["derive", "alloc"], optional = true }
+
+# "wincode"
+wincode = { workspace = true, optional = true }
 
 # "async"
 corosensei = { workspace = true, optional = true }
@@ -132,6 +136,7 @@ std = [
     "ark-serialize/std",
     "ark-std/std",
     "aurora-engine-modexp/std",
+    "bitflags/std",
     "k256/std",
     "once_cell/std",
     "p256/std",
@@ -140,12 +145,15 @@ std = [
     "c-kzg?/std",
     "secp256k1?/std",
     "serde?/std",
+    "wincode?/std",
     "triomphe?/std",
     "ruint?/std",
     "dep:stacker",
 ]
 
 async = ["std", "dep:corosensei"]
+
+wincode = ["dep:wincode"]
 
 serde = [
     "dep:serde",
@@ -154,6 +162,7 @@ serde = [
     "alloy-eips/serde",
     "alloy-primitives/serde",
     "ark-serialize/serde",
+    "bitflags/serde",
     "derive-where/serde",
     "k256/serde",
     "p256/serde",
