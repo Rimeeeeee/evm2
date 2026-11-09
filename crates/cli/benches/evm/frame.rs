@@ -1,9 +1,9 @@
 //! Warm ordinary and frame execution across interpreter, inspection, JIT and AOT backends.
 
 use alloy_consensus::{TxEip8141, TxLegacy, transaction::Recovered};
-use alloy_eips::eip8141::{
-    Frame, FrameLimits, FrameMode, FrameSignature, FrameStatus, NONCE_MANAGER, SignatureScheme,
-    nonce_keys_hash,
+use alloy_eips::{
+    eip8141::{Frame, FrameLimits, FrameMode, FrameSignature, FrameStatus, SignatureScheme},
+    eip8250::{NONCE_MANAGER, nonce_keys_hash},
 };
 use alloy_primitives::{Address, Bytes, TxKind, U256};
 use criterion::{BenchmarkGroup, Criterion, black_box, measurement::WallTime};
