@@ -2626,6 +2626,7 @@ dependencies = [
  "codspeed-criterion-compat",
  "evm2",
  "evm2-eest",
+ "evm2-inspectors",
  "evm2-jit-build",
  "evm2-jit-context",
  "evm2-jit-llvm",

@@ -3,11 +3,7 @@
 use evm2::SpecId;
 use revm::primitives::hardfork::SpecId as ReferenceSpecId;
 
-/// Returns the reference implementation's spec ID for `spec`.
-///
-/// # Panics
-///
-/// Panics when the reference implementation has no counterpart of `spec`.
+/// Returns the reference spec ID, falling back to Amsterdam for unsupported forks.
 pub const fn spec_id(spec: SpecId) -> ReferenceSpecId {
     match spec {
         SpecId::FRONTIER => ReferenceSpecId::FRONTIER,
@@ -25,6 +21,6 @@ pub const fn spec_id(spec: SpecId) -> ReferenceSpecId {
         SpecId::PRAGUE => ReferenceSpecId::PRAGUE,
         SpecId::OSAKA => ReferenceSpecId::OSAKA,
         SpecId::AMSTERDAM => ReferenceSpecId::AMSTERDAM,
-        _ => panic!("unsupported reference spec"),
+        _ => ReferenceSpecId::AMSTERDAM,
     }
 }
