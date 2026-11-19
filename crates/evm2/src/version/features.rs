@@ -275,6 +275,10 @@ evm_features! {
     EIP4758,
     /// Applies [EIP-8151](https://eips.ethereum.org/EIPS/eip-8151) recovery restrictions.
     EIP8151,
+    /// EIP-8288 dependency frame execution, after block-level proof validation.
+    ///
+    /// Default: off. The embedding client must verify dependency coverage before enabling it.
+    EIP8288,
 }
 
 #[cfg(test)]

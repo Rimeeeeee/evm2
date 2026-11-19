@@ -26,6 +26,7 @@ use alloy_eips::{
         FrameGasUsed, FrameMode, FrameReceipt, FrameStatus, MAX_FRAMES, SignatureScheme,
     },
     eip8250::{MAX_NONCE_KEYS, NONCE_MANAGER, nonce_calldata, nonce_slot, validate_nonce_keys},
+    eip8288::validate_dependency_frame,
 };
 use alloy_primitives::{Address, B256, Bytes, U256};
 use core::marker::PhantomData;
@@ -171,7 +172,8 @@ impl FrameGas {
             })?;
         let tokens = sum(tokens, elided_tokens)?;
         let floor_tokens = sum(floor_tokens, elided_tokens)?;
-        let intrinsic = sum(base, mul(tokens, gp.get(GasId::TxTokenCost))?)?;
+        let intrinsic =
+            sum(sum(base, mul(tokens, gp.get(GasId::TxTokenCost))?)?, tx.recursive_stark_gas())?;
         let floor = sum(base, mul(floor_tokens, gp.get(GasId::TxFloorCostPerToken))?)?;
         // Positive intrinsic gas makes checked totals reject saturation in the shared frame sums.
         let execution = sum(intrinsic, tx.total_frame_execution_gas_limit())?.max(floor);
@@ -270,7 +272,12 @@ pub fn prepare_with_hooks<T: EvmTypes, H: TxHandlerHooks<T>>(
     }
     validate_block_gas_limit(host.version(), gas.execution.max(gas.state), host.block.gas_limit)?;
     let placeholders = host.feature(EvmFeatures::FRAME_SIGNATURE_PLACEHOLDERS);
-    validate_structure(tx, placeholders, host.feature(EvmFeatures::EIP7906))?;
+    validate_structure(
+        tx,
+        placeholders,
+        host.feature(EvmFeatures::EIP7906),
+        host.feature(EvmFeatures::EIP8288),
+    )?;
     // The requested tip product can exceed U256 even when the signed budget is valid.
     // Saturating before the minimum preserves the arbitrary-precision result.
     let max_priority_fee =
@@ -426,7 +433,12 @@ fn validate_signatures(tx: &TxEip8141, hash: B256, placeholders: bool) -> Handle
 }
 
 /// Checks frame flags, batching, assertion ordering, expiry fields, and signature structure.
-fn validate_structure(tx: &TxEip8141, placeholders: bool, assertions: bool) -> HandlerResult<()> {
+fn validate_structure(
+    tx: &TxEip8141,
+    placeholders: bool,
+    assertions: bool,
+    dependencies: bool,
+) -> HandlerResult<()> {
     // Shared wire validation also applies a fixed gas schedule. Native execution must use
     // the selected Version, so validate structure here and calculate reservations separately.
     if tx.frames.iter().any(Frame::has_reserved_flags) {
@@ -441,6 +453,13 @@ fn validate_structure(tx: &TxEip8141, placeholders: bool, assertions: bool) -> H
     let mut expiry = false;
     for (index, frame) in tx.frames.iter().enumerate() {
         let previous_atomic = index > 0 && tx.frames[index - 1].is_atomic_batch();
+        if frame.mode == FrameMode::DependencyVerify {
+            if !dependencies {
+                return Err(invalid(FrameTransactionError::DependenciesNotActive));
+            }
+            validate_dependency_frame(frame, previous_atomic)
+                .map_err(|error| invalid(FrameTransactionError::InvalidDependency(error)))?;
+        }
         if frame.mode != FrameMode::Sender && !frame.value.is_zero() {
             return Err(invalid(FrameTransactionError::ValueTransferNotAllowed));
         }
@@ -768,6 +787,9 @@ fn execute_frame<T: EvmTypes>(
     tx: &TxEip8141,
     frame: &Frame,
 ) -> HandlerResult<(InstrStop, u64, u64, i64, Bytes)> {
+    if frame.mode == FrameMode::DependencyVerify {
+        return Ok((InstrStop::Stop, frame.limits.execution, 0, 0, Bytes::new()));
+    }
     let target = frame.resolved_target(tx.sender);
     let mut gas = GasTracker::new_isolated(frame.limits.execution, frame.limits.state);
     let run = (|| -> Result<MessageResultExt<T::MessageResultExt>, HostError> {
