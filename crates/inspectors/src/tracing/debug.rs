@@ -1,9 +1,9 @@
 use crate::tracing::{
     Erc7562Inspector, FourByteInspector, KECCAK256_PREIMAGE_TRACER, Keccak256PreimageInspector,
-    MuxInspector, TracingInspector, TracingInspectorConfig, TransactionContext,
+    MuxInspector, TraceLimits, TracingInspector, TracingInspectorConfig, TransactionContext,
     utils::transaction_info,
 };
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
 use alloy_consensus::{Transaction, transaction::Recovered};
 use alloy_primitives::{Address, Log, U256};
 use alloy_rpc_types_trace::geth::{
@@ -15,6 +15,7 @@ use evm2::{
     DatabaseError, EvmTypes, EvmTypesHost, Inspector, InspectorConfig, NoopInspector,
     TxResultWithState,
     env::BlockEnv,
+    ethereum::eip8141::FrameGas,
     evm::DynDatabase,
     interpreter::{Interpreter, Message, MessageResult},
 };
@@ -178,8 +179,42 @@ impl DebugInspector {
         Ok(this)
     }
 
+    /// Applies the limits to the tracers that record trace data, see [`Self::set_limits`].
+    pub fn with_limits(mut self, limits: TraceLimits) -> Self {
+        self.set_limits(limits);
+        self
+    }
+
+    /// Applies the limits to the tracers that record trace data, and keeps them across
+    /// [`Self::fuse`].
+    ///
+    /// The erc7562 tracer applies them to the call inputs it retains. Its preimages and those of
+    /// the keccak256 preimage tracer keep their own limit, which defaults to
+    /// [`DEFAULT_MAX_RECORDED_BYTES`](crate::tracing::DEFAULT_MAX_RECORDED_BYTES), so limits
+    /// without a maximum do not lift it. Each tracer of a mux tracer has its own budget. The
+    /// 4byte, noop, state-gas and JavaScript tracers record no unbounded byte data and ignore the
+    /// limits.
+    pub fn set_limits(&mut self, limits: TraceLimits) {
+        match self {
+            Self::CallTracer(inspector, _)
+            | Self::PreStateTracer(inspector, _)
+            | Self::FlatCallTracer(inspector, _)
+            | Self::Default(inspector, _) => inspector.set_limits(limits),
+            Self::Erc7562Tracer(inspector) => inspector.set_call_limits(limits),
+            Self::Mux(inspector, _) => inspector.set_limits(limits),
+            Self::FourByte(_)
+            | Self::Keccak256Preimage(_)
+            | Self::Noop(_)
+            | Self::StateGasTracer(_) => {}
+            #[cfg(feature = "js-tracer")]
+            Self::Js(_) => {}
+        }
+    }
+
     /// Prepares inspector for executing the next transaction. This will remove any state from
-    /// previous transactions.
+    /// previous transactions, except the global state of a JavaScript tracer: its script is
+    /// evaluated again in the same JS context, so `globalThis` properties and modified prototypes
+    /// persist until the inspector is dropped.
     pub fn fuse(&mut self) -> Result<(), DebugInspectorError> {
         match self {
             Self::FourByte(inspector) => {
@@ -346,6 +381,39 @@ macro_rules! delegate {
 }
 
 impl<T: EvmTypes> Inspector<T> for DebugInspector {
+    fn frame_transaction_start(
+        &mut self,
+        tx: &Arc<alloy_consensus::TxEip8141>,
+        gas: &FrameGas,
+        host: &mut T::Host<'_>,
+    ) {
+        delegate!(self => inspector.frame_transaction_start(tx, gas, host))
+    }
+
+    fn frame_start(
+        &mut self,
+        index: usize,
+        frame: &alloy_eips::eip8141::Frame,
+        host: &mut T::Host<'_>,
+    ) {
+        delegate!(self => inspector.frame_start(index, frame, host))
+    }
+
+    fn frame_end(
+        &mut self,
+        index: usize,
+        receipt: &alloy_eips::eip8141::FrameReceipt,
+        output: &alloy_primitives::Bytes,
+        stop: evm2::interpreter::InstrStop,
+        host: &mut T::Host<'_>,
+    ) {
+        delegate!(self => inspector.frame_end(index, receipt, output, stop, host))
+    }
+
+    fn frame_transaction_end(&mut self, result: &evm2::TxResult<T>, host: &mut T::Host<'_>) {
+        delegate!(self => inspector.frame_transaction_end(result, host))
+    }
+
     fn initialize_interp(&mut self, interp: &mut Interpreter<'_, '_, T>) {
         delegate!(self => inspector.initialize_interp(interp))
     }
@@ -429,7 +497,7 @@ pub enum DebugInspectorError {
     /// The keccak256 preimage tracer reached its limit of recorded bytes
     #[error(transparent)]
     Keccak256Preimage(#[from] crate::tracing::Keccak256PreimageLimitExceeded),
-    /// The erc7562 tracer reached its limit of recorded preimage bytes or failed to read the state
+    /// The erc7562 tracer reached a limit of recorded bytes or failed to read the state
     #[error(transparent)]
     Erc7562(#[from] crate::tracing::Erc7562Error),
     /// Error from JS inspector

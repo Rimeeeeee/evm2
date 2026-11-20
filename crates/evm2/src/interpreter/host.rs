@@ -1,4 +1,4 @@
-use super::{GasTracker, InstrStop, Message, Result, Word};
+use super::{Gas, GasTracker, InstrStop, Message, Result, Word};
 use crate::{
     BaseEvmTypes, DatabaseError, EvmTypesHost, ExecutionConfig, ExecutionError, HostError, SpecId,
     env::{BlockEnv, TxEnv},
@@ -133,6 +133,13 @@ pub trait Host<T: EvmTypesHost> {
     /// must keep it at a stable address while the interpreter runs.
     fn tx_env(&mut self) -> &TxEnv<T>;
 
+    /// Returns the inspector-visible depth of top-level messages.
+    ///
+    /// The call depth limit and the nested-create nonce check are measured from this depth, and
+    /// inspectors compare against it to find the top-level message. It should be at most
+    /// `u16::MAX - CALL_DEPTH_LIMIT - 1` so the deepest message stays representable.
+    fn initial_call_depth(&self) -> u16;
+
     /// Loads account information.
     fn load_account(
         &mut self,
@@ -179,7 +186,83 @@ pub trait Host<T: EvmTypesHost> {
         message: &mut Message<T>,
     ) -> Result<MessageResult<T>, ExecutionError>;
 
-    /// Registers the current contract for self-destruction.
+    /// Whether the active transaction uses independent frame budgets.
+    fn frame_transaction_active(&self) -> bool {
+        false
+    }
+
+    /// Reads a transaction parameter under the selected frame protocol.
+    fn frame_tx_param(&self, _param: Word, _state_left: u64) -> Option<Word> {
+        None
+    }
+
+    /// Reads one frame's immutable calldata.
+    fn frame_data(&self, _index: Word) -> Option<Bytes> {
+        None
+    }
+
+    /// Reads frame metadata or a completed frame's outcome.
+    fn frame_param(&self, _index: Word, _param: Word) -> Option<Word> {
+        None
+    }
+
+    /// Reads protocol signature metadata.
+    fn frame_signature_param(&self, _index: Word, _param: Word) -> Option<Word> {
+        None
+    }
+
+    /// Reads an arbitrary application signature witness.
+    fn frame_signature_bytes(&self, _index: Word) -> Option<Bytes> {
+        None
+    }
+
+    /// Whether the current top-level frame is a read-only assertion.
+    fn is_assert_frame(&self) -> bool {
+        false
+    }
+
+    /// Atomically applies approval and returns its state-gas charge.
+    fn approve_frame(
+        &mut self,
+        _address: Address,
+        _scope: Word,
+        _state_left: u64,
+    ) -> Result<u64, HostError> {
+        Err(InstrStop::OpcodeNotFound.into())
+    }
+
+    /// Journals a storage charge/refill and returns the spendable refill for this frame.
+    fn frame_sstore_gas(
+        &mut self,
+        _address: Address,
+        _key: Word,
+        _charge: u64,
+        refill: u64,
+    ) -> u64 {
+        refill
+    }
+
+    /// Reads a recorded transaction trace value in ASSERT mode.
+    fn txtrace(&mut self, _param: Word, _index: Word) -> Option<Word> {
+        None
+    }
+
+    /// Reads one recorded event's data in ASSERT mode.
+    fn event_data(&self, _index: Word) -> Option<Bytes> {
+        None
+    }
+
+    /// Adopts another account's code, charging the opcode's dynamic gas.
+    fn set_code_from(
+        &mut self,
+        _contract: &Address,
+        _source: &Address,
+        _gas: &mut Gas,
+    ) -> Result<bool, HostError> {
+        Err(InstrStop::OpcodeNotFound.into())
+    }
+
+    /// Transfers the current contract's balance and applies the active destruction rules.
     fn selfdestruct(
         &mut self,
         contract: &Address,

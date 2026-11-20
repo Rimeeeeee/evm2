@@ -16,6 +16,9 @@ use core::fmt::{self, Display};
 use derive_where::derive_where;
 
 /// Precompile implementation function.
+///
+/// It reads the message's input with [`Evm::message_input`], since the input of a call
+/// instruction's message is a range of the caller's memory.
 pub type PrecompileFn<T = BaseEvmTypes> =
     fn(&mut Evm<'_, T>, &Message<T>, &mut GasTracker) -> PrecompileResult;
 
@@ -238,7 +241,7 @@ impl<T: EvmTypesHost> PrecompileMap<T> {
 
     /// Returns the precompile data at `address`, if any.
     #[inline]
-    pub(super) fn get_data(&self, address: &Address) -> Option<&PrecompileData<T>> {
+    pub fn get_data(&self, address: &Address) -> Option<&PrecompileData<T>> {
         match short_address(address) {
             Some(index) if !self.short.get(index) => None,
             None if self.long_count == 0 => None,
@@ -449,11 +452,11 @@ macro_rules! define_precompiles {
             #[allow(non_snake_case)]
             $vis const fn $name<T: $crate::EvmTypesHost>() -> $crate::precompiles::Precompile<T> {
                 fn run<T: $crate::EvmTypesHost>(
-                    _evm: &mut $crate::Evm<'_, T>,
+                    evm: &mut $crate::Evm<'_, T>,
                     message: &$crate::interpreter::Message<T>,
                     gas: &mut $crate::interpreter::GasTracker,
                 ) -> $crate::precompiles::PrecompileResult {
-                    $f(message.input.as_ref(), gas)
+                    $f(evm.message_input(message), gas)
                 }
 
                 $crate::precompiles::Precompile::new(
@@ -468,9 +471,13 @@ macro_rules! define_precompiles {
 
 pub use crate::define_precompiles;
 
+/// secp256k1 public key recovery precompile.
+#[allow(non_snake_case)]
+pub const fn SECP256K1_ECRECOVER<T: EvmTypesHost>() -> Precompile<T> {
+    Precompile::new(Address::with_last_byte(1), PrecompileId::EcRec, secp256k1::run::<T>)
+}
+
 define_precompiles! {
-    /// secp256k1 public key recovery precompile.
-    pub const SECP256K1_ECRECOVER = (0x01, PrecompileId::EcRec) => secp256k1::run;
     /// SHA-256 precompile.
     pub const SHA256 = (0x02, PrecompileId::Sha256) => hash::run_sha256;
     /// RIPEMD-160 precompile.

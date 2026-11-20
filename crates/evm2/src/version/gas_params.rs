@@ -190,6 +190,8 @@ gas_ids! {
     Custom6;
     /// Reserved custom gas parameter slot 7.
     Custom7;
+    /// SETCODEFROM account write charge.
+    SetCodeFromWrite;
 }
 
 /// Dynamic gas parameter table.
@@ -415,14 +417,6 @@ impl GasParams {
         self.get(GasId::NewAccountState)
     }
 
-    /// Returns the EIP-8037 state gas charged per EIP-7702 authorization: the per-account portion
-    /// ([`Self::new_account_state_gas`]) plus the per-bytecode portion
-    /// ([`GasId::TxEip7702PerAuthState`]). Zero before Amsterdam.
-    #[inline]
-    pub const fn eip7702_auth_state_gas(&self) -> u64 {
-        self.new_account_state_gas().saturating_add(self.get(GasId::TxEip7702PerAuthState))
-    }
-
     /// Calculates the code-deposit state gas for `len` bytes (EIP-8037).
     #[inline]
     pub const fn code_deposit_state_gas(&self, len: usize) -> u64 {
@@ -472,6 +466,19 @@ impl GasParams {
             zero_bytes + non_zero_tokens,
             zero_bytes * self.get(GasId::TxFloorZeroByteMultiplier) + non_zero_tokens,
         )
+    }
+
+    /// Counts calldata tokens and floor tokens, returning `None` if either total overflows.
+    pub(crate) fn checked_tx_calldata_tokens(&self, input: &[u8]) -> Option<(u64, u64)> {
+        let zero_bytes = count_zero_bytes(input);
+        let non_zero_tokens = (input.len() as u64 - zero_bytes)
+            .checked_mul(self.get(GasId::TxTokenNonZeroByteMultiplier))?;
+        Some((
+            zero_bytes.checked_add(non_zero_tokens)?,
+            zero_bytes
+                .checked_mul(self.get(GasId::TxFloorZeroByteMultiplier))?
+                .checked_add(non_zero_tokens)?,
+        ))
     }
 
     /// Returns the EIP-7623 calldata floor gas: `TxFloorCostBase` plus `TxFloorCostPerToken` for
@@ -547,7 +554,7 @@ mod tests {
     fn gas_id_roundtrips_values() {
         assert_eq!(GasId::from_usize(0), Some(GasId::ExpByte));
         assert_eq!(GasId::ExpByte.as_usize(), 0);
-        assert_eq!(GasId::from_usize(GasId::MAX.as_usize()), Some(GasId::Custom7));
+        assert_eq!(GasId::from_usize(GasId::MAX.as_usize()), Some(GasId::MAX));
         assert_eq!(GasId::from_usize(GasId::COUNT), None);
     }
 

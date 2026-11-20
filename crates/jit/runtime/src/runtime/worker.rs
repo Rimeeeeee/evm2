@@ -20,8 +20,6 @@ use crate::{
 use alloy_primitives::Bytes;
 use crossbeam_channel as chan;
 use rayon::{ThreadPool, ThreadPoolBuilder};
-#[cfg(feature = "llvm")]
-use std::{cell::RefCell, time::Instant};
 use std::{
     sync::{
         Arc,
@@ -37,6 +35,8 @@ use crate::{
     llvm::{JitDylibGuard, orc::ResourceTracker},
     runtime::config::JitMode,
 };
+#[cfg(feature = "llvm")]
+use std::{cell::RefCell, time::Instant};
 
 #[cfg(all(feature = "llvm", unix))]
 type OutOfProcessHelper = Option<Arc<super::out_of_process::HelperProcess>>;
@@ -468,6 +468,46 @@ impl CompilerTarget {
 
 #[cfg(feature = "llvm")]
 pub(super) fn compile_with_state(
+    mut job: CompileJob,
+    config: &RuntimeConfig,
+    target: CompilerTarget,
+    state_slot: &mut Option<CompilerState>,
+) -> WorkerResult {
+    // A panic while compiling must fail this job rather than unwind into the Rayon pool, which
+    // aborts the process when a spawned job panics.
+    let (key, kind, generation) = (job.key, job.kind, job.generation);
+    let sync_notifier = std::mem::replace(&mut job.sync_notifier, SyncNotifier::none());
+    let t0 = Instant::now();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        compile_with_state_inner(job, config, target, state_slot)
+    }));
+    match result {
+        Ok(result) => WorkerResult { sync_notifier, ..result },
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".into());
+            error!(hash = %key.code_hash, spec_id = ?key.spec_id, %message, "compilation panicked");
+            // The compiler may be left inconsistent: build a fresh one for the next job.
+            *state_slot = None;
+            WorkerResult {
+                key,
+                outcome: Err(format!("compilation panicked: {message}")),
+                kind,
+                sync_notifier,
+                generation,
+                compile_duration: t0.elapsed(),
+                timings: CompileTimings::default(),
+                transient: false,
+            }
+        }
+    }
+}
+
+#[cfg(feature = "llvm")]
+fn compile_with_state_inner(
     job: CompileJob,
     config: &RuntimeConfig,
     target: CompilerTarget,
@@ -707,15 +747,7 @@ pub(super) fn compile_jit_object_artifact(
     compiler: &mut EvmCompiler<EvmLlvmBackend>,
 ) -> Result<WorkerSuccess, String> {
     let object_bytes = compile_object(job, compiler)?;
-    let mut builtin_symbols: Vec<String> = compiler
-        .backend()
-        .pending_symbol_names()
-        .into_iter()
-        .map(|name| name.to_string_lossy().into_owned())
-        .collect();
-    if builtin_symbols.is_empty() {
-        builtin_symbols = builtin_symbol_names(compiler.builtin_symbol_suffix());
-    }
+    let builtin_symbols = builtin_symbol_names(compiler.builtin_symbol_suffix());
 
     debug!(
         bytecode_len = job.bytecode.len(),
@@ -871,6 +903,7 @@ mod lifecycle_tests {
             ["first-exit", "second-enter", "second-exit", "tls-enter", "tls-exit", "owner-exit"]
         );
     }
+
     #[test]
     fn shutdown_joins_remaining_workers_before_reporting_a_panic() {
         let mut pool = workers(0);
@@ -885,10 +918,44 @@ mod lifecycle_tests {
             let error = pool.shutdown().unwrap_err();
             assert!(pool.threads.is_empty());
             assert_eq!(exited_rx.try_recv(), Ok(()));
-            assert!(error.to_string().contains("1 compile worker thread(s) panicked"));
+            assert_eq!(error.to_string(), "1 compile worker thread(s) panicked");
             pool.shutdown().unwrap();
         });
         release.send(()).unwrap();
         owner.join().unwrap();
+    }
+
+    #[cfg(feature = "llvm")]
+    #[test]
+    fn cancun_sstore_compiles_without_fallback() {
+        for target in [CompilerTarget::Jit, CompilerTarget::Aot] {
+            let bytecode = Bytes::from_static(&[0x60, 0x42, 0x5f, 0x55, 0x00]);
+            let config = RuntimeConfig::default();
+            let mut state = None;
+            let result = compile_with_state(
+                CompileJob {
+                    kind: if target == CompilerTarget::Aot {
+                        CompilationKind::Aot
+                    } else {
+                        CompilationKind::Jit
+                    },
+                    key: RuntimeCacheKey {
+                        code_hash: alloy_primitives::keccak256(&bytecode),
+                        spec_id: evm2::SpecId::CANCUN,
+                    },
+                    bytecode,
+                    symbol_name: "cancun_sstore_compiles_without_fallback".into(),
+                    opt_level: OptimizationLevel::None,
+                    sync_notifier: SyncNotifier::none(),
+                    generation: 0,
+                },
+                &config,
+                target,
+                &mut state,
+            );
+            if let Err(error) = result.outcome {
+                panic!("Cancun SSTORE {target:?} compilation failed: {error}");
+            }
+        }
     }
 }

@@ -11,7 +11,7 @@ use alloy_primitives::{
 };
 
 /// One block's account transitions, finalized into a [`BundleState`] with their reverts.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct BlockState {
     transitions: AddressMap<TransitionAccount>,
     contracts: B256Map<Bytecode>,
@@ -376,6 +376,7 @@ mod tests {
                 current: Some(&updated),
                 created: false,
                 selfdestructed: false,
+                code_adopted: false,
                 touched: false,
                 code: None,
                 storage: &StorageOverlay::default(),
@@ -420,6 +421,7 @@ mod tests {
                     current: Some(&info),
                     created: false,
                     selfdestructed: false,
+                    code_adopted: false,
                     touched: false,
                     code: None,
                     storage: &storage,
@@ -431,6 +433,7 @@ mod tests {
                     current: (step == 3 || step == 4).then_some(&info),
                     created: step == 3,
                     selfdestructed: step != 3,
+                    code_adopted: false,
                     touched: false,
                     code: (step == 3).then(|| (code.hash_slow(), &code)),
                     storage: &storage,
@@ -444,6 +447,7 @@ mod tests {
                 current: Some(&info),
                 created: false,
                 selfdestructed: false,
+                code_adopted: false,
                 touched: false,
                 code: None,
                 storage: &empty,
@@ -499,6 +503,7 @@ mod tests {
                 current: Some(&info),
                 created: true,
                 selfdestructed: true,
+                code_adopted: false,
                 touched: false,
                 code: None,
                 storage: &storage,
@@ -528,6 +533,7 @@ mod tests {
                     current: Some(&info),
                     created: false,
                     selfdestructed: false,
+                    code_adopted: false,
                     touched: false,
                     code: None,
                     storage: &storage,
@@ -556,6 +562,7 @@ mod tests {
                     current: Some(&info),
                     created: false,
                     selfdestructed: false,
+                    code_adopted: false,
                     touched: false,
                     code: None,
                     storage: &storage,

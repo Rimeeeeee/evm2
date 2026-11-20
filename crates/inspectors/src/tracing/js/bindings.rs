@@ -36,6 +36,7 @@ use evm2::{
     evm::{AccountInfo, DbResult, DynDatabase, PendingState, State},
     interpreter::{
         Word,
+        instructions::{decode_pair, decode_single},
         opcode::{
             OpCode, op as opcode,
             op::{PUSH0, PUSH32},
@@ -240,6 +241,8 @@ pub(crate) struct PreStep<'a> {
     pub(crate) pc: u64,
     /// Opcode to be executed
     pub(crate) op: u8,
+    /// Byte after the opcode, or 0 if the bytecode ends there
+    pub(crate) immediate: u8,
     /// Remaining gas before step execution
     pub(crate) gas_remaining: u64,
     /// Stack before step execution
@@ -349,6 +352,13 @@ impl ReusableCallFrame {
             }
             .into())
         });
+        let get_frame_index = state_fn(ctx, state.clone(), 0, |state, _, _| {
+            Ok(state
+                .borrow()
+                .frame_index
+                .map(|index| JsValue::from(index as u64))
+                .unwrap_or_else(JsValue::undefined))
+        });
 
         object.set(js_string!("getFrom"), get_from, false, ctx)?;
         object.set(js_string!("getTo"), get_to, false, ctx)?;
@@ -356,12 +366,13 @@ impl ReusableCallFrame {
         object.set(js_string!("getInput"), get_input, false, ctx)?;
         object.set(js_string!("getGas"), get_gas, false, ctx)?;
         object.set(js_string!("getType"), get_type, false, ctx)?;
+        object.set(js_string!("getFrameIndex"), get_frame_index, false, ctx)?;
 
         Ok(Self { state, object })
     }
 
     pub(crate) fn update(&self, frame: CallFrame) {
-        let CallFrame { contract, kind, gas } = frame;
+        let CallFrame { contract, kind, gas, frame_index } = frame;
         let mut state = self.state.borrow_mut();
         state.caller = contract.caller;
         state.contract = contract.contract;
@@ -369,6 +380,7 @@ impl ReusableCallFrame {
         state.input = contract.input;
         state.gas = gas;
         state.kind = kind;
+        state.frame_index = frame_index;
     }
 
     pub(crate) fn value(&self) -> JsValue {
@@ -401,20 +413,29 @@ impl ReusableFrameResult {
                 .map(|error| JsValue::from(js_string!(error.as_str())))
                 .unwrap_or_else(JsValue::undefined))
         });
+        let get_frame_index = state_fn(ctx, state.clone(), 0, |state, _, _| {
+            Ok(state
+                .borrow()
+                .frame_index
+                .map(|index| JsValue::from(index as u64))
+                .unwrap_or_else(JsValue::undefined))
+        });
 
         object.set(js_string!("getGasUsed"), get_gas_used, false, ctx)?;
         object.set(js_string!("getOutput"), get_output, false, ctx)?;
         object.set(js_string!("getError"), get_error, false, ctx)?;
+        object.set(js_string!("getFrameIndex"), get_frame_index, false, ctx)?;
 
         Ok(Self { state, object })
     }
 
     pub(crate) fn update(&self, frame: FrameResult) {
-        let FrameResult { gas_used, output, error } = frame;
+        let FrameResult { gas_used, output, error, frame_index } = frame;
         let mut state = self.state.borrow_mut();
         state.gas_used = gas_used;
         state.output = output;
         state.error = error;
+        state.frame_index = frame_index;
     }
 
     pub(crate) fn value(&self) -> JsValue {
@@ -647,12 +668,12 @@ pub(crate) struct StepSnapshot {
 impl StepSnapshot {
     /// Records everything about a step that must be captured before the opcode executes.
     pub(crate) fn record(&mut self, step: PreStep<'_>) {
-        let PreStep { pc, op, gas_remaining, stack, memory } = step;
+        let PreStep { pc, op, immediate, gas_remaining, stack, memory } = step;
         let state = self;
         state.pc = pc;
         state.op = op;
         state.gas_remaining = gas_remaining;
-        state.stack.record(op, stack);
+        state.stack.record(op, immediate, stack);
         state.memory.record(op, stack, memory);
     }
 }
@@ -729,6 +750,9 @@ impl OpcodeNames {
 /// An opcode only touches its top `inputs` items, so the pre-execution stack is the post-execution
 /// stack below those items followed by the saved inputs. This holds for halted opcodes too, which
 /// pop at most `inputs` items.
+///
+/// SWAPN and EXCHANGE declare no inputs but swap items at depths decoded from their immediate, so
+/// they save every item down to the deepest one they touch.
 #[derive(Debug, Default)]
 struct StackView {
     /// Pre-execution length.
@@ -740,9 +764,17 @@ struct StackView {
 }
 
 impl StackView {
-    fn record(&mut self, op: u8, stack: &[U256]) {
+    fn record(&mut self, op: u8, immediate: u8, stack: &[U256]) {
         self.len = stack.len();
-        let inputs = OpCode::new(op).map_or(0, |op| op.inputs() as usize).min(stack.len());
+        let inputs = match op {
+            // An invalid immediate halts the opcode before it touches the stack.
+            opcode::SWAPN => decode_single(immediate).map_or(0, |n| usize::from(n) + 1),
+            opcode::EXCHANGE => {
+                decode_pair(immediate).map_or(0, |(n, m)| usize::from(n.max(m)) + 1)
+            }
+            _ => OpCode::new(op).map_or(0, |op| op.inputs() as usize),
+        }
+        .min(stack.len());
         self.saved.clear();
         self.saved.extend_from_slice(&stack[stack.len() - inputs..]);
     }
@@ -856,6 +888,7 @@ fn memory_write_range(op: u8, stack: &[U256]) -> Option<(usize, usize)> {
 
 #[derive(Debug, Default)]
 struct CallFrameState {
+    frame_index: Option<usize>,
     caller: Address,
     contract: Address,
     value: U256,
@@ -866,6 +899,7 @@ struct CallFrameState {
 
 #[derive(Debug, Default)]
 struct FrameResultState {
+    frame_index: Option<usize>,
     gas_used: u64,
     output: Bytes,
     error: Option<String>,
@@ -1003,6 +1037,7 @@ pub(crate) struct Contract {
 
 /// Represents the call frame object for exit functions
 pub(crate) struct FrameResult {
+    pub(crate) frame_index: Option<usize>,
     pub(crate) gas_used: u64,
     pub(crate) output: Bytes,
     pub(crate) error: Option<String>,
@@ -1010,6 +1045,7 @@ pub(crate) struct FrameResult {
 
 /// Represents the call frame object for enter functions
 pub(crate) struct CallFrame {
+    pub(crate) frame_index: Option<usize>,
     pub(crate) contract: Contract,
     pub(crate) kind: FrameKind,
     pub(crate) gas: u64,
@@ -1030,7 +1066,7 @@ impl Default for FrameKind {
 
 /// The `ctx` object that represents the context in which the transaction is executed.
 pub(crate) struct JsEvmContext {
-    /// String, one of the two values CALL and CREATE
+    /// String, CALL, CREATE, or the synthetic FRAME transaction root.
     pub(crate) r#type: String,
     /// Sender of the transaction
     pub(crate) from: Address,
@@ -1131,7 +1167,14 @@ mod tests {
         f: impl FnOnce() -> R,
     ) -> R {
         let mut snapshot = StepSnapshot::default();
-        snapshot.record(PreStep { pc: 0, op, gas_remaining: 0, stack, memory: &memory.borrow() });
+        snapshot.record(PreStep {
+            pc: 0,
+            op,
+            immediate: 0,
+            gas_remaining: 0,
+            stack,
+            memory: &memory.borrow(),
+        });
         log.with_scope(
             &mut snapshot,
             stack,
@@ -1591,7 +1634,7 @@ mod tests {
             (opcode::STOP, pre.to_vec()),
         ] {
             let mut view = StackView::default();
-            view.record(op, &pre);
+            view.record(op, 0, &pre);
             let post: &'static [U256] = post.leak();
             view.post = Some(post);
             assert_eq!(view.len(), 3);

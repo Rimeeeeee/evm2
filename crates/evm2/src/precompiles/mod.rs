@@ -5,12 +5,51 @@ use crate::{
     evm::{PrewarmSet, precompile::PrecompileProvider},
     interpreter::{GasTracker, Message},
 };
-#[cfg(feature = "std")]
-use alloc::boxed::Box;
 use alloc::{borrow::Cow, vec::Vec};
 use alloy_primitives::Address;
+use arrayref as _;
+
+#[cfg(feature = "std")]
+use alloc::boxed::Box;
 #[cfg(feature = "std")]
 use core::any::{Any, TypeId};
+
+// Silence backend dependency lints when another backend takes precedence.
+core::cfg_select! {
+    feature = "bn" => {
+        use ark_bn254 as _;
+        use ark_ec as _;
+        use ark_ff as _;
+        use ark_serialize as _;
+        use bn as _;
+    }
+    _ => {}
+}
+
+// silence arkworks-bls12-381 lint as blst will be used as default if both are enabled.
+core::cfg_select! {
+    feature = "blst" => {
+        use ark_bls12_381 as _;
+        use ark_ec as _;
+        use ark_ff as _;
+        use ark_serialize as _;
+    }
+    _ => {}
+}
+
+// silence aurora-engine-modexp if gmp is enabled
+#[cfg(feature = "gmp")]
+use aurora_engine_modexp as _;
+
+// silence p256 lint as aws-lc-rs will be used if both are enabled.
+#[cfg(feature = "p256-aws-lc-rs")]
+use p256 as _;
+
+pub(crate) use crate::{
+    evm::precompile::PrecompileOutput,
+    once_lock::OnceLock,
+    utils::{calc_linear_cost, u64_to_address},
+};
 
 pub mod blake2;
 pub mod bls12_381;
@@ -33,8 +72,9 @@ pub use id::PrecompileId;
 mod table;
 pub use table::*;
 
-/// EIP-7823 constants.
 pub(crate) mod eip7823 {
+    //! EIP-7823 constants.
+
     /// Each of the modexp length inputs must be less than or equal to 1024 bytes.
     pub(crate) const INPUT_SIZE_LIMIT: usize = 1024;
 }
@@ -42,56 +82,21 @@ pub(crate) mod eip7823 {
 mod result;
 pub use result::{PrecompileError, PrecompileHalt, PrecompileResult};
 
-pub(crate) use crate::{
-    evm::precompile::PrecompileOutput,
-    once_lock::OnceLock,
-    utils::{calc_linear_cost, u64_to_address},
-};
-
-// Silence backend dependency lints when another backend takes precedence.
-core::cfg_select! {
-    feature = "bn" => {
-        use ark_bn254 as _;
-        use ark_ec as _;
-        use ark_ff as _;
-        use ark_serialize as _;
-        use bn as _;
-    }
-    _ => {}
-}
-
-use arrayref as _;
-
-// silence arkworks-bls12-381 lint as blst will be used as default if both are enabled.
-core::cfg_select! {
-    feature = "blst" => {
-        use ark_bls12_381 as _;
-        use ark_ec as _;
-        use ark_ff as _;
-        use ark_serialize as _;
-    }
-    _ => {}
-}
-
-// silence aurora-engine-modexp if gmp is enabled
-#[cfg(feature = "gmp")]
-use aurora_engine_modexp as _;
-
-// silence p256 lint as aws-lc-rs will be used if both are enabled.
-#[cfg(feature = "p256-aws-lc-rs")]
-use p256 as _;
-
 /// Default precompile provider.
 #[derive(Clone, Debug)]
 pub struct Precompiles<T: EvmTypesHost = crate::BaseEvmTypes> {
     map: Cow<'static, PrecompileMap<T>>,
+    /// The map before the first [`PrecompileProvider::move_precompiles`], whose addresses stay
+    /// warm: `eth_simulateV1` keeps the warm set of the fork when it moves a precompile. Changes
+    /// made through [`Precompiles::as_map_mut`] after that move do not change the warm set.
+    warm: Option<Cow<'static, PrecompileMap<T>>>,
 }
 
 impl<T: EvmTypesHost> Precompiles<T> {
     /// Creates a precompile provider from a static precompile map.
     #[inline]
     pub const fn new(map: Cow<'static, PrecompileMap<T>>) -> Self {
-        Self { map }
+        Self { map, warm: None }
     }
 
     /// Creates a precompile provider for a base EVM specification.
@@ -121,6 +126,9 @@ impl<T: EvmTypesHost> Precompiles<T> {
     }
 
     /// Returns the underlying precompile map mutably.
+    ///
+    /// After [`PrecompileProvider::move_precompiles`], changes to this map do not change the
+    /// [warm addresses](PrecompileProvider::warm_addresses).
     #[inline]
     pub fn as_map_mut(&mut self) -> &mut PrecompileMap<T> {
         self.map.to_mut()
@@ -135,7 +143,7 @@ impl<T: EvmTypesHost> PrecompileProvider<T> for Precompiles<T> {
 
     #[inline]
     fn warm_addresses(&self, warm: &mut PrewarmSet) {
-        self.map.as_ref().warm_addresses(warm);
+        self.warm.as_ref().unwrap_or(&self.map).warm_addresses(warm);
     }
 
     #[inline]
@@ -158,7 +166,13 @@ impl<T: EvmTypesHost> PrecompileProvider<T> for Precompiles<T> {
         &mut self,
         moves: &[(Address, Address)],
     ) -> Result<(), MovePrecompileError> {
-        self.as_map_mut().move_precompiles(moves.iter().copied())
+        let original = (self.warm.is_none() && moves.iter().any(|(source, dest)| source != dest))
+            .then(|| self.map.clone());
+        self.as_map_mut().move_precompiles(moves.iter().copied())?;
+        if original.is_some() {
+            self.warm = original;
+        }
+        Ok(())
     }
 
     #[inline]
@@ -213,7 +227,7 @@ fn cached_base_precompiles<T: EvmTypesHost>(spec: SpecId) -> &'static Precompile
         SpecId::BERLIN | SpecId::LONDON | SpecId::MERGE | SpecId::SHANGHAI => 3,
         SpecId::CANCUN => 4,
         SpecId::PRAGUE => 5,
-        SpecId::OSAKA | SpecId::AMSTERDAM => 6,
+        SpecId::OSAKA | SpecId::AMSTERDAM | SpecId::BOGOTA => 6,
     };
 
     shared_base_precompiles::<T>()
@@ -306,5 +320,21 @@ mod tests {
         assert!(
             Precompiles::<crate::BaseEvmTypes>::base(SpecId::BERLIN).as_map().contains(&identity)
         );
+    }
+
+    #[test]
+    fn move_precompiles_keeps_warm_addresses() {
+        let identity = IDENTITY::<crate::BaseEvmTypes>().address();
+        let moved = address!("0x0000000000000000000000000000000000001000");
+        let mut precompiles = Precompiles::<crate::BaseEvmTypes>::base(SpecId::BERLIN);
+
+        PrecompileProvider::move_precompiles(&mut precompiles, &[(identity, moved)]).unwrap();
+
+        let mut warm = PrewarmSet::new();
+        precompiles.warm_addresses(&mut warm);
+        assert!(warm.is_warm(&identity));
+        assert!(!warm.is_warm(&moved));
+        assert!(!precompiles.contains(&identity));
+        assert!(precompiles.contains(&moved));
     }
 }
