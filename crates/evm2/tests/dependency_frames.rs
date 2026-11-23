@@ -4,7 +4,10 @@ mod common;
 
 use alloy_eips::{
     eip8141::{Frame, FrameLimits, FrameMode, FrameStatus},
-    eip8288::{Dependency, DependencyError, LEANSPHINCS_SCHEME, LEANSPHINCS_VERIFICATION_GAS},
+    eip8288::{
+        DependencyValidationError, LEANSPHINCS_SCHEME, LEANSPHINCS_VERIFICATION_GAS,
+        SignatureDependency,
+    },
 };
 use alloy_primitives::{B256, Bytes, U256};
 use common::{APPROVE_BOTH, BODY, SENDER, frame, payload, recovered, set_version};
@@ -18,7 +21,7 @@ fn dependency_frame(count: usize) -> Frame {
     Frame {
         mode: FrameMode::DependencyVerify,
         limits: FrameLimits { execution: count as u64 * LEANSPHINCS_VERIFICATION_GAS, state: 0 },
-        data: Dependency {
+        data: SignatureDependency {
             scheme: LEANSPHINCS_SCHEME,
             data_hash: B256::ZERO,
             verification_key_hash: B256::repeat_byte(1),
@@ -94,7 +97,7 @@ fn invalid_dependency_target_is_rejected() {
     assert_eq!(
         evm.validate_tx(&tx),
         Err(HandlerError::InvalidFrameTransaction(FrameTransactionError::InvalidDependency(
-            DependencyError::FrameFields
+            DependencyValidationError::FrameFields
         )))
     );
 }

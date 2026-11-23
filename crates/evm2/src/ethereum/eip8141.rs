@@ -26,7 +26,7 @@ use alloy_eips::{
         FrameGasUsed, FrameMode, FrameReceipt, FrameStatus, MAX_FRAMES, SignatureScheme,
     },
     eip8250::{MAX_NONCE_KEYS, NONCE_MANAGER, nonce_calldata, nonce_slot, validate_nonce_keys},
-    eip8288::validate_dependency_frame,
+    eip8288::SignatureDependencies,
 };
 use alloy_primitives::{Address, B256, Bytes, U256};
 use core::marker::PhantomData;
@@ -457,7 +457,8 @@ fn validate_structure(
             if !dependencies {
                 return Err(invalid(FrameTransactionError::DependenciesNotActive));
             }
-            validate_dependency_frame(frame, previous_atomic)
+            SignatureDependencies::from_frame(frame, previous_atomic)
+                .and_then(SignatureDependencies::validate)
                 .map_err(|error| invalid(FrameTransactionError::InvalidDependency(error)))?;
         }
         if frame.mode != FrameMode::Sender && !frame.value.is_zero() {

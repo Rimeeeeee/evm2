@@ -103,5 +103,5 @@ pub enum FrameTransactionError {
     DependenciesNotActive,
     /// A dependency declaration or its containing frame is malformed.
     #[error(transparent)]
-    InvalidDependency(#[from] alloy_eips::eip8288::DependencyError),
+    InvalidDependency(#[from] alloy_eips::eip8288::DependencyValidationError),
 }

@@ -77,7 +77,7 @@ fn assert_static_error_with_env(
         if entry == "prefix" && tx.frames.is_empty() {
             continue;
         }
-        let (mut evm, reads) = evm(version, block.clone());
+        let (mut evm, reads) = evm(version, block);
         let tx = recovered(tx.clone());
         let error = match entry {
             "validate" => evm.validate_tx(&tx).unwrap_err(),
@@ -828,12 +828,12 @@ fn frame_fee_boundary_includes_blob_and_keyed_nonce_reservations() {
                 "one wei short",
                 tx.clone(),
                 version,
-                block.clone(),
+                block,
                 HandlerError::FrameFeeBudgetTooLow { required, got: tx.fees.max_fee },
             );
             tx.fees.max_fee = required;
             for entry in ["validate", "execute", "prefix"] {
-                let (mut evm, reads) = evm(version, block.clone());
+                let (mut evm, reads) = evm(version, block);
                 let tx = recovered(tx.clone());
                 let error = match entry {
                     "validate" => evm.validate_tx(&tx).unwrap_err(),
