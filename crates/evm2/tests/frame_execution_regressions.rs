@@ -540,11 +540,13 @@ fn assert_native_case(case: &Case, result: &Outcome) {
         put_storage(&mut accounts, BODY, U256::ZERO, U256::from(u8::from(present)));
     } else if name.starts_with("nonzero_original_refund_") {
         let mut present = U256::from(7);
-        for index in 1..case.tx.frames.len() {
-            let next = U256::from_be_slice(&case.tx.frames[index].data);
-            executions[index] = if index == 1 { 5_107 } else { 207 };
+        for (index, (frame, execution)) in
+            case.tx.frames.iter().zip(&mut executions).enumerate().skip(1)
+        {
+            let next = U256::from_be_slice(&frame.data);
+            *execution = if index == 1 { 5_107 } else { 207 };
             if present == U256::from(7) && next != present {
-                executions[index] += 10_000;
+                *execution += 10_000;
             }
             if next == U256::from(7) && next != present {
                 raw_refund += gp.get(GasId::SstoreResetRefund);

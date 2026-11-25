@@ -98,4 +98,10 @@ pub enum FrameTransactionError {
     /// EIP-8250 nonce keys must be strictly increasing.
     #[error("EIP-8250 nonce keys must be strictly increasing")]
     NonceKeysNotIncreasing,
+    /// EIP-8288 dependency frames require explicit activation by the embedding client.
+    #[error("EIP-8288 dependency frames are not active")]
+    DependenciesNotActive,
+    /// A dependency declaration or its containing frame is malformed.
+    #[error(transparent)]
+    InvalidDependency(#[from] alloy_eips::eip8288::DependencyValidationError),
 }
