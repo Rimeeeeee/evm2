@@ -71,7 +71,7 @@ pub(crate) mod frames {
 
     use super::*;
     use alloy_consensus::{TxEip8141, transaction::Recovered};
-    use alloy_eips::eip8141::{Frame, FrameLimits, FrameMode, FrameSignature, SignatureScheme};
+    use alloy_eips::eip8141::{Frame, FrameLimits, FrameMode};
     use alloy_primitives::U256;
     use evm2::{
         BaseEvmTypes, Evm, Precompiles,
@@ -136,16 +136,26 @@ pub(crate) mod frames {
         let key = SigningKey::from_slice(&[0x11; 32]).unwrap();
         let sender =
             Address::from_raw_public_key(&key.verifying_key().to_sec1_point(false).as_bytes()[1..]);
-        let mut tx = payload(sender, vec![Frame { data, ..frame(FrameMode::Verify, sender, 3) }]);
-        tx.signatures.push(FrameSignature {
-            scheme: SignatureScheme::Secp256k1,
-            signature: vec![0; 65].into(),
-            ..Default::default()
-        });
+        let mut claim = sender.into_word().to_vec();
+        claim.extend_from_slice(&[0; 32 + 65]);
+        let mut tx = payload(
+            sender,
+            vec![
+                Frame {
+                    mode: FrameMode::Proof,
+                    target: alloy_eips::eip8141::SECP256K1_VERIFIER.into(),
+                    limits: FrameLimits { execution: 3100, state: 0 },
+                    data: claim.into(),
+                    ..Default::default()
+                },
+                Frame { data, ..frame(FrameMode::Verify, sender, 3) },
+            ],
+        );
         let (sig, recid) = key.sign_prehash_recoverable(tx.signature_hash().as_slice());
-        let mut signature = vec![recid.to_byte()];
-        signature.extend_from_slice(sig.to_bytes().as_slice());
-        tx.signatures[0].signature = signature.into();
+        let mut claim = tx.frames[0].data.to_vec();
+        claim[64] = recid.to_byte();
+        claim[65..].copy_from_slice(sig.to_bytes().as_slice());
+        tx.frames[0].data = claim.into();
         (sender, Recovered::new_unchecked(TxEnvelope::Eip8141(tx), Address::ZERO))
     }
 }

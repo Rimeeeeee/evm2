@@ -5,7 +5,7 @@ mod common;
 use alloy_consensus::{TxEip8141, TxLegacy, transaction::Recovered};
 use alloy_eips::{
     Typed2718,
-    eip8141::{Frame, FrameMode, FrameSignature, FrameStatus, SignatureMessage, SignatureScheme},
+    eip8141::{Frame, FrameMode, FrameStatus},
     eip8250::{NONCE_MANAGER, nonce_slot},
     eip8272::{RECENT_ROOT_ADDRESS, RECENT_ROOT_CODE, RECENT_ROOT_CODE_HASH},
 };
@@ -225,29 +225,49 @@ fn keyed_nonce_updates_protocol_storage_without_bumping_account_nonce() {
 }
 
 #[test]
-fn empty_account_verification_uses_canonical_transaction_signature() {
-    let key = SigningKey::from_slice(&[0x11; 32]).unwrap();
-    let sender =
-        Address::from_raw_public_key(&key.verifying_key().to_sec1_point(false).as_bytes()[1..]);
-    let mut tx = payload(vec![frame(FrameMode::Verify, sender)]);
+fn empty_account_verification_uses_the_selected_canonical_secp256k1_proof() {
+    let key = SigningKey::from_slice(&[7; 32]).unwrap();
+    let public = key.verifying_key().to_sec1_point(false);
+    let sender = Address::from_raw_public_key(&public.as_bytes()[1..]);
+    let mut verify = frame(FrameMode::Verify, sender);
+    verify.data = Bytes::from_static(&[0]);
+    let mut tx = payload(vec![
+        common::proof(
+            alloy_eips::eip8141::SECP256K1_VERIFIER,
+            sender.into_word(),
+            B256::ZERO,
+            &[0; 65],
+        ),
+        verify,
+    ]);
     tx.sender = sender;
-    tx.signatures.push(FrameSignature {
-        scheme: SignatureScheme::Secp256k1,
-        signature: vec![0; 65].into(),
-        ..Default::default()
-    });
-    let (sig, recid) = key.sign_prehash_recoverable(tx.signature_hash().as_slice());
-    let mut bytes = vec![recid.to_byte()];
-    bytes.extend_from_slice(sig.to_bytes().as_slice());
-    tx.signatures[0].signature = bytes.into();
+    let (signature, recovery) = key.sign_prehash_recoverable(tx.signature_hash().as_slice());
+    let mut data = tx.frames[0].data.to_vec();
+    data[64] = recovery.to_byte();
+    data[65..].copy_from_slice(signature.to_bytes().as_slice());
+    tx.frames[0].data = data.into();
     let mut evm = evm(&[], &[]);
     evm.overlay_db_mut().insert_account_info(
         &sender,
         AccountInfo::default().with_balance(U256::from(1_000_000_000)),
     );
-    let result = evm.transact(&recovered(tx)).unwrap().commit();
+    let result = evm.transact(&recovered(tx.clone())).unwrap().discard();
+    assert!(result.status);
     assert_eq!(result.frame.unwrap().payer, sender);
-    assert_eq!(evm.state_mut().account(&sender).unwrap().nonce(), 1);
+    tx.frames[1].data = Bytes::from_static(&[1]);
+    assert_eq!(
+        evm.transact(&recovered(tx.clone())).unwrap_err(),
+        HandlerError::InvalidFrameTransaction(FrameTransactionError::ProofFrameFailed)
+    );
+    let (signature, recovery) = key.sign_prehash_recoverable(tx.signature_hash().as_slice());
+    let mut data = tx.frames[0].data.to_vec();
+    data[64] = recovery.to_byte();
+    data[65..].copy_from_slice(signature.to_bytes().as_slice());
+    tx.frames[0].data = data.into();
+    assert_eq!(
+        evm.transact(&recovered(tx)).unwrap_err(),
+        HandlerError::InvalidFrameTransaction(FrameTransactionError::VerifyFrameFailed)
+    );
 }
 
 #[test]
@@ -568,11 +588,7 @@ fn unused_malformed_signature_precedes_database_reads_and_fatal_errors_survive()
     let reads = Arc::new(AtomicUsize::new(0));
     evm.set_database(Db::new(FailingDatabase(reads.clone(), "frame database failure")));
     let mut malformed = payload(vec![frame(FrameMode::Verify, SENDER)]);
-    malformed.signatures.push(FrameSignature {
-        scheme: SignatureScheme::Secp256k1,
-        signature: Bytes::from_static(&[0]),
-        ..Default::default()
-    });
+    malformed.frames.insert(0, Frame { mode: FrameMode::Proof, ..Default::default() });
     assert!(matches!(
         evm.validate_frame_prefix(&recovered(malformed), 1),
         Err(evm2::registry::HandlerError::InvalidFrameTransaction(_))
@@ -691,46 +707,52 @@ fn verify_entry_failure_emits_its_frame_end_before_invalidating_the_prefix() {
 #[test]
 fn elided_witness_hash_and_intrinsic_commit_to_length_instead_of_contents() {
     let version = Version::base(SpecId::BOGOTA);
-    let token = version.gas_params.get(GasId::TxTokenNonZeroByteMultiplier);
-    let intrinsic_byte_cost = token * version.gas_params.get(GasId::TxTokenCost);
-    let floor_byte_cost = token * version.gas_params.get(GasId::TxFloorCostPerToken);
-    for len in [0, 1, 55, 56, 64, 128, 256] {
-        let mut zero = payload(vec![frame(FrameMode::Verify, SENDER)]);
-        zero.signatures
-            .push(FrameSignature { signature: vec![0; len].into(), ..Default::default() });
+    let multiplier = version.gas_params.get(GasId::TxTokenNonZeroByteMultiplier);
+    for len in [0, 1, 55, 56, 64, 128, 256, 7740] {
+        let zero = payload(vec![
+            common::proof(BODY, B256::repeat_byte(1), B256::ZERO, &vec![0; len]),
+            frame(FrameMode::Verify, SENDER),
+        ]);
         let mut nonzero = zero.clone();
-        nonzero.signatures[0].signature = vec![0xff; len].into();
+        nonzero.frames[0] = common::proof(BODY, B256::repeat_byte(1), B256::ZERO, &vec![0xff; len]);
         let gas = FrameGas::calculate(&zero, version).unwrap();
-        assert_eq!(FrameGas::calculate(&nonzero, version).unwrap(), gas, "length {len}");
-        assert_eq!(nonzero.signature_hash(), zero.signature_hash(), "length {len}");
-        nonzero.signatures[0].signature = vec![0xff; len + 1].into();
-        assert_ne!(nonzero.signature_hash(), zero.signature_hash(), "length {len}");
+        assert_eq!(FrameGas::calculate(&nonzero, version).unwrap(), gas);
+        assert_eq!(nonzero.signature_hash(), zero.signature_hash());
+        nonzero.frames[0] =
+            common::proof(BODY, B256::repeat_byte(1), B256::ZERO, &vec![0xff; len + 1]);
+        assert_ne!(nonzero.signature_hash(), zero.signature_hash());
         let extended = FrameGas::calculate(&nonzero, version).unwrap();
-        assert_eq!(extended.intrinsic - gas.intrinsic, intrinsic_byte_cost);
-        assert_eq!(extended.floor - gas.floor, floor_byte_cost);
+        assert_eq!(
+            extended.intrinsic - gas.intrinsic,
+            multiplier * version.gas_params.get(GasId::TxTokenCost)
+        );
+        assert_eq!(
+            extended.floor - gas.floor,
+            multiplier * version.gas_params.get(GasId::TxFloorCostPerToken)
+        );
     }
 }
 
 #[test]
-fn explicit_signature_messages_preserve_content_sensitive_hashing_and_intrinsic_pricing() {
+fn explicit_proof_messages_require_the_commit_flag_to_bind_witness_contents() {
     let version = Version::base(SpecId::BOGOTA);
-    let mut zero = payload(vec![frame(FrameMode::Verify, SENDER)]);
-    zero.signatures.push(FrameSignature {
-        msg: SignatureMessage::Explicit(B256::repeat_byte(1)),
-        signature: vec![0; 64].into(),
-        ..Default::default()
-    });
+    let mut zero =
+        payload(vec![common::proof(BODY, B256::repeat_byte(1), B256::repeat_byte(2), &[0; 64])]);
     let mut nonzero = zero.clone();
-    nonzero.signatures[0].signature = vec![0xff; 64].into();
-    assert_ne!(nonzero.signature_hash(), zero.signature_hash());
-    let zero_gas = FrameGas::calculate(&zero, version).unwrap();
-    let nonzero_gas = FrameGas::calculate(&nonzero, version).unwrap();
-    let token_difference = version.gas_params.get(GasId::TxTokenNonZeroByteMultiplier) - 1;
+    nonzero.frames[0] =
+        common::proof(BODY, B256::repeat_byte(1), B256::repeat_byte(2), &[0xff; 64]);
+    assert_eq!(nonzero.signature_hash(), zero.signature_hash());
     assert_eq!(
-        nonzero_gas.intrinsic - zero_gas.intrinsic,
-        64 * token_difference * version.gas_params.get(GasId::TxTokenCost)
+        FrameGas::calculate(&zero, version).unwrap(),
+        FrameGas::calculate(&nonzero, version).unwrap()
     );
-    assert_eq!(nonzero_gas.floor, zero_gas.floor);
+    zero.frames[0].flags = alloy_eips::eip8141::PROOF_COMMIT_FLAG;
+    nonzero.frames[0].flags = alloy_eips::eip8141::PROOF_COMMIT_FLAG;
+    assert_ne!(nonzero.signature_hash(), zero.signature_hash());
+    assert_eq!(
+        FrameGas::calculate(&zero, version).unwrap(),
+        FrameGas::calculate(&nonzero, version).unwrap()
+    );
 }
 
 #[test]

@@ -350,8 +350,7 @@ builtins! {
     FrameDataLoad  = __revmc_builtin_framedataload(@[ecx] ptr, @[sp] ptr) None,
     FrameDataCopy  = __revmc_builtin_framedatacopy(@[ecx] ptr, @[sp] ptr) None,
     FrameParam     = __revmc_builtin_frameparam(@[ecx] ptr, @[sp] ptr) None,
-    SigParam       = __revmc_builtin_sigparam(@[ecx] ptr, @[sp] ptr) None,
-    SigDataCopy    = __revmc_builtin_sigdatacopy(@[ecx] ptr, @[sp] ptr) None,
+    ProofParam       = __revmc_builtin_proofparam(@[ecx] ptr, @[sp] ptr) None,
     TxTrace        = __revmc_builtin_txtrace(@[ecx] ptr, @[sp] ptr) None,
     EventDataCopy  = __revmc_builtin_eventdatacopy(@[ecx] ptr, @[sp] ptr) None,
 

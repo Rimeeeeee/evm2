@@ -4,10 +4,7 @@ mod common;
 
 use alloy_consensus::TxEip8141;
 use alloy_eips::{
-    eip8141::{
-        Frame, FrameLimits, FrameMode, FrameSignature, FrameStatus, SignatureMessage,
-        SignatureScheme,
-    },
+    eip8141::{Frame, FrameLimits, FrameMode, FrameStatus},
     eip8250::{NONCE_MANAGER, nonce_slot},
 };
 use alloy_primitives::{Address, B256, U256};
@@ -54,49 +51,48 @@ fn nonce(evm: &mut Evm<'_, BaseEvmTypes>, key: U256) -> U256 {
 
 fn set_placeholders(evm: &mut Evm<'_, BaseEvmTypes>, enabled: bool) {
     let mut version = *evm.version();
-    version.features.set(EvmFeatures::FRAME_SIGNATURE_PLACEHOLDERS, enabled);
+    version.features.set(EvmFeatures::FRAME_PROOF_PLACEHOLDERS, enabled);
     set_version(evm, version);
 }
 
 #[test]
-fn reserved_zero_signature_message_is_rejected_even_with_placeholders() {
+fn committed_canonical_message_proofs_are_rejected_even_in_simulation() {
     for placeholders in [false, true] {
-        for scheme in
-            [SignatureScheme::Arbitrary, SignatureScheme::Secp256k1, SignatureScheme::P256]
-        {
-            let mut evm = evm(APPROVE_BOTH, &[]);
-            set_placeholders(&mut evm, placeholders);
-            let mut tx = payload(vec![frame(FrameMode::Verify, SENDER, 3)], vec![]);
-            tx.signatures.push(FrameSignature {
-                scheme,
-                msg: SignatureMessage::Explicit(B256::ZERO),
-                ..Default::default()
-            });
-            let tx = recovered(tx);
-            common::assert_validation_error(
-                &mut evm,
-                &tx,
-                HandlerError::InvalidFrameTransaction(
-                    FrameTransactionError::InvalidSignatureMessage,
-                ),
-            );
-            assert_eq!(nonce(&mut evm, U256::ZERO), U256::ZERO);
-        }
+        let mut evm = evm(APPROVE_BOTH, &[]);
+        set_placeholders(&mut evm, placeholders);
+        let mut claim = common::proof(
+            alloy_eips::eip8141::SECP256K1_VERIFIER,
+            B256::repeat_byte(1),
+            B256::ZERO,
+            &[],
+        );
+        claim.flags = alloy_eips::eip8141::PROOF_COMMIT_FLAG;
+        let tx = payload(vec![claim, frame(FrameMode::Verify, SENDER, 3)], vec![]);
+        assert_eq!(
+            evm.transact(&recovered(tx)).unwrap_err(),
+            HandlerError::InvalidFrameTransaction(FrameTransactionError::InvalidProofFrame)
+        );
+        assert_eq!(nonce(&mut evm, U256::ZERO), U256::ZERO);
     }
 }
 
 #[test]
-fn nonzero_arbitrary_message_and_unsigned_simulation_placeholders_remain_valid() {
-    for scheme in [SignatureScheme::Arbitrary, SignatureScheme::Secp256k1, SignatureScheme::P256] {
-        let mut evm = evm(APPROVE_BOTH, &[]);
-        set_placeholders(&mut evm, true);
-        let mut tx = payload(vec![frame(FrameMode::Verify, SENDER, 3)], vec![]);
-        tx.signatures.push(FrameSignature {
-            scheme,
-            msg: SignatureMessage::Explicit(B256::with_last_byte(1)),
-            ..Default::default()
-        });
-        assert!(evm.transact(&recovered(tx)).unwrap().discard().status);
+fn only_omitted_protocol_proofs_are_waived_by_explicit_simulation_mode() {
+    for verifier in [
+        alloy_eips::eip8141::SECP256K1_VERIFIER,
+        alloy_eips::eip8141::P256_VERIFIER,
+        alloy_eips::eip8141::LEANSPHINCS_VERIFIER,
+    ] {
+        for placeholders in [false, true] {
+            let mut evm = evm(APPROVE_BOTH, &[]);
+            set_placeholders(&mut evm, placeholders);
+            let claim = common::proof(verifier, B256::repeat_byte(1), B256::ZERO, &[]);
+            let tx = payload(vec![claim, frame(FrameMode::Verify, SENDER, 3)], vec![]);
+            assert_eq!(evm.transact(&recovered(tx)).is_ok(), placeholders);
+            let claim = common::proof(verifier, B256::repeat_byte(1), B256::ZERO, &[1]);
+            let tx = payload(vec![claim, frame(FrameMode::Verify, SENDER, 3)], vec![]);
+            assert!(evm.transact(&recovered(tx)).is_err());
+        }
     }
 }
 

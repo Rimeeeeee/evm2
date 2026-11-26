@@ -1261,13 +1261,9 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
                 let sp = self.sp_after_inputs();
                 self.call_fallible_builtin(Builtin::FrameParam, &[self.ecx, sp]);
             }
-            op::SIGPARAM => {
+            op::PROOFPARAM => {
                 let sp = self.sp_after_inputs();
-                self.call_fallible_builtin(Builtin::SigParam, &[self.ecx, sp]);
-            }
-            op::SIGDATACOPY => {
-                let sp = self.sp_after_inputs();
-                self.call_fallible_builtin(Builtin::SigDataCopy, &[self.ecx, sp]);
+                self.call_fallible_builtin(Builtin::ProofParam, &[self.ecx, sp]);
             }
             op::TXTRACE => {
                 let sp = self.sp_after_inputs();

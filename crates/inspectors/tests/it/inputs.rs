@@ -508,7 +508,7 @@ mod frames {
 
     #[test]
     fn synthetic_default_verification_respects_input_recording() {
-        let input = Bytes::from_static(&[1, 2, 3]);
+        let input = Bytes::from_static(&[0]);
         for config in [
             TracingInspectorConfig::none(),
             TracingInspectorConfig::parity_vm_trace(),
@@ -520,8 +520,8 @@ mod frames {
             assert!(evm.call_tx(&tx).unwrap().status);
             let inspector = evm.clear_inspector_as::<TracingInspector>().unwrap();
             let nodes = inspector.traces().nodes();
-            assert_eq!(nodes[0].children.len(), 1);
-            let trace = &nodes[nodes[0].children[0]].trace;
+            assert_eq!(nodes[0].children.len(), 2);
+            let trace = &nodes[nodes[0].children[1]].trace;
             assert!(!trace.entered_evm);
             assert_eq!(trace.data, if config.record_inputs { input.clone() } else { Bytes::new() });
         }

@@ -3,9 +3,7 @@
 use super::*;
 use crate::runtime::{ArtifactStore, RuntimeArtifactStore, RuntimeConfig, RuntimeTuning};
 use alloy_consensus::{TxEip8141, TxLegacy, transaction::Recovered};
-use alloy_eips::eip8141::{
-    Frame, FrameLimits, FrameMode, FrameSignature, FrameStatus, SignatureScheme,
-};
+use alloy_eips::eip8141::{Frame, FrameLimits, FrameMode, FrameStatus};
 use alloy_primitives::{Address, Bytes, TxKind, U256};
 use evm2::{
     BaseEvmTypes, Evm, Precompiles, SpecId, TxResultWithState,
@@ -32,11 +30,11 @@ fn run(
     let validation = [0x60, 3, 0x5f, 0x5f, 0xaa];
     let body_code = [
         0x5f, 0xb0, 0x50, // TXPARAM type
-        0x60, 1, 0x60, 1, 0xb3, 0x50, // FRAMEPARAM execution budget
-        0x60, 1, 0x5f, 0xb4, 0x50, // SIGPARAM scheme
-        0x60, 1, 0x5f, 0xb1, 0x50, // FRAMEDATALOAD
-        0x60, 1, 0x60, 32, 0x5f, 0x5f, 0xb2, // FRAMEDATACOPY
-        0x5f, 0x60, 4, 0x5f, 0x60, 32, 0xb5, // SIGDATACOPY
+        0x60, 1, 0x60, 2, 0xb3, 0x50, // FRAMEPARAM execution budget
+        0x60, 11, 0xb0, 0x50, // TXPARAM proof count
+        0x60, 1, 0x5f, 0xb4, 0x50, // PROOFPARAM verifier at frame 0
+        0x60, 2, 0x5f, 0xb1, 0x50, // FRAMEDATALOAD
+        0x60, 2, 0x60, 32, 0x5f, 0x5f, 0xb2, // FRAMEDATACOPY
         0x5f, 0x35, 0x5f, 0x55, // Ordinary SSTORE, with isolated state gas
         0x60, 36, 0x5f, 0xa0, 0x00, // Consensus event includes both copies
     ];
@@ -68,6 +66,7 @@ fn run(
         (sender, validation.as_slice()),
         (body, body_code.as_slice()),
         (assertion, assertion_code.as_slice()),
+        (Address::with_last_byte(0xd0), &[op::STOP][..]),
     ] {
         database.insert_account_info(
             &address,
@@ -76,7 +75,7 @@ fn run(
                 .with_code(Bytecode::new_legacy(Bytes::copy_from_slice(code))),
         );
     }
-    let frames = [
+    let mut frames: Vec<_> = [
         (FrameMode::Verify, sender, 3),
         (FrameMode::Sender, body, 0),
         (FrameMode::Assert, assertion, 0),
@@ -91,18 +90,19 @@ fn run(
         ..Default::default()
     })
     .collect();
-    let tx = TxEip8141 {
-        sender,
-        chain_id: 1,
-        frames,
-        nonce_keys: Some(vec![]),
-        signatures: vec![FrameSignature {
-            scheme: SignatureScheme::Arbitrary,
-            signature: Bytes::from_static(b"abcd"),
+    // A pure verifier stays interpreted, while subsequent PROOFPARAM runs in compiled code.
+    frames.insert(
+        0,
+        Frame {
+            mode: FrameMode::Proof,
+            target: Address::with_last_byte(0xd0).into(),
+            limits: FrameLimits { execution: 4000, state: 0 },
+            data: [vec![1; 64], b"abcd".to_vec()].concat().into(),
             ..Default::default()
-        }],
-        ..Default::default()
-    };
+        },
+    );
+    let tx =
+        TxEip8141 { sender, chain_id: 1, frames, nonce_keys: Some(vec![]), ..Default::default() };
     let mut evm = Evm::<BaseEvmTypes>::new(
         SpecId::BOGOTA,
         BlockEnvExt::default(),
@@ -152,7 +152,7 @@ fn native_frames_match_interpreter_with_jit_aot_and_reloaded_artifacts() {
                     if state != 0 && !revert {
                         assert!(interpreted.result.status);
                         let mut expected = U256::from(42).to_be_bytes::<32>().to_vec();
-                        expected.extend_from_slice(b"abcd");
+                        expected.extend_from_slice(&[0; 4]);
                         assert_eq!(
                             interpreted.result.frame.as_ref().unwrap().outputs.last().unwrap(),
                             &Bytes::from(expected)

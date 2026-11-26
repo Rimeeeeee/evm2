@@ -558,8 +558,7 @@ opcodes! {
     0xB1 => FRAMEDATALOAD => framedataload => stack_io(2, 1);
     0xB2 => FRAMEDATACOPY => framedatacopy => stack_io(4, 0);
     0xB3 => FRAMEPARAM => frameparam => stack_io(2, 1);
-    0xB4 => SIGPARAM => sigparam => stack_io(2, 1);
-    0xB5 => SIGDATACOPY => sigdatacopy => stack_io(4, 0);
+    0xB4 => PROOFPARAM => proofparam => stack_io(2, 1);
     0xB6 => TXTRACE => txtrace => stack_io(2, 1);
     0xB7 => EVENTDATACOPY => eventdatacopy => stack_io(4, 0);
     // 0xB8

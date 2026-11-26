@@ -3481,7 +3481,7 @@ mod frames {
     #[test]
     fn native_default_account_verification_is_visible_in_debug_and_mux_results() {
         for (mux, initial_call_depth) in [(false, 0), (true, 0), (false, 7), (true, 7)] {
-            let (sender, tx) = default_verification_transaction(Bytes::new());
+            let (sender, tx) = default_verification_transaction(Bytes::from_static(&[0]));
             let mut evm = evm(&[(sender, &[])]);
             let spec = evm2::SpecId::BOGOTA;
             let version = Version::new(spec);
@@ -3520,13 +3520,13 @@ mod frames {
                 _ => panic!("call tracer result"),
             };
             assert_eq!(calls.from, sender);
-            assert_eq!(calls.calls.len(), 1);
-            assert_eq!(calls.calls[0].to, Some(sender));
+            assert_eq!(calls.calls.len(), 2);
+            assert_eq!(calls.calls[1].to, Some(sender));
             assert_eq!(
-                calls.calls[0].gas_used,
-                U256::from(result.result.frame.as_ref().unwrap().receipts[0].gas_used.execution)
+                calls.calls[1].gas_used,
+                U256::from(result.result.frame.as_ref().unwrap().receipts[1].gas_used.execution)
             );
-            assert!(calls.calls[0].error.is_none());
+            assert!(calls.calls[1].error.is_none());
         }
     }
 

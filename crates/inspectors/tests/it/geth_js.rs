@@ -697,21 +697,21 @@ mod frames {
     }
 
     #[test]
-    fn javascript_default_verification_without_interpreter_emits_one_enter_and_exit() {
-        let (sender, tx) = default_verification_transaction(Bytes::new());
+    fn javascript_proof_and_default_verification_emit_enter_and_exit() {
+        let (sender, tx) = default_verification_transaction(Bytes::from_static(&[0]));
         let mut evm = evm(&[(sender, &[])]);
         evm.set_inspector(JsInspector::new(TRACER.into(), json!(null)).unwrap());
         let result = evm.transact(&tx).unwrap().detach();
         let mut inspector = evm.clear_inspector_as::<JsInspector>().unwrap();
         let block = *evm.block_env();
         let actual = inspector.json_result(&result, &tx, &block, evm.database_mut()).unwrap();
-        assert_eq!(actual["events"].as_array().unwrap().len(), 2);
+        assert_eq!(actual["events"].as_array().unwrap().len(), 4);
         assert_eq!(actual["events"][0], json!(["enter", 0, "STATICCALL"]));
         assert_eq!(
-            actual["events"][1][2],
-            result.result.frame.as_ref().unwrap().receipts[0].gas_used.execution
+            actual["events"][3][2],
+            result.result.frame.as_ref().unwrap().receipts[1].gas_used.execution
         );
-        assert_eq!(actual["frames"][0][1], 1);
+        assert_eq!(actual["frames"][1][1], 1);
     }
 
     #[test]

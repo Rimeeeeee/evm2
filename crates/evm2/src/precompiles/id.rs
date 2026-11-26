@@ -103,4 +103,10 @@ precompile_ids! {
     Bls12MapFp2ToGp2 = "BLS12_MAP_FP2_TO_G2";
     /// ECDSA signature verification over the secp256r1 elliptic curve.
     P256Verify = "P256VERIFY";
+    /// Pure secp256k1 claim verifier.
+    FrameSecp256k1 = "FRAME_SECP256K1";
+    /// Pure P-256 claim verifier.
+    FrameP256 = "FRAME_P256";
+    /// Pure leanSPHINCS claim verifier.
+    FrameLeanSphincs = "FRAME_LEANSPHINCS";
 }

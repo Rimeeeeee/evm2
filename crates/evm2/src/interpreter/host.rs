@@ -206,13 +206,8 @@ pub trait Host<T: EvmTypesHost> {
         None
     }
 
-    /// Reads protocol signature metadata.
-    fn frame_signature_param(&self, _index: Word, _param: Word) -> Option<Word> {
-        None
-    }
-
-    /// Reads an arbitrary application signature witness.
-    fn frame_signature_bytes(&self, _index: Word) -> Option<Bytes> {
+    /// Reads the key, verifier, or encoded message of a proof frame.
+    fn frame_proof_param(&self, _index: Word, _param: Word) -> Option<Word> {
         None
     }
 

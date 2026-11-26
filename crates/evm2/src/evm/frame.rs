@@ -15,7 +15,7 @@ use alloy_consensus::{TxEip8141, transaction::Recovered};
 use alloy_eips::{
     Typed2718,
     eip7906::TxTraceParam,
-    eip8141::{FrameMode, FrameStatus, SignatureScheme},
+    eip8141::{FrameMode, FrameStatus},
     eip8250::{NONCE_MANAGER, nonce_keys_hash, nonce_slot},
 };
 use alloy_primitives::{Address, B256, Bytes, KECCAK256_EMPTY, U256, map::HashMap};
@@ -60,6 +60,8 @@ pub(crate) struct FrameTransactionRuntime {
     diff: Option<FrameDiff>,
     /// Canonical nonce-key digest, computed once for the immutable transaction payload.
     nonce_keys_hash: Option<B256>,
+    /// Leading proof count, cached so TXPARAM has constant-time queries.
+    proof_count: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -89,6 +91,8 @@ impl FrameTransactionRuntime {
         legacy_nonce: u64,
     ) -> Self {
         let frame_count = payload.frames.len();
+        let proof_count =
+            payload.frames.iter().take_while(|frame| frame.mode == FrameMode::Proof).count();
         let nonce_keys_hash = payload.nonce_keys.as_deref().map(nonce_keys_hash);
         Self {
             resolved_target: payload.sender,
@@ -106,6 +110,7 @@ impl FrameTransactionRuntime {
             state_gas: FrameStateGas::default(),
             diff: None,
             nonce_keys_hash,
+            proof_count,
         }
     }
 
@@ -121,7 +126,7 @@ impl FrameTransactionRuntime {
             8 => U256::from_be_bytes(self.signature_hash.0),
             9 => U256::from(tx.frames.len()),
             10 => U256::from(self.current_frame_index),
-            11 => U256::from(tx.signatures.len()),
+            11 => U256::from(self.proof_count),
             12 => U256::from(state_left),
             13 if tx.nonce_keys.is_some() => U256::from(self.legacy_nonce),
             14 => U256::from(tx.nonce_keys.as_ref()?.len()),
@@ -155,24 +160,22 @@ impl FrameTransactionRuntime {
         })
     }
 
-    pub(super) fn signature_param(&self, index: U256, param: U256) -> Option<U256> {
-        let sig = self.payload.signatures.get(usize::try_from(index).ok()?)?;
+    pub(super) fn proof_param(&self, index: U256, param: U256) -> Option<U256> {
+        let frame = self.payload.frames.get(usize::try_from(index).ok()?)?;
+        let claim = frame.proof()?;
         Some(match u8::try_from(param).ok()? {
-            0 if sig.scheme != SignatureScheme::Arbitrary => U256::from_be_slice(
-                if sig.signer.is_empty() { self.payload.sender } else { sig.signer_address()? }
-                    .as_slice(),
-            ),
-            1 => U256::from(u8::from(sig.scheme)),
-            2 => {
-                if sig.signs_transaction_hash() {
-                    U256::ZERO
-                } else {
-                    U256::from_be_bytes(sig.explicit_message()?.0)
-                }
-            }
-            3 if sig.scheme == SignatureScheme::Arbitrary => U256::from(sig.signature.len()),
+            0 => U256::from_be_bytes(claim.key.0),
+            1 => U256::from_be_slice(frame.resolved_target(self.payload.sender).as_slice()),
+            2 => U256::from_be_bytes(claim.msg.0),
             _ => return None,
         })
+    }
+
+    pub(super) fn is_proof(&self) -> bool {
+        self.payload
+            .frames
+            .get(self.current_frame_index)
+            .is_some_and(|frame| frame.mode == FrameMode::Proof)
     }
 
     pub(super) fn is_assert(&self) -> bool {
@@ -285,12 +288,16 @@ impl FrameTransactionRuntime {
     }
 
     pub(super) fn data(&self, index: U256) -> Option<Bytes> {
-        self.payload.frames.get(usize::try_from(index).ok()?).map(|frame| frame.data.clone())
-    }
-
-    pub(super) fn signature_bytes(&self, index: U256) -> Option<Bytes> {
-        let signature = self.payload.signatures.get(usize::try_from(index).ok()?)?;
-        (signature.scheme == SignatureScheme::Arbitrary).then(|| signature.signature.clone())
+        let current = self.payload.frames.get(self.current_frame_index)?;
+        let frame = self.payload.frames.get(usize::try_from(index).ok()?)?;
+        if current.mode == FrameMode::Proof
+            || (frame.mode == FrameMode::Proof
+                && !(current.mode == FrameMode::Verify
+                    && frame.flags & alloy_eips::eip8141::PROOF_READ_FLAG != 0))
+        {
+            return None;
+        }
+        Some(frame.data.clone())
     }
 
     pub(super) fn sstore_gas(
@@ -479,16 +486,14 @@ impl<T: EvmTypes> Evm<'_, T> {
         }
         let f = &rt.payload.frames[rt.current_frame_index];
         let scope = f.flags & 3;
-        let index = if scope & 2 != 0 { 0 } else { 1 };
+        let index = f.data.first().copied().map(usize::from);
         let valid = scope != 0
-            && rt.payload.signatures.get(index).is_some_and(|sig| {
-                sig.scheme == SignatureScheme::Secp256k1
-                    && sig.signs_transaction_hash()
-                    && if sig.signer.is_empty() {
-                        rt.payload.sender == message.destination
-                    } else {
-                        sig.signer_address() == Some(message.destination)
-                    }
+            && f.data.len() == 1
+            && index.and_then(|index| rt.payload.frames.get(index)).is_some_and(|frame| {
+                frame.resolved_target(rt.payload.sender) == alloy_eips::eip8141::SECP256K1_VERIFIER
+                    && frame.proof().is_some_and(|claim| {
+                        claim.key == message.destination.into_word() && claim.msg.is_zero()
+                    })
             });
         let mut gas = GasTracker::new_isolated(message.gas_limit, message.reservoir);
         let stop = if valid {
@@ -646,6 +651,41 @@ mod tests {
     use alloy_primitives::{Log, LogData, b256, keccak256};
 
     #[test]
+    fn proof_metadata_uses_frame_indices_and_preserves_encoded_zero_message() {
+        let mut data = B256::repeat_byte(1).to_vec();
+        data.extend_from_slice(&[0; 32]);
+        let runtime = FrameTransactionRuntime::new(
+            Arc::new(TxEip8141 {
+                frames: alloc::vec![
+                    Frame {
+                        mode: FrameMode::Proof,
+                        target: alloy_eips::eip8141::SECP256K1_VERIFIER.into(),
+                        data: data.into(),
+                        ..Default::default()
+                    },
+                    Frame::default()
+                ],
+                ..Default::default()
+            }),
+            B256::repeat_byte(2),
+            U256::ZERO,
+            0,
+        );
+        assert_eq!(runtime.tx_param(U256::from(11), 0), Some(U256::ONE));
+        assert_eq!(
+            runtime.proof_param(U256::ZERO, U256::ZERO),
+            Some(U256::from_be_bytes(B256::repeat_byte(1).0))
+        );
+        assert_eq!(
+            runtime.proof_param(U256::ZERO, U256::ONE),
+            Some(U256::from_be_slice(alloy_eips::eip8141::SECP256K1_VERIFIER.as_slice()))
+        );
+        assert_eq!(runtime.proof_param(U256::ZERO, U256::from(2)), Some(U256::ZERO));
+        assert_eq!(runtime.proof_param(U256::ZERO, U256::from(3)), None);
+        assert_eq!(runtime.proof_param(U256::ONE, U256::ZERO), None);
+    }
+
+    #[test]
     fn txparam_exposes_signed_fee_budget_and_rejects_removed_fee_selectors() {
         let mut tx = TxEip8141::default();
         tx.fees.max_priority_fee_per_gas = U256::from(7);
@@ -775,5 +815,48 @@ mod tests {
         assert!(runtime.diff.is_some());
         assert_eq!(runtime.trace_value(&state, U256::from(0x0a), U256::ZERO), Some(U256::ONE));
         assert_eq!(runtime.trace_value(&state, U256::from(0x09), U256::ZERO), Some(U256::from(12)));
+    }
+}
+
+/// A proof-only instruction guard. Compiled runners are bypassed while this is active,
+/// so the same restrictions hold with an interpreter, JIT, or AOT configured on the node.
+pub(super) struct PureInspector<'a, T: EvmTypes> {
+    inner: Option<&'a mut dyn Inspector<T>>,
+}
+
+impl<'a, T: EvmTypes> PureInspector<'a, T> {
+    pub(super) fn new(inner: Option<&'a mut dyn Inspector<T>>) -> Self {
+        Self { inner }
+    }
+}
+
+impl<T: EvmTypes> Inspector<T> for PureInspector<'_, T> {
+    fn step(&mut self, interp: &mut crate::interpreter::Interpreter<'_, '_, T>) {
+        if let Some(inner) = &mut self.inner {
+            inner.step(interp);
+        }
+        let opcode = interp.opcode();
+        let allowed = matches!(opcode,
+            0x00..=0x0b | 0x10..=0x1e | 0x20 | 0x34..=0x39 | 0x3d..=0x3e
+            | 0x50..=0x53 | 0x56..=0x5b | 0x5e..=0x9f | 0xe6..=0xe8 | 0xf3 | 0xfa | 0xfd);
+        let invalid_call = if opcode == 0xfa {
+            interp.stack().iter().rev().nth(1).copied().is_some_and(|word| {
+                let target = Address::from_word(B256::from(word));
+                !interp.host().precompiles().contains(&target)
+                    || (target == Address::with_last_byte(1)
+                        && interp.host().feature(EvmFeatures::EIP8151))
+            })
+        } else {
+            false
+        };
+        if !allowed || invalid_call {
+            interp.set_stop(InstrStop::OpcodeNotFound);
+        }
+    }
+
+    fn step_end(&mut self, interp: &mut crate::interpreter::Interpreter<'_, '_, T>) {
+        if let Some(inner) = &mut self.inner {
+            inner.step_end(interp);
+        }
     }
 }

@@ -1134,10 +1134,9 @@ mod abi {
         __revmc_builtin_txparam(ecx: &mut EvmContext<'_, '_, '_, T>, param: &mut EvmWord) -> BuiltinResult;
         __revmc_builtin_framedataload(ecx: &mut EvmContext<'_, '_, '_, T>, sp: &mut [EvmWord; 2]) -> BuiltinResult;
         __revmc_builtin_frameparam(ecx: &mut EvmContext<'_, '_, '_, T>, sp: &mut [EvmWord; 2]) -> BuiltinResult;
-        __revmc_builtin_sigparam(ecx: &mut EvmContext<'_, '_, '_, T>, sp: &mut [EvmWord; 2]) -> BuiltinResult;
+        __revmc_builtin_proofparam(ecx: &mut EvmContext<'_, '_, '_, T>, sp: &mut [EvmWord; 2]) -> BuiltinResult;
         __revmc_builtin_txtrace(ecx: &mut EvmContext<'_, '_, '_, T>, sp: &mut [EvmWord; 2]) -> BuiltinResult;
         __revmc_builtin_framedatacopy(ecx: &mut EvmContext<'_, '_, '_, T>, sp: &mut [EvmWord; 4]) -> BuiltinResult;
-        __revmc_builtin_sigdatacopy(ecx: &mut EvmContext<'_, '_, '_, T>, sp: &mut [EvmWord; 4]) -> BuiltinResult;
         __revmc_builtin_eventdatacopy(ecx: &mut EvmContext<'_, '_, '_, T>, sp: &mut [EvmWord; 4]) -> BuiltinResult;
     }
 }
