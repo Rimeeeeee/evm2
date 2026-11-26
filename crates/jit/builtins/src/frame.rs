@@ -63,14 +63,14 @@ pub unsafe fn __revmc_builtin_frameparam<T: EvmTypesHost>(
 }
 
 #[inline]
-pub unsafe fn __revmc_builtin_sigparam<T: EvmTypesHost>(
+pub unsafe fn __revmc_builtin_proofparam<T: EvmTypesHost>(
     ecx: &mut EvmContext<'_, '_, '_, T>,
     sp: &mut [EvmWord; 2],
 ) -> BuiltinResult {
     let rev![index, param] = sp;
     *param = ecx
         .host()
-        .frame_signature_param(index.to_u256(), param.to_u256())
+        .frame_proof_param(index.to_u256(), param.to_u256())
         .ok_or(InstrStop::OpcodeNotFound)?
         .into();
     Ok(())
@@ -97,17 +97,6 @@ pub unsafe fn __revmc_builtin_framedatacopy<T: EvmTypesHost>(
 ) -> BuiltinResult {
     let rev![memory, offset, len, index] = sp;
     let data = ecx.host().frame_data(index.to_u256()).ok_or(InstrStop::OpcodeNotFound)?;
-    copy_frame_bytes(ecx, memory.to_u256(), offset.to_u256(), len.to_u256(), &data, false)
-}
-
-#[inline]
-pub unsafe fn __revmc_builtin_sigdatacopy<T: EvmTypesHost>(
-    ecx: &mut EvmContext<'_, '_, '_, T>,
-    sp: &mut [EvmWord; 4],
-) -> BuiltinResult {
-    let rev![memory, offset, len, index] = sp;
-    let data =
-        ecx.host().frame_signature_bytes(index.to_u256()).ok_or(InstrStop::OpcodeNotFound)?;
     copy_frame_bytes(ecx, memory.to_u256(), offset.to_u256(), len.to_u256(), &data, false)
 }
 

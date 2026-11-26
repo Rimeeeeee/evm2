@@ -1900,7 +1900,10 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
             .as_ref()
             .filter(|_| frame_guard.evm.runner_supported)
             .cloned();
-        let stop = if let Some(inspector) = inspector {
+        let stop = if frame_guard.evm.frame_tx.as_ref().is_some_and(|runtime| runtime.is_proof()) {
+            let mut pure = frame::PureInspector::new(inspector);
+            interp_ref.run_inspect(frame_guard.evm, &mut pure)
+        } else if let Some(inspector) = inspector {
             interp_ref.run_inspect(frame_guard.evm, inspector)
         } else if let Some(runner) = runner
             && let Some(stop) = runner.run(interp_ref, frame_guard.evm)
@@ -2093,12 +2096,8 @@ impl<'a, T: EvmTypes> Host<T> for Evm<'a, T> {
         self.frame_tx.as_ref()?.param(index, param)
     }
 
-    fn frame_signature_param(&self, index: Word, param: Word) -> Option<Word> {
-        self.frame_tx.as_ref()?.signature_param(index, param)
-    }
-
-    fn frame_signature_bytes(&self, index: Word) -> Option<Bytes> {
-        self.frame_tx.as_ref()?.signature_bytes(index)
+    fn frame_proof_param(&self, index: Word, param: Word) -> Option<Word> {
+        self.frame_tx.as_ref()?.proof_param(index, param)
     }
 
     fn is_assert_frame(&self) -> bool {

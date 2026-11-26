@@ -265,10 +265,10 @@ evm_features! {
     ///
     /// Default: on since Bogota
     EIP7906,
-    /// Explicit simulation-only allowance for unsigned frame requests.
+    /// Simulation-only allowance for omitted proofs targeting the three protocol verifiers.
     ///
     /// Default: off
-    FRAME_SIGNATURE_PLACEHOLDERS,
+    FRAME_PROOF_PLACEHOLDERS,
     /// Applies [EIP-8298](https://eips.ethereum.org/EIPS/eip-8298) code adoption.
     EIP8298,
     /// Applies [EIP-4758](https://eips.ethereum.org/EIPS/eip-4758) SENDALL semantics.

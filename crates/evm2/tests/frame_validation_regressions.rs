@@ -3,10 +3,7 @@
 mod common;
 
 use alloy_consensus::TxEip8141;
-use alloy_eips::eip8141::{
-    EXPIRY_DATA_LENGTH, EXPIRY_VERIFIER, Frame, FrameLimits, FrameMode, FrameSignature, SECP256K1N,
-    SECP256R1N, SignatureMessage, SignatureScheme,
-};
+use alloy_eips::eip8141::{EXPIRY_DATA_LENGTH, EXPIRY_VERIFIER, Frame, FrameLimits, FrameMode};
 use alloy_primitives::{Address, B256, U256};
 use common::{BODY, FailingDatabase, SENDER, recovered};
 use evm2::{
@@ -16,7 +13,6 @@ use evm2::{
     evm::Db,
     registry::{FrameTransactionError, HandlerError},
 };
-use k256::ecdsa::SigningKey;
 use p256::ecdsa::{
     Signature as P256Signature, SigningKey as P256SigningKey, signature::hazmat::PrehashSigner,
 };
@@ -277,112 +273,29 @@ fn malformed_frame_structure_and_nonce_schemas_are_rejected_without_reads() {
 }
 
 #[test]
-fn every_signature_is_validated_before_account_or_nonce_reads() {
-    let mut signatures = vec![
-        (
-            "secp length",
-            FrameSignature {
-                scheme: SignatureScheme::Secp256k1,
-                signature: vec![0; 64].into(),
-                ..Default::default()
-            },
-        ),
-        (
-            "p256 length",
-            FrameSignature {
-                scheme: SignatureScheme::P256,
-                signature: vec![0; 127].into(),
-                ..Default::default()
-            },
-        ),
-        ("arbitrary signer", FrameSignature { signer: SENDER.into(), ..Default::default() }),
-        (
-            "zero explicit message",
-            FrameSignature { msg: SignatureMessage::Explicit(B256::ZERO), ..Default::default() },
-        ),
-    ];
-    let mut secp = vec![0; 65];
-    secp[0] = 2;
-    secp[32] = 1;
-    secp[64] = 1;
-    signatures.push((
-        "secp recovery bit",
-        FrameSignature {
-            scheme: SignatureScheme::Secp256k1,
-            signature: secp.into(),
-            ..Default::default()
-        },
-    ));
-    let mut high_s = vec![0; 65];
-    high_s[32] = 1;
-    high_s[33..].copy_from_slice(&((SECP256K1N >> 1usize) + U256::from(1)).to_be_bytes::<32>());
-    signatures.push((
-        "secp high s",
-        FrameSignature {
-            scheme: SignatureScheme::Secp256k1,
-            signature: high_s.into(),
-            ..Default::default()
-        },
-    ));
-    for (scheme, order, length, offset) in [
-        (SignatureScheme::Secp256k1, SECP256K1N, 65, 1),
-        (SignatureScheme::P256, SECP256R1N, 128, 0),
-    ] {
-        for (name, r, s) in [
-            ("zero r", U256::ZERO, U256::from(1)),
-            ("out of range r", order, U256::from(1)),
-            ("zero s", U256::from(1), U256::ZERO),
-            ("high s", U256::from(1), (order >> 1usize) + U256::from(1)),
-        ] {
-            let mut bytes = vec![0; length];
-            bytes[offset..offset + 32].copy_from_slice(&r.to_be_bytes::<32>());
-            bytes[offset + 32..offset + 64].copy_from_slice(&s.to_be_bytes::<32>());
-            signatures.push((
-                name,
-                FrameSignature { scheme, signature: bytes.into(), ..Default::default() },
-            ));
-        }
-    }
-    let mut p256 = vec![0; 128];
-    p256[31] = 1;
-    p256[63] = 1;
-    signatures.push((
-        "p256 public key signer mismatch",
-        FrameSignature {
-            scheme: SignatureScheme::P256,
-            signature: p256.into(),
-            ..Default::default()
-        },
-    ));
-    for (name, signature) in signatures {
+fn proof_structure_is_validated_before_account_or_nonce_reads() {
+    for case in 0..6 {
         let mut tx = payload();
-        tx.signatures = vec![FrameSignature::default(), signature];
-        let reason = match name {
-            "zero explicit message" => FrameTransactionError::InvalidSignatureMessage,
-            "arbitrary signer" => FrameTransactionError::UnexpectedSignatureSigner,
-            "p256 public key signer mismatch" => FrameTransactionError::SignatureSignerMismatch,
-            _ => FrameTransactionError::SignatureValidationFailed,
-        };
-        assert_static_error(name, tx, invalid(reason));
+        let mut proof = common::proof(BODY, B256::repeat_byte(1), B256::ZERO, &[]);
+        match case {
+            0 => proof.data = vec![1; 63].into(),
+            1 => proof.data = vec![0; 64].into(),
+            2 => proof.limits.state = 1,
+            3 => proof.value = U256::ONE,
+            4 => proof.flags = alloy_eips::eip8141::PROOF_COMMIT_FLAG,
+            _ => {}
+        }
+        if case == 5 {
+            tx.frames.push(proof);
+        } else {
+            tx.frames.insert(0, proof);
+        }
+        assert_static_error(
+            "proof structure before state",
+            tx,
+            invalid(FrameTransactionError::InvalidProofFrame),
+        );
     }
-    // Structurally canonical, cryptographically valid signature for a different signer.
-    let mut tx = payload();
-    let key = SigningKey::from_slice(&[0x11; 32]).unwrap();
-    let message = B256::with_last_byte(1);
-    let (signature, recovery) = key.sign_prehash_recoverable(message.as_slice());
-    let mut bytes = vec![recovery.to_byte()];
-    bytes.extend_from_slice(&signature.to_bytes());
-    tx.signatures.push(FrameSignature {
-        scheme: SignatureScheme::Secp256k1,
-        msg: SignatureMessage::Explicit(message),
-        signature: bytes.into(),
-        ..Default::default()
-    });
-    assert_static_error(
-        "wrong recovered signer",
-        tx,
-        invalid(FrameTransactionError::SignatureSignerMismatch),
-    );
 }
 
 #[test]
@@ -540,7 +453,7 @@ fn competing_errors_follow_static_preparation_order_and_valid_payload_reaches_db
     );
     let mut tx = payload();
     tx.chain_id = 2;
-    tx.signatures.push(FrameSignature { scheme: SignatureScheme::P256, ..Default::default() });
+    tx.frames.insert(0, Frame { mode: FrameMode::Proof, ..Default::default() });
     assert_static_error(
         "chain before signature shape",
         tx,
@@ -590,16 +503,24 @@ fn activation_and_signature_placeholder_controls_do_not_relax_static_shape() {
         assert_eq!(reads.load(Ordering::Relaxed), 0);
     }
     let mut version = Version::new(SpecId::BOGOTA);
-    version.features.insert(EvmFeatures::FRAME_SIGNATURE_PLACEHOLDERS);
+    version.features.insert(EvmFeatures::FRAME_PROOF_PLACEHOLDERS);
     let (mut evm, reads) = evm(version, BlockEnvExt::default());
     let mut tx = payload();
-    tx.signatures.push(FrameSignature { scheme: SignatureScheme::Secp256k1, ..Default::default() });
+    tx.frames.insert(
+        0,
+        common::proof(
+            alloy_eips::eip8141::SECP256K1_VERIFIER,
+            B256::repeat_byte(1),
+            B256::ZERO,
+            &[],
+        ),
+    );
     assert!(matches!(evm.validate_tx(&recovered(tx.clone())), Err(HandlerError::Database(_))));
     assert_eq!(reads.load(Ordering::Relaxed), 1);
-    tx.signatures[0].msg = SignatureMessage::Explicit(B256::ZERO);
+    tx.frames[0].flags = alloy_eips::eip8141::PROOF_COMMIT_FLAG;
     assert_eq!(
         evm.validate_tx(&recovered(tx)).unwrap_err(),
-        invalid(FrameTransactionError::InvalidSignatureMessage)
+        invalid(FrameTransactionError::InvalidProofFrame)
     );
     assert_eq!(reads.load(Ordering::Relaxed), 1);
 }
@@ -645,37 +566,24 @@ fn valid_structure_boundaries_reach_database_validation() {
 }
 
 #[test]
-fn native_p256_verification_accepts_a_valid_signature_and_rejects_invalid_crypto_before_reads() {
-    let key = P256SigningKey::from_slice(&[0x22; 32]).unwrap();
-    let message = B256::with_last_byte(1);
+fn native_p256_verifier_authenticates_the_key_message_and_proof() {
+    let key = P256SigningKey::from_slice(&[3; 32]).unwrap();
+    let message = B256::repeat_byte(0x77);
     let signature: P256Signature = key.sign_prehash(message.as_slice()).unwrap();
     let signature = signature.normalize_s();
     let public = key.verifying_key().to_sec1_point(false);
-    let mut bytes = signature.to_bytes().to_vec();
-    bytes.extend_from_slice(&public.as_bytes()[1..]);
-    let mut tx = payload();
-    tx.signatures = vec![
-        FrameSignature::default(),
-        FrameSignature {
-            scheme: SignatureScheme::P256,
-            signer: Address::from_raw_public_key(&public.as_bytes()[1..]).into(),
-            msg: SignatureMessage::Explicit(message),
-            signature: bytes.into(),
-        },
-    ];
-    let (mut evm, reads) = evm(Version::new(SpecId::BOGOTA), BlockEnvExt::default());
-    assert!(matches!(evm.validate_tx(&recovered(tx.clone())), Err(HandlerError::Database(_))));
-    assert_eq!(reads.load(Ordering::Relaxed), 1);
-    // Preserve canonical scalars and the signer/public-key match while invalidating the signature.
-    let mut invalid_bytes = tx.signatures[1].signature.to_vec();
-    invalid_bytes[..32].fill(0);
-    invalid_bytes[31] = 1;
-    tx.signatures[1].signature = invalid_bytes.into();
-    assert_static_error(
-        "p256 invalid crypto",
-        tx,
-        invalid(FrameTransactionError::SignatureValidationFailed),
-    );
+    let signer = Address::from_raw_public_key(&public.as_bytes()[1..]);
+    let mut input = signer.into_word().to_vec();
+    input.extend_from_slice(message.as_slice());
+    input.extend_from_slice(signature.to_bytes().as_slice());
+    input.extend_from_slice(&public.as_bytes()[1..]);
+    let mut gas = evm2::interpreter::GasTracker::new_isolated(7000, 0);
+    assert!(evm2::precompiles::frame_verifiers::p256(&input, &mut gas).is_ok());
+    assert_eq!(gas.remaining(), 100);
+    input[0] = 1;
+    let mut gas = evm2::interpreter::GasTracker::new_isolated(7000, 0);
+    assert!(evm2::precompiles::frame_verifiers::p256(&input, &mut gas).is_err());
+    assert_eq!(gas.remaining(), 0);
 }
 
 #[test]
@@ -781,7 +689,7 @@ fn frame_environment_errors_follow_revm_precedence() {
         let mut tx = payload();
         tx.nonce = u64::MAX;
         tx.frames[1].flags = 0x80;
-        tx.signatures.push(FrameSignature { scheme: SignatureScheme::P256, ..Default::default() });
+        tx.frames.insert(0, Frame { mode: FrameMode::Proof, ..Default::default() });
         if blobs {
             tx.blob_versioned_hashes = vec![B256::ZERO; version.max_blobs_per_tx + 1];
         }
@@ -1303,5 +1211,23 @@ mod nonces {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn invalid_native_claims_are_rejected_before_any_prefix_state_access() {
+    for target in [
+        alloy_eips::eip8141::SECP256K1_VERIFIER,
+        alloy_eips::eip8141::P256_VERIFIER,
+        alloy_eips::eip8141::LEANSPHINCS_VERIFIER,
+    ] {
+        let mut tx = payload();
+        tx.frames.insert(0, common::proof(target, B256::repeat_byte(1), B256::ZERO, &[0; 65]));
+        let (mut evm, reads) = evm(Version::new(SpecId::BOGOTA), BlockEnvExt::default());
+        assert_eq!(
+            evm.validate_frame_prefix(&recovered(tx), 2).unwrap_err(),
+            invalid(FrameTransactionError::ProofFrameFailed)
+        );
+        assert_eq!(reads.load(Ordering::Relaxed), 0);
     }
 }

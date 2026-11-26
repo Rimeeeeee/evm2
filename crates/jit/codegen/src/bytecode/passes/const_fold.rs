@@ -445,8 +445,7 @@ fn try_range_fold(
         | op::FRAMEDATALOAD
         | op::FRAMEDATACOPY
         | op::FRAMEPARAM
-        | op::SIGPARAM
-        | op::SIGDATACOPY
+        | op::PROOFPARAM
         | op::TXTRACE
         | op::EVENTDATACOPY
         | op::DUPN

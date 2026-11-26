@@ -67,15 +67,8 @@ pub fn frameparam(cx: _, [index, param]: [Word]) -> Result<out> {
 }
 
 #[instruction]
-pub fn sigparam(cx: _, [index, param]: [Word]) -> Result<out> {
-    *out =
-        cx.state.host().frame_signature_param(*index, *param).ok_or(InstrStop::OpcodeNotFound)?;
-}
-
-#[instruction(dynamic_gas)]
-pub fn sigdatacopy(cx: _, [memory, offset, len, index]: [Word]) -> Result {
-    let data = cx.state.host().frame_signature_bytes(*index).ok_or(InstrStop::OpcodeNotFound)?;
-    copy_data(cx, memory, offset, len, data, false)
+pub fn proofparam(cx: _, [index, param]: [Word]) -> Result<out> {
+    *out = cx.state.host().frame_proof_param(*index, *param).ok_or(InstrStop::OpcodeNotFound)?;
 }
 
 #[instruction]

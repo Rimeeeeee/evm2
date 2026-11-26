@@ -12,6 +12,9 @@ pub type PrecompileResult = Result<PrecompileOutput, PrecompileError>;
 /// the entire EVM transaction.
 #[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]
 pub enum PrecompileHalt {
+    /// A frame verifier received malformed input or an invalid proof.
+    #[error("frame proof verification failed")]
+    InvalidFrameProof,
     /// out of gas is the main error. Others are here just for completeness
     #[error("out of gas")]
     OutOfGas,

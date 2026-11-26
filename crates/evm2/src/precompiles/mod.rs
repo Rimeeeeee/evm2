@@ -59,6 +59,7 @@ pub mod bn254;
 mod crypto;
 pub use crypto::{Crypto, DefaultCrypto, crypto, install_crypto};
 
+pub mod frame_verifiers;
 pub mod hash;
 pub mod identity;
 pub mod kzg_point_evaluation;
@@ -175,7 +176,7 @@ impl<T: EvmTypesHost> PrecompileProvider<T> for Precompiles<T> {
 }
 
 #[cfg(feature = "std")]
-type BasePrecompileCache<T> = [OnceLock<PrecompileMap<T>>; 7];
+type BasePrecompileCache<T> = [OnceLock<PrecompileMap<T>>; 8];
 
 /// Append-only list of the [`BasePrecompileCache`] of each host type, starting at
 /// [`BASE_PRECOMPILES`].
@@ -214,7 +215,8 @@ fn cached_base_precompiles<T: EvmTypesHost>(spec: SpecId) -> &'static Precompile
         SpecId::BERLIN | SpecId::LONDON | SpecId::MERGE | SpecId::SHANGHAI => 3,
         SpecId::CANCUN => 4,
         SpecId::PRAGUE => 5,
-        SpecId::OSAKA | SpecId::AMSTERDAM | SpecId::BOGOTA => 6,
+        SpecId::OSAKA | SpecId::AMSTERDAM => 6,
+        SpecId::BOGOTA => 7,
     };
 
     shared_base_precompiles::<T>()
@@ -282,6 +284,14 @@ fn base_precompiles<T: EvmTypesHost>(spec: SpecId) -> PrecompileMap<T> {
 
     if spec.enables(SpecId::OSAKA) {
         precompiles.extend([MODEXP_OSAKA(), P256VERIFY_OSAKA()]);
+    }
+
+    if spec.enables(SpecId::BOGOTA) {
+        precompiles.extend([
+            FRAME_SECP256K1_VERIFIER(),
+            FRAME_P256_VERIFIER(),
+            FRAME_LEANSPHINCS_VERIFIER(),
+        ]);
     }
 
     precompiles.shrink_to_fit();

@@ -189,3 +189,17 @@ pub(crate) fn assert_validation_error(
     assert_eq!(evm.validate_frame_prefix(tx, 1).unwrap_err(), expected, "prefix");
     assert_eq!(evm.transact(tx).unwrap_err(), expected, "execution");
 }
+
+/// Constructs a proof with a fixed claim prefix and a borrowed witness copied into wire data.
+pub(crate) fn proof(target: Address, key: B256, msg: B256, witness: &[u8]) -> Frame {
+    let mut data = key.to_vec();
+    data.extend_from_slice(msg.as_slice());
+    data.extend_from_slice(witness);
+    Frame {
+        mode: FrameMode::Proof,
+        target: target.into(),
+        data: data.into(),
+        limits: FrameLimits { execution: 20_000, state: 0 },
+        ..Default::default()
+    }
+}

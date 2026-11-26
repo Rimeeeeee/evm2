@@ -15,6 +15,7 @@ keywords.workspace = true
 workspace = true
 
 [dependencies]
+lean-sphincs.workspace = true
 evm2-macros.workspace = true
 
 alloy-consensus.workspace = true

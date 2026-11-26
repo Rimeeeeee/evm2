@@ -978,8 +978,7 @@ evm_versions! {
             FRAMEDATALOAD: VERYLOW,
             FRAMEDATACOPY: VERYLOW,
             FRAMEPARAM: BASE,
-            SIGPARAM: BASE,
-            SIGDATACOPY: VERYLOW,
+            PROOFPARAM: BASE,
             TXTRACE: WARM_STORAGE_READ_COST,
             EVENTDATACOPY: VERYLOW,
             SETCODEFROM: ZERO,
@@ -1155,8 +1154,7 @@ macro_rules! op_instr {
     (@path $ty:ident, FRAMEDATALOAD) => { instr::framedataload<$ty> };
     (@path $ty:ident, FRAMEDATACOPY) => { instr::framedatacopy<$ty> };
     (@path $ty:ident, FRAMEPARAM) => { instr::frameparam<$ty> };
-    (@path $ty:ident, SIGPARAM) => { instr::sigparam<$ty> };
-    (@path $ty:ident, SIGDATACOPY) => { instr::sigdatacopy<$ty> };
+    (@path $ty:ident, PROOFPARAM) => { instr::proofparam<$ty> };
     (@path $ty:ident, TXTRACE) => { instr::txtrace<$ty> };
     (@path $ty:ident, EVENTDATACOPY) => { instr::eventdatacopy<$ty> };
 }

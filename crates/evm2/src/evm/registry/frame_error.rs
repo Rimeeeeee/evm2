@@ -5,6 +5,12 @@ use thiserror::Error;
 /// A protocol validation or execution failure in an EIP-8141 frame transaction.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum FrameTransactionError {
+    /// A proof frame has invalid fields or is outside the leading proof prefix.
+    #[error("invalid EIP-8141 proof frame")]
+    InvalidProofFrame,
+    /// A pure verifier call reverted or halted exceptionally.
+    #[error("EIP-8141 proof frame failed")]
+    ProofFrameFailed,
     /// EIP-8141 derived gas limit overflow.
     #[error("EIP-8141 derived gas limit overflow")]
     GasLimitOverflow,
