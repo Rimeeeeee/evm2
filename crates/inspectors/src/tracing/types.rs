@@ -1050,13 +1050,20 @@ mod trace_serde {
     #[derive(Serialize)]
     #[serde(rename = "CallTrace")]
     struct CallTraceSer<'a> {
-        frame_transaction_root: bool,
-        entered_evm: bool,
-        frame_index: Option<usize>,
-        frame_mode: Option<u8>,
-        state_gas_used: u64,
-        rolled_back: bool,
-        skipped: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        frame_transaction_root: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        entered_evm: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        frame_index: Option<Option<usize>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        frame_mode: Option<Option<u8>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        state_gas_used: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rolled_back: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        skipped: Option<bool>,
         depth: usize,
         success: bool,
         caller: &'a Address,
@@ -1122,14 +1129,16 @@ mod trace_serde {
 
     impl Serialize for CallTrace {
         fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            let binary = !serializer.is_human_readable();
             CallTraceSer {
-                frame_transaction_root: self.frame_transaction_root,
-                entered_evm: self.entered_evm,
-                frame_index: self.frame_index,
-                frame_mode: self.frame_mode,
-                state_gas_used: self.state_gas_used,
-                rolled_back: self.rolled_back,
-                skipped: self.skipped,
+                frame_transaction_root: (binary || self.frame_transaction_root)
+                    .then_some(self.frame_transaction_root),
+                entered_evm: (binary || self.entered_evm).then_some(self.entered_evm),
+                frame_index: (binary || self.frame_index.is_some()).then_some(self.frame_index),
+                frame_mode: (binary || self.frame_mode.is_some()).then_some(self.frame_mode),
+                state_gas_used: (binary || self.state_gas_used != 0).then_some(self.state_gas_used),
+                rolled_back: (binary || self.rolled_back).then_some(self.rolled_back),
+                skipped: (binary || self.skipped).then_some(self.skipped),
                 depth: self.depth.into(),
                 success: self.success,
                 caller: &self.caller,
@@ -1330,11 +1339,14 @@ mod frame_serde_tests {
             skipped: true,
             ..Default::default()
         };
-        let json = serde_json::to_vec(&trace).unwrap();
-        assert_eq!(serde_json::from_slice::<CallTrace>(&json).unwrap(), trace);
-        for bytes in [rmp_serde::to_vec(&trace).unwrap(), rmp_serde::to_vec_named(&trace).unwrap()]
-        {
-            assert_eq!(rmp_serde::from_slice::<CallTrace>(&bytes).unwrap(), trace);
+        for trace in [CallTrace::default(), trace] {
+            let json = serde_json::to_vec(&trace).unwrap();
+            assert_eq!(serde_json::from_slice::<CallTrace>(&json).unwrap(), trace);
+            for bytes in
+                [rmp_serde::to_vec(&trace).unwrap(), rmp_serde::to_vec_named(&trace).unwrap()]
+            {
+                assert_eq!(rmp_serde::from_slice::<CallTrace>(&bytes).unwrap(), trace);
+            }
         }
     }
 }
