@@ -1586,6 +1586,7 @@ fn test_geth_prestate_disable_code_in_diff_mode() {
         diff_mode: Some(true),
         disable_code: Some(true),
         disable_storage: Some(false),
+        ..Default::default()
     };
 
     let mut insp = TracingInspector::new(TracingInspectorConfig::from_geth_prestate_config(
@@ -1642,6 +1643,7 @@ fn test_geth_prestate_disable_code_in_diff_mode() {
         diff_mode: Some(true),
         disable_code: Some(false),
         disable_storage: Some(false),
+        ..Default::default()
     };
 
     let mut insp2 = TracingInspector::new(TracingInspectorConfig::from_geth_prestate_config(
@@ -1866,6 +1868,7 @@ fn test_geth_prestate_diff_selfdestruct(spec_id: SpecId) {
         diff_mode: Some(true),
         disable_code: Some(false),
         disable_storage: Some(false),
+        ..Default::default()
     };
     let insp =
         TracingInspector::new(TracingInspectorConfig::from_geth_prestate_config(&prestate_config));
