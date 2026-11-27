@@ -124,14 +124,6 @@ impl CurrentFiber {
     }
 }
 
-struct ResetCurrentFiber(Option<NonNull<CurrentFiber>>);
-
-impl Drop for ResetCurrentFiber {
-    fn drop(&mut self) {
-        CURRENT.set(self.0);
-    }
-}
-
 /// Runs `func` on a native fiber and awaits its completion.
 ///
 /// Synchronous code running inside `func` may call [`block_on_current`] to wait for async host
@@ -298,7 +290,7 @@ impl<'a, R> FiberFuture<'a, R> {
             };
             let current = NonNull::from(&mut current);
             CURRENT.set(Some(current));
-            let _reset = ResetCurrentFiber(previous);
+            let _reset = core::mem::DropGuard::new(previous, |previous| CURRENT.set(previous));
             Ok(func())
         };
         // SAFETY: The coroutine is stored inside `FiberFuture<'a, R>`, which is tied to the
@@ -535,8 +527,7 @@ impl<D: AsyncDatabase + fmt::Debug> fmt::Debug for AsyncDb<D> {
 mod tests {
     use super::*;
     use crate::{
-        BaseEvmTypes, Evm, ExecutionConfig, Inspector, PrecompileError, Precompiles, SpecId,
-        Version,
+        BaseEvmTypes, Evm, Inspector, PrecompileError, Precompiles, SpecId,
         bytecode::Bytecode,
         constants::CALL_DEPTH_LIMIT,
         env::BlockEnvExt,
@@ -1080,16 +1071,14 @@ mod tests {
             &target,
             AccountInfo { nonce: 1, ..AccountInfo::default().with_code(code) },
         );
-        let mut version = Version::new(SpecId::FRONTIER);
-        version.initial_call_depth = initial_call_depth;
-        let mut evm = Evm::<BaseEvmTypes>::new_with_execution_config(
-            ExecutionConfig::for_spec_and_version(SpecId::FRONTIER, version),
+        let mut evm = Evm::<BaseEvmTypes>::new(
             SpecId::FRONTIER,
             BlockEnvExt::default(),
             crate::ethereum::ethereum_tx_registry(SpecId::FRONTIER),
             database,
             Precompiles::base(SpecId::FRONTIER),
         );
+        evm.set_initial_call_depth(initial_call_depth);
         evm.set_inspector(DepthInspector::default());
         let tx = Recovered::new_unchecked(
             crate::ethereum::TxEnvelope::Legacy(TxLegacy {

@@ -1,7 +1,7 @@
 use crate::tracing::{
     Erc7562Inspector, FourByteInspector, KECCAK256_PREIMAGE_TRACER, Keccak256PreimageInspector,
-    MuxInspector, TracingInspector, TracingInspectorConfig, TransactionContext,
-    utils::transaction_info,
+    MuxInspector, RawDefaultFrame, RawStructLogInspector, TraceLimits, TracingInspector,
+    TracingInspectorConfig, TransactionContext, utils::transaction_info,
 };
 use alloc::{sync::Arc, vec::Vec};
 use alloy_consensus::{Transaction, transaction::Recovered};
@@ -54,6 +54,8 @@ pub enum DebugInspector {
     Keccak256Preimage(Keccak256PreimageInspector),
     /// Default tracer
     Default(TracingInspector, GethDefaultTracingOptions),
+    /// Default tracer that writes its struct logs as JSON, see [`StructLogMode::Raw`]
+    RawDefault(RawStructLogInspector),
     /// JS tracer
     #[cfg(feature = "js-tracer")]
     Js(Box<crate::tracing::js::JsInspector>),
@@ -77,6 +79,7 @@ impl DebugInspector {
             Self::Erc7562Tracer(inspector) => Self::Erc7562Tracer(inspector.clone()),
             Self::Keccak256Preimage(inspector) => Self::Keccak256Preimage(inspector.clone()),
             Self::Default(inspector, config) => Self::Default(inspector.clone(), *config),
+            Self::RawDefault(inspector) => Self::RawDefault(inspector.fresh()),
             #[cfg(feature = "js-tracer")]
             Self::Js(inspector) => Self::Js(inspector.try_clone()?.into()),
         })
@@ -84,6 +87,15 @@ impl DebugInspector {
 
     /// Create a new `DebugInspector` from the given tracing options.
     pub fn new(opts: GethDebugTracingOptions) -> Result<Self, DebugInspectorError> {
+        Self::new_with_struct_log_mode(opts, StructLogMode::Typed)
+    }
+
+    /// Create a new `DebugInspector` from the given tracing options, with the default struct
+    /// logger producing its struct logs as `mode` says. Other tracers are not affected.
+    pub fn new_with_struct_log_mode(
+        opts: GethDebugTracingOptions,
+        mode: StructLogMode,
+    ) -> Result<Self, DebugInspectorError> {
         let GethDebugTracingOptions { config, tracer, tracer_config, .. } = opts;
 
         // Normalize an empty tracer name to None so it selects DebugInspector::Default below,
@@ -170,17 +182,79 @@ impl DebugInspector {
                 }
             }
         } else {
-            Self::Default(
-                TracingInspector::new(TracingInspectorConfig::from_geth_config(&config)),
-                config,
-            )
+            match mode {
+                StructLogMode::Typed => Self::Default(
+                    TracingInspector::new(TracingInspectorConfig::from_geth_config(&config)),
+                    config,
+                ),
+                StructLogMode::Raw => Self::RawDefault(RawStructLogInspector::new(config)),
+            }
         };
 
         Ok(this)
     }
 
+    /// Applies the limits to the tracers that record trace data, see [`Self::set_limits`].
+    pub fn with_limits(mut self, limits: TraceLimits) -> Self {
+        self.set_limits(limits);
+        self
+    }
+
+    /// Applies the limits to the tracers that record trace data, and keeps them across
+    /// [`Self::fuse`].
+    ///
+    /// The erc7562 tracer applies them to the call inputs it retains. Its preimages and those of
+    /// the keccak256 preimage tracer keep their own limit, which defaults to
+    /// [`DEFAULT_MAX_RECORDED_BYTES`](crate::tracing::DEFAULT_MAX_RECORDED_BYTES), so limits
+    /// without a maximum do not lift it. Each tracer of a mux tracer has its own budget. The
+    /// 4byte, noop, state-gas and JavaScript tracers record no unbounded byte data and ignore the
+    /// limits.
+    pub fn set_limits(&mut self, limits: TraceLimits) {
+        match self {
+            Self::CallTracer(inspector, _)
+            | Self::PreStateTracer(inspector, _)
+            | Self::FlatCallTracer(inspector, _)
+            | Self::Default(inspector, _) => inspector.set_limits(limits),
+            Self::RawDefault(inspector) => inspector.set_limits(limits),
+            Self::Erc7562Tracer(inspector) => inspector.set_call_limits(limits),
+            Self::Mux(inspector, _) => inspector.set_limits(limits),
+            Self::FourByte(_)
+            | Self::Keccak256Preimage(_)
+            | Self::Noop(_)
+            | Self::StateGasTracer(_) => {}
+            #[cfg(feature = "js-tracer")]
+            Self::Js(_) => {}
+        }
+    }
+
+    /// Returns the bytes counted against the limits since the last [`Self::fuse`], see
+    /// [`Self::set_limits`].
+    ///
+    /// A mux tracer returns the sum of its tracers, and tracers that ignore the limits return
+    /// zero. A caller that traces several transactions can pass what is left of a limit to the
+    /// next one, to bound them together.
+    pub fn recorded_bytes(&self) -> usize {
+        match self {
+            Self::CallTracer(inspector, _)
+            | Self::PreStateTracer(inspector, _)
+            | Self::FlatCallTracer(inspector, _)
+            | Self::Default(inspector, _) => inspector.recorded_bytes(),
+            Self::RawDefault(inspector) => inspector.recorded_bytes(),
+            Self::Erc7562Tracer(inspector) => inspector.recorded_call_bytes(),
+            Self::Mux(inspector, _) => inspector.recorded_bytes(),
+            Self::FourByte(_)
+            | Self::Keccak256Preimage(_)
+            | Self::Noop(_)
+            | Self::StateGasTracer(_) => 0,
+            #[cfg(feature = "js-tracer")]
+            Self::Js(_) => 0,
+        }
+    }
+
     /// Prepares inspector for executing the next transaction. This will remove any state from
-    /// previous transactions.
+    /// previous transactions, except the global state of a JavaScript tracer: its script is
+    /// evaluated again in the same JS context, so `globalThis` properties and modified prototypes
+    /// persist until the inspector is dropped.
     pub fn fuse(&mut self) -> Result<(), DebugInspectorError> {
         match self {
             Self::FourByte(inspector) => {
@@ -190,6 +264,7 @@ impl DebugInspector {
             | Self::PreStateTracer(inspector, _)
             | Self::FlatCallTracer(inspector, _)
             | Self::Default(inspector, _) => inspector.fuse(),
+            Self::RawDefault(inspector) => inspector.fuse(),
             Self::Erc7562Tracer(inspector) => inspector.fuse(),
             Self::Keccak256Preimage(inspector) => inspector.clear(),
             Self::Noop(_) | Self::StateGasTracer(_) => {}
@@ -234,6 +309,8 @@ impl DebugInspector {
     ///
     /// The default struct logger moves the recorded stack snapshots into the result, so calling
     /// this again before [`Self::fuse`] returns struct logs without stacks.
+    ///
+    /// Use [`Self::get_trace`] for raw output.
     pub fn get_result<T: EvmTypesHost<Tx: Transaction>>(
         &mut self,
         tx_context: Option<TransactionContext>,
@@ -316,6 +393,7 @@ impl DebugInspector {
                     )
                     .into()
             }
+            Self::RawDefault(_) => return Err(DebugInspectorError::RawStructLogs),
             #[cfg(feature = "js-tracer")]
             Self::Js(inspector) => {
                 inspector.set_transaction_context(tx_context.unwrap_or_default());
@@ -324,6 +402,25 @@ impl DebugInspector {
         };
 
         Ok(res)
+    }
+
+    /// Should be invoked after each transaction to obtain the resulting [`DebugTrace`].
+    ///
+    /// This is [`Self::get_result`] for every tracer but the default struct logger in
+    /// raw mode, which returns its frame with the struct logs as JSON. It takes the
+    /// struct logs, so calling this again before [`Self::fuse`] returns a frame without them.
+    pub fn get_trace<T: EvmTypesHost<Tx: Transaction>>(
+        &mut self,
+        tx_context: Option<TransactionContext>,
+        tx: &Recovered<T::Tx>,
+        block_env: &BlockEnv<T>,
+        res: &TxResultWithState<T>,
+        db: &mut dyn DynDatabase,
+    ) -> Result<DebugTrace, DebugInspectorError> {
+        if let Self::RawDefault(inspector) = self {
+            return Ok(DebugTrace::RawDefault(inspector.take_frame(&res.result)));
+        }
+        self.get_result(tx_context, tx, block_env, res, db).map(DebugTrace::Geth)
     }
 }
 
@@ -336,6 +433,7 @@ macro_rules! delegate {
             Self::FlatCallTracer($insp, _) => Inspector::<T>::$method($insp, $($arg),*),
             Self::Erc7562Tracer($insp) => Inspector::<T>::$method($insp, $($arg),*),
             Self::Default($insp, _) => Inspector::<T>::$method($insp, $($arg),*),
+            Self::RawDefault($insp) => Inspector::<T>::$method($insp, $($arg),*),
             Self::Keccak256Preimage($insp) => Inspector::<T>::$method($insp, $($arg),*),
             Self::Noop($insp) => Inspector::<T>::$method($insp, $($arg),*),
             Self::StateGasTracer($insp) => Inspector::<T>::$method($insp, $($arg),*),
@@ -463,7 +561,7 @@ pub enum DebugInspectorError {
     /// The keccak256 preimage tracer reached its limit of recorded bytes
     #[error(transparent)]
     Keccak256Preimage(#[from] crate::tracing::Keccak256PreimageLimitExceeded),
-    /// The erc7562 tracer reached its limit of recorded preimage bytes or failed to read the state
+    /// The erc7562 tracer reached a limit of recorded bytes or failed to read the state
     #[error(transparent)]
     Erc7562(#[from] crate::tracing::Erc7562Error),
     /// Error from JS inspector
@@ -473,4 +571,36 @@ pub enum DebugInspectorError {
     /// Database operation failed
     #[error("database error {0:?}")]
     Database(DatabaseError),
+    /// The struct logs are JSON, which a [`GethTrace`] cannot hold, see
+    /// [`DebugInspector::get_trace`]
+    #[error("raw struct logs are only returned by `get_trace`")]
+    RawStructLogs,
+}
+
+/// How the default struct logger of a [`DebugInspector`] produces its struct logs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StructLogMode {
+    /// Record the steps and build typed
+    /// [`StructLog`](alloy_rpc_types_trace::geth::StructLog)s from them.
+    #[default]
+    Typed,
+    /// Write the struct logs as JSON during execution, see [`RawStructLogInspector`]. The trace
+    /// serializes to the same JSON, several times faster, but its struct logs cannot be inspected.
+    Raw,
+}
+
+/// The trace of a transaction, as returned by [`DebugInspector::get_trace`].
+///
+/// It serializes like the [`GethTrace`] of the tracer.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize), serde(untagged))]
+// A trace is built once per transaction, so the size of the typed frames does not matter.
+#[allow(clippy::large_enum_variant)]
+pub enum DebugTrace {
+    /// A trace with typed frames
+    Geth(GethTrace),
+    /// The frame of the default struct logger with its struct logs as JSON, see
+    /// [`StructLogMode::Raw`]
+    RawDefault(RawDefaultFrame),
 }

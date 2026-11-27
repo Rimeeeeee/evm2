@@ -142,7 +142,8 @@ impl TryFrom<&AlloyCodeChange> for BalCodeChange {
             });
         }
         let bytecode = Bytecode::new_raw_checked(change.new_code().clone())?;
-        let hash = bytecode.hash_slow();
+        let hash = change.code_hash();
+        bytecode.seed_hash(hash);
         Ok(Self::new(change.block_access_index(), (hash, bytecode)))
     }
 }
