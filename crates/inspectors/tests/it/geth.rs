@@ -1,6 +1,9 @@
 //! Geth tests
 
 mod consistency;
+#[cfg(feature = "serde")]
+mod raw_struct_logs;
+mod refund_counter;
 mod runtime_oog;
 
 use crate::utils::{
@@ -675,6 +678,47 @@ fn test_geth_erc7562_bounds_retained_preimages() {
     }
 }
 
+#[test]
+fn test_geth_erc7562_bounds_retained_call_inputs() {
+    let contract = address!("1000000000000000000000000000000000000001");
+    let spec = SpecId::CANCUN;
+    // CALL passing two bytes of memory as input.
+    let code = Bytes::from_static(&hex!("5f5f60025f5f5f5af100"));
+    let mut db = InMemoryDB::default();
+    db.insert_account_info(
+        &contract,
+        AccountInfo { code: Some(Bytecode::new_raw(code)), ..Default::default() },
+    );
+    let block = *Context::mainnet().block();
+    for (limit, input) in [(2, Some(2)), (1, None)] {
+        let mut inspector = Erc7562Inspector::new(Erc7562Config::default());
+        inspector.set_call_limits(TraceLimits::default().set_max_recorded_bytes(Some(limit)));
+        let mut evm = Evm::<BaseEvmTypes>::new(
+            spec,
+            block,
+            ethereum_tx_registry(spec),
+            db.clone(),
+            Precompiles::base(spec),
+        );
+        evm.set_inspector(&mut inspector);
+        let tx = TxEnv {
+            gas_limit: 1_000_000,
+            gas_price: 0,
+            kind: TransactTo::Call(contract),
+            ..Default::default()
+        };
+        let envelope = tx.envelope();
+        let res = evm.transact(&envelope).unwrap().detach();
+        drop(evm);
+
+        assert_eq!(inspector.limit_exceeded(), input.is_none());
+        assert_eq!(
+            inspector.frame(&envelope, &res.result).ok().map(|frame| frame.calls[0].input.len()),
+            input
+        );
+    }
+}
+
 /// A database whose storage reads fail.
 struct NoStorageDb(InMemoryDB);
 
@@ -845,6 +889,25 @@ fn test_geth_erc7562_records_warm_first_reads() {
     assert_eq!(frame.calls[0].accessed_slots.reads[&slot], vec![value]);
 }
 
+/// geth reads the code size when the opcode runs, so an account created earlier in the same
+/// transaction has a size.
+#[test]
+fn test_geth_erc7562_contract_size_of_account_created_in_same_transaction() {
+    // CREATE a contract whose runtime code is 5 bytes, then EXTCODESIZE the created address.
+    let code = hex!("6460056000f36000526005601b6000f03b00");
+    let (trace, _) = trace_contract(
+        SpecId::CANCUN,
+        GethDebugTracingOptions::erc7562_tracer(Erc7562Config::default()),
+        code.into(),
+    );
+    let GethTrace::Erc7562Tracer(frame) = trace else { panic!("Expected Erc7562Tracer") };
+
+    let created = frame.calls[0].to.unwrap();
+    assert_eq!(frame.contract_size.len(), 1);
+    assert_eq!(frame.contract_size[&created].contract_size, 5);
+    assert_eq!(frame.contract_size[&created].opcode, op::EXTCODESIZE);
+}
+
 fn trace_contract(
     spec: SpecId,
     opts: GethDebugTracingOptions,
@@ -977,7 +1040,9 @@ fn test_geth_eip8037_fields_follow_fork() {
         if enabled {
             assert!(sstores[0].state_gas_cost.is_some_and(|cost| cost > 0), "{sstores:#?}");
             assert!(sstores[1].state_gas_cost.is_some_and(|cost| cost < 0), "{sstores:#?}");
-            assert!(frame.struct_logs.iter().all(|log| log.state_gas_reservoir.is_some()));
+            // The gas limit is below the transaction gas cap, so the reservoir stays empty and is
+            // omitted.
+            assert!(frame.struct_logs.iter().all(|log| log.state_gas_reservoir.is_none()));
         } else {
             assert!(
                 frame
@@ -1521,6 +1586,7 @@ fn test_geth_prestate_disable_code_in_diff_mode() {
         diff_mode: Some(true),
         disable_code: Some(true),
         disable_storage: Some(false),
+        ..Default::default()
     };
 
     let mut insp = TracingInspector::new(TracingInspectorConfig::from_geth_prestate_config(
@@ -1577,6 +1643,7 @@ fn test_geth_prestate_disable_code_in_diff_mode() {
         diff_mode: Some(true),
         disable_code: Some(false),
         disable_storage: Some(false),
+        ..Default::default()
     };
 
     let mut insp2 = TracingInspector::new(TracingInspectorConfig::from_geth_prestate_config(
@@ -1801,6 +1868,7 @@ fn test_geth_prestate_diff_selfdestruct(spec_id: SpecId) {
         diff_mode: Some(true),
         disable_code: Some(false),
         disable_storage: Some(false),
+        ..Default::default()
     };
     let insp =
         TracingInspector::new(TracingInspectorConfig::from_geth_prestate_config(&prestate_config));
@@ -2352,51 +2420,6 @@ fn test_geth_opcode_limit_ignores_named_tracers() {
     let inspector = DebugInspector::new(opts).unwrap();
     let DebugInspector::CallTracer(inspector, _) = &inspector else { panic!("unexpected tracer") };
     assert_eq!(inspector.config().step_limit, None);
-}
-
-#[test]
-fn test_geth_struct_log_out_of_gas_cost() {
-    let contract = address!("0xc000000000000000000000000000000000000004");
-    let caller = address!("0xa000000000000000000000000000000000000004");
-    let code = [op::PUSH1, 0x01, op::PUSH1, 0x00, op::SSTORE];
-
-    let context = Context::mainnet()
-        .with_db(InMemoryDB::default())
-        .modify_cfg_chained(|cfg| cfg.spec = SpecId::LONDON)
-        .modify_db_chained(|db| {
-            db.insert_account_info(
-                &contract,
-                AccountInfo { code: Some(Bytecode::new_raw(code.into())), ..Default::default() },
-            );
-        });
-
-    let mut insp = TracingInspector::new(TracingInspectorConfig::default_geth());
-    let mut evm = context.build_mainnet().with_inspector(&mut insp);
-
-    // Leaves 5000 gas for the cold zero-to-nonzero SSTORE, which would cost 22100. The step
-    // consumes the 5000 left.
-    let res = evm
-        .inspect_tx(TxEnv {
-            caller,
-            gas_limit: 21_000 + 6 + 5_000,
-            gas_price: 0,
-            kind: TransactTo::Call(contract),
-            data: Bytes::default(),
-            nonce: 0,
-            ..Default::default()
-        })
-        .unwrap();
-    assert!(!res.result.is_success(), "{res:#?}");
-
-    let frame = insp.geth_builder().geth_traces(
-        res.result.tx_gas_used(),
-        res.result.output().unwrap_or_default().clone(),
-        GethDefaultTracingOptions::default(),
-    );
-    let sstore = frame.struct_logs.last().unwrap();
-    assert_eq!(sstore.opcode(), "SSTORE");
-    assert_eq!(sstore.gas, 5_000);
-    assert_eq!(sstore.gas_cost, 5_000);
 }
 
 /// EIP-7708: a transfer log of a reverted call is rolled back and does not consume an index.
@@ -3424,8 +3447,8 @@ mod frames {
             let (sender, tx) = default_verification_transaction(Bytes::from_static(&[0]));
             let mut evm = evm(&[(sender, &[])]);
             let spec = evm2::SpecId::BOGOTA;
-            let mut version = Version::new(spec);
-            version.initial_call_depth = initial_call_depth;
+            let version = Version::new(spec);
+            evm.set_initial_call_depth(initial_call_depth);
             evm.set_execution_config(
                 ExecutionConfig::for_spec_and_version(spec, version),
                 spec,
@@ -3981,4 +4004,92 @@ fn tracing_inspector_traces_the_same_with_the_steps_it_asks_for_and_with_every_s
             None => assert_eq!(asked_steps, every_steps, "{config:?}"),
         }
     }
+}
+
+#[test]
+fn debug_inspector_limits_halt_steps_and_call_inputs() {
+    // `JUMPDEST PUSH0 JUMP` loops without memory, the `CALL` passes one byte of input, and the
+    // `KECCAK256` hashes 32 zero bytes.
+    let looping = &hex!("5b5f56")[..];
+    let call = &hex!("5f5f60015f5f5f5af100")[..];
+    let keccak = &hex!("60205f2000")[..];
+    for (options, code, halts) in [
+        (json!({}), looping, true),
+        (json!({"tracer": "callTracer"}), call, true),
+        (json!({"tracer": "erc7562Tracer"}), call, true),
+        (json!({"tracer": "muxTracer", "tracerConfig": {"callTracer": {}}}), call, true),
+        (json!({"tracer": "muxTracer", "tracerConfig": {"erc7562Tracer": {}}}), call, true),
+        // The preimages keep the limit of their tracer.
+        (json!({"tracer": "erc7562Tracer"}), keccak, false),
+        (json!({"tracer": KECCAK256_PREIMAGE_TRACER}), keccak, false),
+    ] {
+        let account = address!("1000000000000000000000000000000000000001");
+        let run = |limits: Option<TraceLimits>| {
+            let opts = serde_json::from_value(options.clone()).unwrap();
+            let mut inspector = DebugInspector::new(opts).unwrap();
+            if let Some(limits) = limits {
+                inspector = inspector.with_limits(limits);
+            }
+            let context =
+                Context::mainnet().with_db(InMemoryDB::default()).modify_db_chained(|db| {
+                    db.insert_account_info(
+                        &account,
+                        AccountInfo {
+                            code: Some(Bytecode::new_raw(code.to_vec().into())),
+                            ..Default::default()
+                        },
+                    );
+                });
+            let mut evm = context.build_mainnet().with_inspector(&mut inspector);
+            evm.inspect_tx(TxEnv {
+                gas_limit: 1_000_000,
+                kind: TransactTo::Call(account),
+                ..Default::default()
+            })
+            .is_ok()
+        };
+        assert!(run(None), "{options}");
+        let limits = TraceLimits::default()
+            .set_max_recorded_bytes(Some(0))
+            .set_behavior(TraceLimitBehavior::Halt);
+        assert_eq!(run(Some(limits)), !halts, "{options}");
+    }
+}
+
+#[test]
+fn debug_inspector_recorded_bytes_sums_mux_tracers() {
+    // The CALL passes one byte of input.
+    let code = hex!("5f5f60015f5f5f5af100");
+    let account = address!("1000000000000000000000000000000000000001");
+    let recorded = |options| {
+        let opts = serde_json::from_value(options).unwrap();
+        let mut inspector = DebugInspector::new(opts).unwrap();
+        let context = Context::mainnet().with_db(InMemoryDB::default()).modify_db_chained(|db| {
+            db.insert_account_info(
+                &account,
+                AccountInfo {
+                    code: Some(Bytecode::new_raw(code.to_vec().into())),
+                    ..Default::default()
+                },
+            );
+        });
+        let mut evm = context.build_mainnet().with_inspector(&mut inspector);
+        evm.inspect_tx(TxEnv {
+            gas_limit: 1_000_000,
+            kind: TransactTo::Call(account),
+            ..Default::default()
+        })
+        .unwrap();
+        drop(evm);
+        inspector.recorded_bytes()
+    };
+    let call = recorded(json!({"tracer": "callTracer"}));
+    let erc7562 = recorded(json!({"tracer": "erc7562Tracer"}));
+    assert!(call > 0 && erc7562 > 0, "{call} {erc7562}");
+    let mux = recorded(json!({
+        "tracer": "muxTracer",
+        "tracerConfig": {"callTracer": {}, "erc7562Tracer": {}},
+    }));
+    assert_eq!(mux, call + erc7562);
+    assert_eq!(recorded(json!({"tracer": "noopTracer"})), 0);
 }

@@ -98,9 +98,7 @@ fn approval_executes_body_and_commits_explicit_sender_nonce(
     #[values(0, 7)] initial_call_depth: u16,
 ) {
     let mut evm = evm(&[0x60, 42, 0x5f, 0x55, 0x00], &[]);
-    let mut version = Version::new(SpecId::BOGOTA);
-    version.initial_call_depth = initial_call_depth;
-    set_version(&mut evm, version);
+    evm.set_initial_call_depth(initial_call_depth);
     evm.tx_env_mut().origin = ASSERTION;
     evm.tx_env_mut().gas_price = U256::from(99);
     let tx =
@@ -1079,7 +1077,7 @@ fn native_frame_prefix_dispatches_for_custom_transaction_envelopes() {
 }
 
 #[test]
-fn unsuccessful_prefix_frames_report_the_revm_validation_error() {
+fn unsuccessful_prefix_frames_fail_validation_without_consuming_the_nonce() {
     for body in [&[0x5f, 0x5f, 0xfd][..], &[0xfe][..]] {
         let mut evm = evm(body, &[]);
         let tx = recovered(payload(vec![

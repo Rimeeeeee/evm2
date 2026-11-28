@@ -41,7 +41,7 @@ pub fn run<T: EvmTypesHost>(
 
     gas.spend(ECRECOVER_BASE)?;
 
-    let input = right_pad::<128>(message.input.as_ref());
+    let input = right_pad::<128>(evm.message_input(message));
 
     // `v` must be a 32-byte big-endian integer equal to 27 or 28.
     if !(input[32..63].iter().all(|&b| b == 0) && matches!(input[63], 27 | 28)) {
@@ -80,10 +80,7 @@ pub fn run<T: EvmTypesHost>(
 }
 
 pub(crate) fn ecrecover_bytes(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Option<[u8; 32]> {
-    match ecrecover(sig.into(), recid, msg.into()) {
-        Ok(address) => Some(address.0),
-        Err(_) => None,
-    }
+    ecrecover(sig.into(), recid, msg.into()).ok().map(|address| address.0)
 }
 
 // Select the correct implementation based on the enabled features.
