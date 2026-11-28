@@ -172,9 +172,13 @@ impl FrameGas {
             })?;
         let tokens = sum(tokens, elided_tokens)?;
         let floor_tokens = sum(floor_tokens, elided_tokens)?;
+        let dependency_proof_gas = tx.recursive_stark_gas();
         let intrinsic =
-            sum(sum(base, mul(tokens, gp.get(GasId::TxTokenCost))?)?, tx.recursive_stark_gas())?;
-        let floor = sum(base, mul(floor_tokens, gp.get(GasId::TxFloorCostPerToken))?)?;
+            sum(sum(base, mul(tokens, gp.get(GasId::TxTokenCost))?)?, dependency_proof_gas)?;
+        let floor = sum(
+            sum(base, mul(floor_tokens, gp.get(GasId::TxFloorCostPerToken))?)?,
+            dependency_proof_gas,
+        )?;
         // Positive intrinsic gas makes checked totals reject saturation in the shared frame sums.
         let execution = sum(intrinsic, tx.total_frame_execution_gas_limit())?.max(floor);
         let state = tx.total_frame_state_gas_limit();

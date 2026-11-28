@@ -3,10 +3,13 @@
 mod common;
 
 use alloy_eips::{
-    eip8141::{Frame, FrameLimits, FrameMode, FrameStatus},
+    eip8141::{
+        FRAME_TX_INTRINSIC_COST, FRAME_TX_PER_FRAME_COST, FRAME_TX_TOTAL_COST_FLOOR_PER_TOKEN,
+        Frame, FrameLimits, FrameMode, FrameStatus,
+    },
     eip8288::{
         DependencyValidationError, LEANSPHINCS_SCHEME, LEANSPHINCS_VERIFICATION_GAS,
-        SignatureDependency,
+        LEANSTARK_VERIFICATION_GAS, SignatureDependency,
     },
 };
 use alloy_primitives::{B256, Bytes, U256};
@@ -100,4 +103,43 @@ fn invalid_dependency_target_is_rejected() {
             DependencyValidationError::FrameFields
         )))
     );
+}
+
+#[test]
+fn dependency_proof_gas_survives_a_binding_floor_and_body_revert() {
+    for count in [1, 2] {
+        for revert in [false, true] {
+            let body = if revert { &[0x5f, 0x5f, 0xfd][..] } else { &[0x00][..] };
+            let mut evm = common::evm(common::database_with_nonce_manager([
+                (SENDER, APPROVE_BOTH),
+                (BODY, body),
+            ]));
+            let mut version = Version::new(SpecId::BOGOTA);
+            version.features.insert(EvmFeatures::EIP8288);
+            set_version(&mut evm, version);
+            let mut tx = payload(vec![
+                dependency_frame(count),
+                frame(FrameMode::Verify, SENDER),
+                frame(FrameMode::Sender, BODY),
+            ]);
+            tx.frames[2].data = vec![0; 10_000].into();
+            let expected = FRAME_TX_INTRINSIC_COST
+                + 3 * FRAME_TX_PER_FRAME_COST
+                + tx.frame_calldata_len() * 4 * FRAME_TX_TOTAL_COST_FLOOR_PER_TOKEN
+                + count as u64 * LEANSTARK_VERIFICATION_GAS;
+            let gas = FrameGas::calculate(&tx, evm.version()).unwrap();
+            assert!(gas.intrinsic + tx.total_frame_execution_gas_limit() < expected);
+            assert_eq!(gas.floor, expected);
+            assert_eq!(gas.execution, expected);
+            let result = evm.transact(&recovered(tx)).unwrap().commit();
+            assert_eq!(result.floor_gas, expected);
+            assert!(result.total_gas_spent < expected);
+            let receipts = &result.frame.as_ref().unwrap().receipts;
+            assert_eq!(receipts[0].gas_used.execution, count as u64 * LEANSPHINCS_VERIFICATION_GAS);
+            assert_eq!(
+                receipts[2].status,
+                if revert { FrameStatus::Failure } else { FrameStatus::Success }
+            );
+        }
+    }
 }
