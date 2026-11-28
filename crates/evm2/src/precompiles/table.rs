@@ -694,8 +694,8 @@ pub const fn FRAME_SECP256K1_VERIFIER<T: EvmTypesHost>() -> Precompile<T> {
     Precompile::new(
         alloy_eips::eip8141::SECP256K1_VERIFIER,
         PrecompileId::FrameSecp256k1,
-        |_, message, gas| {
-            crate::precompiles::frame_verifiers::secp256k1(message.input.as_ref(), gas)
+        |evm, message, gas| {
+            crate::precompiles::frame_verifiers::secp256k1(evm.message_input(message), gas)
         },
     )
 }
@@ -706,7 +706,9 @@ pub const fn FRAME_P256_VERIFIER<T: EvmTypesHost>() -> Precompile<T> {
     Precompile::new(
         alloy_eips::eip8141::P256_VERIFIER,
         PrecompileId::FrameP256,
-        |_, message, gas| crate::precompiles::frame_verifiers::p256(message.input.as_ref(), gas),
+        |evm, message, gas| {
+            crate::precompiles::frame_verifiers::p256(evm.message_input(message), gas)
+        },
     )
 }
 
@@ -716,8 +718,8 @@ pub const fn FRAME_LEANSPHINCS_VERIFIER<T: EvmTypesHost>() -> Precompile<T> {
     Precompile::new(
         alloy_eips::eip8141::LEANSPHINCS_VERIFIER,
         PrecompileId::FrameLeanSphincs,
-        |_, message, gas| {
-            crate::precompiles::frame_verifiers::leansphincs(message.input.as_ref(), gas)
+        |evm, message, gas| {
+            crate::precompiles::frame_verifiers::leansphincs(evm.message_input(message), gas)
         },
     )
 }
